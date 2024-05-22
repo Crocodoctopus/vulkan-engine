@@ -1,0 +1,8 @@
+[package]
+name = "raytrace"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+vulkano = "0.34.1"
+winit = { version = "0.30.0", features = ["rwh_05"] }
