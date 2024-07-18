@@ -2,21 +2,33 @@ extern crate ash;
 extern crate ash_window;
 extern crate winit;
 
-use ash::google::surfaceless_query;
-use ash::vk::ShaderModuleCreateInfo;
+use ash::vk::{Extent2D, ImageUsageFlags, ShaderModuleCreateInfo};
 use ash::{khr, vk, Device, Entry, Instance};
-use std::ffi::c_char;
-use std::sync::Arc;
-use vulkano::device::QueueCreateFlags;
+use std::ffi::CStr;
+use winit::dpi::PhysicalSize;
 use winit::event_loop::EventLoop;
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::Window;
 
 fn main() {
+    // Required Vulkan features.
+    let instance_extensions = [];
+    let validation_layers = [c"VK_LAYER_KHRONOS_validation"];
+    let device_extensions = [
+        c"VK_KHR_dynamic_rendering",
+        c"VK_EXT_descriptor_indexing",
+        c"VK_KHR_swapchain",
+    ];
+    let (viewport_w, viewport_h) = (720_u32, 1080_u32);
+
     // Create window.
     let event_loop = EventLoop::new().expect("Could not create window event loop.");
     let window = event_loop
-        .create_window(Window::default_attributes())
+        .create_window(
+            Window::default_attributes()
+                .with_resizable(false)
+                .with_inner_size(PhysicalSize::new(viewport_w, viewport_h)),
+        )
         .expect("Could not create window.");
     let raw_display_handle = window.display_handle().unwrap().as_raw();
     let raw_window_handle = window.window_handle().unwrap().as_raw();
@@ -24,29 +36,21 @@ fn main() {
     unsafe {
         let entry = Entry::load().expect("Failed to load vulkan functions.");
 
-        // Create instance.
         let instance = {
-            // Validation layers.
-            let layers = [c"VK_LAYER_KHRONOS_validation".as_ptr()];
-
-            // Instance extensions.
             //let supported_extensions = entry.enumerate_instance_extension_properties(None).unwrap();
             //println!("{supported_extensions:?}");
-            let mut extensions: Vec<*const c_char> =
-                ash_window::enumerate_required_extensions(raw_display_handle)
-                    .unwrap()
-                    .to_vec();
-
-            /*
-            for e in &extensions {
-                let s = std::ffi::CStr::from_ptr(*e);
-                println!("{s:?}");
-            }
-            */
+            let required_extensions =
+                ash_window::enumerate_required_extensions(raw_display_handle).unwrap();
+            let extensions = [
+                required_extensions,
+                &instance_extensions.map(|x: &CStr| x.as_ptr()),
+            ]
+            .concat();
 
             let app_info = vk::ApplicationInfo::default()
                 .application_name(c"Raytrace")
                 .api_version(vk::make_api_version(0, 1, 2, 0));
+            let layers = validation_layers.map(|x: &CStr| x.as_ptr());
             let instance_cinfo = vk::InstanceCreateInfo::default()
                 .application_info(&app_info)
                 .enabled_layer_names(&layers)
@@ -64,9 +68,6 @@ fn main() {
             .next()
             .unwrap();
 
-        // Surface.
-        let surface_loader = khr::surface::Instance::new(&entry, &instance);
-
         let surface = ash_window::create_surface(
             &entry,
             &instance,
@@ -76,243 +77,223 @@ fn main() {
         )
         .unwrap();
 
-        let surface_format = surface_loader
+        let surface_instance = khr::surface::Instance::new(&entry, &instance);
+        let surface_format = surface_instance
             .get_physical_device_surface_formats(pdevice, surface)
+            .unwrap()
+            .into_iter()
+            .next()
             .unwrap();
-        let surface_capabilities = surface_loader
+        let surface_capabilities = surface_instance
             .get_physical_device_surface_capabilities(pdevice, surface)
             .unwrap();
 
-        // Device.
-        let (device, queue) = {
-            // Get queue family capable of graphics.
-            let queue_family_index = instance
-                .get_physical_device_queue_family_properties(pdevice)
-                .iter()
-                .enumerate()
-                .find(|(index, desc)| desc.queue_flags.contains(vk::QueueFlags::GRAPHICS))
-                .expect("Could not find a graphics queue in {pdevice:?}.")
-                .0 as u32;
+        // Find a queue family that is capable of both present and graphics commands.
+        let queue_family_index = instance
+            .get_physical_device_queue_family_properties(pdevice)
+            .into_iter()
+            .enumerate()
+            .find_map(|(index, properties)| {
+                let graphics = properties.queue_flags.contains(vk::QueueFlags::GRAPHICS);
+                let present = surface_instance
+                    .get_physical_device_surface_support(pdevice, index as u32, surface)
+                    .unwrap();
+                (graphics && present).then_some(index as u32)
+            })
+            .expect("Could not find suitable queue.");
 
-            // Extensions.
-            #[rustfmt::skip]
-            let extensions = [
-                c"VK_KHR_dynamic_rendering"
-            ].map(|t| t.as_ptr());
+        let (device, graphics_queue, present_queue) = {
+            let features = vk::PhysicalDeviceFeatures::default();
+            let extensions = device_extensions.map(|x: &CStr| x.as_ptr());
 
-            // Features.
-            let features = vk::PhysicalDeviceFeatures {
-                ..Default::default()
+            let device = {
+                let mut dynamic_rendering =
+                    vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
+
+                let priority = [1.0];
+
+                let queue_cinfo = [vk::DeviceQueueCreateInfo::default()
+                    .queue_family_index(queue_family_index)
+                    .queue_priorities(&priority)];
+
+                let device_cinfo = vk::DeviceCreateInfo::default()
+                    .push_next(&mut dynamic_rendering)
+                    .queue_create_infos(&queue_cinfo)
+                    .enabled_extension_names(&extensions)
+                    .enabled_features(&features);
+
+                instance
+                    .create_device(pdevice, &device_cinfo, None)
+                    .unwrap()
             };
 
-            // Create device.
-            let prio = [1.0];
-            let queue_info = vk::DeviceQueueCreateInfo::default()
-                .queue_family_index(queue_family_index)
-                .queue_priorities(&prio);
+            // Extract queues.
+            let graphics_queue = device.get_device_queue(queue_family_index, 0);
+            let present_queue = device.get_device_queue(queue_family_index, 0);
 
-            let queue_infos = [queue_info];
-            let device_cinfo = vk::DeviceCreateInfo::default()
-                .queue_create_infos(&queue_infos)
-                .enabled_extension_names(&extensions)
-                .enabled_features(&features);
-
-            let device = instance
-                .create_device(pdevice, &device_cinfo, None)
-                .expect("Could not create device.");
-
-            // Queue.
-            let queue = device.get_device_queue(queue_family_index, 0);
-
-            (device, queue)
+            (device, graphics_queue, present_queue)
         };
 
-        let vert_shader = {
-            let shader_src = include_bytes!("shader.vert.spirv");
+        // Swapchain.
+        let swapchain_device = khr::swapchain::Device::new(&instance, &device);
+        let swapchain = {
+            let swapchain_cinfo = vk::SwapchainCreateInfoKHR::default()
+                .surface(surface)
+                .min_image_count(3)
+                .image_format(surface_format.format)
+                .image_color_space(surface_format.color_space)
+                .image_extent(Extent2D {
+                    width: viewport_w,
+                    height: viewport_h,
+                })
+                .image_usage(ImageUsageFlags::COLOR_ATTACHMENT)
+                .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .pre_transform(surface_capabilities.current_transform)
+                .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
+                .clipped(true)
+                .image_array_layers(1);
+            swapchain_device
+                .create_swapchain(&swapchain_cinfo, None)
+                .unwrap()
+        };
 
-            let (a, tmp_src, b) = shader_src.align_to();
-            assert_eq!(a.len(), 0);
-            assert_eq!(b.len(), 0);
-            let shader_module_cinfo = vk::ShaderModuleCreateInfo::default().code(tmp_src);
+        // Extract swapchain images and create image views for them.
+        let swapchain_images = swapchain_device.get_swapchain_images(swapchain).unwrap();
+        let swapchain_image_views = swapchain_images
+            .iter()
+            .map(|img| {
+                let image_view_cinfo = vk::ImageViewCreateInfo::default()
+                    .image(*img)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(surface_format.format)
+                    .components(vk::ComponentMapping {
+                        r: vk::ComponentSwizzle::IDENTITY,
+                        g: vk::ComponentSwizzle::IDENTITY,
+                        b: vk::ComponentSwizzle::IDENTITY,
+                        a: vk::ComponentSwizzle::IDENTITY,
+                    })
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    });
+                device.create_image_view(&image_view_cinfo, None).unwrap()
+            })
+            .collect::<Vec<vk::ImageView>>();
 
+        let create_shader_module = |src: &[u8]| {
+            let shader_module_cinfo = vk::ShaderModuleCreateInfo {
+                p_code: src.as_ptr() as _,
+                code_size: src.len(),
+                ..Default::default()
+            };
             device
                 .create_shader_module(&shader_module_cinfo, None)
                 .unwrap()
         };
 
-        let frag_shader = {
-            let shader_src = include_bytes!("shader.vert.spirv");
+        let vert_shader = create_shader_module(include_bytes!("shader.vert.spirv"));
+        let frag_shader = create_shader_module(include_bytes!("shader.frag.spirv"));
 
-            let (a, tmp_src, b) = shader_src.align_to();
-            assert_eq!(a.len(), 0);
-            assert_eq!(b.len(), 0);
-            let shader_module_cinfo = vk::ShaderModuleCreateInfo::default().code(tmp_src);
+        let (pipeline, pipeline_layout) = {
+            let vertex_input_cinfo = vk::PipelineVertexInputStateCreateInfo::default();
+            let input_assembly_cinfo = vk::PipelineInputAssemblyStateCreateInfo::default()
+                .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
+                .primitive_restart_enable(false);
 
-            device
-                .create_shader_module(&shader_module_cinfo, None)
+            let viewports = [vk::Viewport {
+                x: 0.,
+                y: 0.,
+                width: viewport_w as f32,
+                height: viewport_h as f32,
+                min_depth: 0.0,
+                max_depth: 1.0,
+            }];
+            let scissors = [vk::Rect2D {
+                offset: vk::Offset2D { x: 0, y: 0 },
+                extent: vk::Extent2D {
+                    width: viewport_w,
+                    height: viewport_h,
+                },
+            }];
+
+            let viewport_cinfo = vk::PipelineViewportStateCreateInfo::default()
+                .viewports(&viewports)
+                .scissors(&scissors);
+
+            let rasterization_cinfo = vk::PipelineRasterizationStateCreateInfo::default()
+                .depth_clamp_enable(false)
+                .rasterizer_discard_enable(false)
+                .polygon_mode(vk::PolygonMode::FILL)
+                .line_width(1.0)
+                .cull_mode(vk::CullModeFlags::BACK)
+                .front_face(vk::FrontFace::CLOCKWISE)
+                .depth_bias_enable(false);
+
+            let multisample_cinfo = vk::PipelineMultisampleStateCreateInfo::default()
+                .sample_shading_enable(false)
+                .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+
+            let color_blend_states = [vk::PipelineColorBlendAttachmentState::default()
+                .color_write_mask(vk::ColorComponentFlags::RGBA)
+                .blend_enable(false)];
+            let color_blend_cinfo = vk::PipelineColorBlendStateCreateInfo::default()
+                .logic_op_enable(false)
+                .attachments(&color_blend_states);
+
+            let pipeline_layout_cinfo = vk::PipelineLayoutCreateInfo::default();
+            let pipeline_layout = device
+                .create_pipeline_layout(&pipeline_layout_cinfo, None)
+                .unwrap();
+
+            let shader_stage_cinfos = [
+                vk::PipelineShaderStageCreateInfo::default()
+                    .module(vert_shader)
+                    .stage(vk::ShaderStageFlags::VERTEX)
+                    .name(c"main"),
+                vk::PipelineShaderStageCreateInfo::default()
+                    .module(frag_shader)
+                    .stage(vk::ShaderStageFlags::FRAGMENT)
+                    .name(c"main"),
+            ];
+
+            let tmp = [surface_format.format];
+            let mut pipeline_rendering_cinfo =
+                vk::PipelineRenderingCreateInfo::default().color_attachment_formats(&tmp);
+
+            let pipeline_cinfo = vk::GraphicsPipelineCreateInfo::default()
+                .push_next(&mut pipeline_rendering_cinfo)
+                .stages(&shader_stage_cinfos)
+                .vertex_input_state(&vertex_input_cinfo)
+                .viewport_state(&viewport_cinfo)
+                .input_assembly_state(&input_assembly_cinfo)
+                .rasterization_state(&rasterization_cinfo)
+                .multisample_state(&multisample_cinfo)
+                .color_blend_state(&color_blend_cinfo)
+                .layout(pipeline_layout);
+            let pipeline = device
+                .create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_cinfo], None)
                 .unwrap()
-        };
+                .into_iter()
+                .next()
+                .unwrap();
 
-        let vert_pipeline_cinfo = vk::PipelineShaderStageCreateInfo::default()
-            .module(vert_shader)
-            .name(c"main");
+            (pipeline, pipeline_layout)
+        };
 
         // Cleanup.
+        device.destroy_pipeline(pipeline, None);
+        device.destroy_pipeline_layout(pipeline_layout, None);
+        swapchain_image_views
+            .into_iter()
+            .for_each(|v| device.destroy_image_view(v, None));
         device.destroy_shader_module(vert_shader, None);
         device.destroy_shader_module(frag_shader, None);
+        swapchain_device.destroy_swapchain(swapchain, None);
         device.destroy_device(None);
-        //device.destroy_swapchain(swapchain, None);
-        //instance.destroy_surface(surface, None);
+        surface_instance.destroy_surface(surface, None);
         instance.destroy_instance(None);
     }
 }
-/*
-    // Create base Vulkan library.
-    let vulkano = VulkanLibrary::new().unwrap();
-
-    // List of required Vulkan extensions.
-    let extensions = InstanceExtensions {
-        khr_surface: true,
-        khr_xlib_surface: true,
-        ..InstanceExtensions::empty()
-    };
-
-    // Create Vulkan instance.
-    let instance = Instance::new(
-        vulkano,
-        InstanceCreateInfo {
-            enabled_extensions: extensions,
-            ..Default::default()
-        },
-    )
-    .expect("Unable to create Vulkan instance.");
-
-    // Create surface.
-    let surface = Surface::from_window(instance.clone(), window_handle).expect("Could not create Vulkan surface.");
-
-    // List of required Device features.
-    let features = Features {
-        dynamic_rendering: true,
-        ..Features::empty()
-    };
-
-    // Enumerate physical devices, select one.
-    let pdevice = instance
-        .enumerate_physical_devices()
-        .unwrap()
-        .next()
-        .expect("Unable to find a physical device.");
-    println!(
-        "Physical device found: {:?}",
-        pdevice.properties().device_name
-    );
-
-    //
-    let surface_formats = pdevice.surface_formats(&surface, SurfaceInfo::default()).unwrap();
-    println!("{:?}", surface_formats);
-
-    // Get queue.
-    let graphics_queue_index = pdevice
-        .queue_family_properties()
-        .iter()
-        .enumerate()
-        .filter_map(|(index, property)| property.queue_flags
-            .contains(QueueFlags::GRAPHICS)
-            .then(|| index as u32))
-        .next()
-        .expect("No graphics queue found.");
-    /*
-    let mut graphics_queue = None;
-    //let mut present_queue = None;
-    for (index, queue_property) in pdevice.queue_family_properties().iter().enumerate() {
-        if queue_property.queue_flags.contains(QueueFlags::GRAPHICS) {
-            graphics_queue = Some(index);
-        }
-    }
-    let graphics_queue = graphics_queue.expect("No graphics queue found.");
-    //assert!(present_queue.is_some());
-    */
-
-    // List of required Device extensions.
-    let device_extensions = DeviceExtensions {
-        khr_swapchain: true,
-        ..DeviceExtensions::empty()
-    };
-
-    // Create logical device from physical device.
-    let (device, mut queues) = Device::new(
-        pdevice,
-        DeviceCreateInfo {
-            queue_create_infos: vec![QueueCreateInfo {
-                queue_family_index: graphics_queue_index,
-                ..Default::default()
-            }],
-            enabled_features: features,
-            enabled_extensions: device_extensions,
-            ..Default::default()
-        },
-    )
-    .expect("Unable to create a logical device.");
-
-    // Extract queues.
-    let graphics_queue = queues.next();
-    // let present_queue = queues.next();
-
-    // Create swapchain and image views.
-    let (swapchain, images) = Swapchain::new(device.clone(), surface, SwapchainCreateInfo {
-        present_mode: PresentMode::Fifo,
-        min_image_count: 3,
-        image_format: Format::B8G8R8A8_UNORM,
-        image_usage: ImageUsage::COLOR_ATTACHMENT,
-        image_color_space: ColorSpace::SrgbNonLinear,
-        image_extent: [640, 480],
-        ..Default::default()
-    }).expect("Could not create Vulkan swapchain.");
-    let image_views: Vec<Arc<ImageView>> = images
-        .iter()
-        .cloned()
-        .map(|image| ImageView::new(image, ImageViewCreateInfo {
-            view_type: vulkano::image::view::ImageViewType::Dim2d,
-            format: Format::B8G8R8A8_UNORM,
-            usage: ImageUsage::COLOR_ATTACHMENT,
-            ..Default::default()
-        }))
-        .collect::<Result<_, _>>()
-        .unwrap();
-    //
-
-    // Default command allocator.
-    let command_allocator = StandardCommandBufferAllocator::new(device.clone(), StandardCommandBufferAllocatorCreateInfo {
-        primary_buffer_count: 1,
-        secondary_buffer_count: 0,
-        ..Default::default()
-    });
-
-    // Create 3 command bufers.
-    let command_buffers: Vec<_> = (0..3).into_iter().map(|i| {
-        // Create rendering info.
-        let rendering_info = RenderingInfo {
-            render_area_offset: [0, 0],
-            render_area_extent: [0, 0],
-            layer_count: 1,
-            view_mask: 0,
-            color_attachments: vec![Some(RenderingAttachmentInfo{
-                image_view: image_views[i].clone(),
-                image_layout: ImageLayout::ColorAttachmentOptimal,
-                resolve_info: None,
-                load_op: AttachmentLoadOp::DontCare,
-                store_op: AttachmentStoreOp::DontCare,
-                clear_value: None,
-                _ne: NonExhaustive::default(),
-            })],
-            ..Default::default()
-
-        };
-
-        // Record command buffer.
-        let command_buffer = AutoCommandBufferBuilder::primary(&command_pool, graphics_queue_index, CommandBufferUsage::MultipleSubmit)
-            .unwrap()
-            .begin_rendering()
-        }).collect();
-*/
-// Create pipeline.
