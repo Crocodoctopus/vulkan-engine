@@ -2,10 +2,9 @@ extern crate ash;
 extern crate ash_window;
 extern crate winit;
 
-use ash::vk::{Extent2D, ImageUsageFlags, ShaderModuleCreateInfo};
-use ash::{khr, vk, Device, Entry, Instance};
+use ash::vk::{Extent2D, ImageUsageFlags};
+use ash::{khr, vk, Entry};
 use std::ffi::CStr;
-use std::thread::sleep;
 use winit::dpi::PhysicalSize;
 use winit::event_loop::EventLoop;
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -20,10 +19,10 @@ fn main() {
         c"VK_EXT_descriptor_indexing",
         c"VK_KHR_swapchain",
     ];
-    let (viewport_w, viewport_h) = (720_u32, 1080_u32);
+    let (viewport_w, viewport_h) = (1080_u32, 720_u32);
 
     // Create window.
-    let event_loop = EventLoop::new().expect("Could not create window event loop.");
+    let mut event_loop = EventLoop::new().expect("Could not create window event loop.");
     let window = event_loop
         .create_window(
             Window::default_attributes()
@@ -50,7 +49,7 @@ fn main() {
 
             let app_info = vk::ApplicationInfo::default()
                 .application_name(c"Raytrace")
-                .api_version(vk::make_api_version(0, 1, 2, 0));
+                .api_version(vk::make_api_version(0, 1, 3, 0));
             let layers = validation_layers.map(|x: &CStr| x.as_ptr());
             let instance_cinfo = vk::InstanceCreateInfo::default()
                 .application_info(&app_info)
@@ -151,6 +150,7 @@ fn main() {
                 .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
                 .pre_transform(surface_capabilities.current_transform)
                 .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
+                .present_mode(vk::PresentModeKHR::FIFO)
                 .clipped(true)
                 .image_array_layers(1);
             swapchain_device
@@ -325,7 +325,28 @@ fn main() {
             .unwrap();
 
         // "Gameloop"
-        {
+        loop {
+            // Input.
+            let mut exit = false;
+            use winit::platform::pump_events::EventLoopExtPumpEvents;
+            let _status = event_loop.pump_events(Some(std::time::Duration::ZERO), |event, _| {
+                match event {
+                    winit::event::Event::WindowEvent {
+                        event: winit::event::WindowEvent::CloseRequested,
+                        ..
+                    } => exit = true,
+                    // Unhandled.
+                    _ => {}
+                }
+            });
+
+            if exit {
+                break;
+            }
+
+            // Update.
+
+            // Draw.
             device
                 .wait_for_fences(&[frame_in_flight], true, u64::MAX)
                 .unwrap();
@@ -335,6 +356,7 @@ fn main() {
                 .acquire_next_image(swapchain, u64::MAX, image_available, vk::Fence::null())
                 .unwrap();
             let image = swapchain_images[image_index as usize];
+            let image_view = swapchain_image_views[image_index as usize];
 
             // Reset and record.
             device
@@ -370,8 +392,36 @@ fn main() {
                     .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)],
             );
 
-            // Begin render.
-            {}
+            // Begin rendering.
+            let color_attachment_infos = [vk::RenderingAttachmentInfo::default()
+                .image_view(image_view)
+                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                .load_op(vk::AttachmentLoadOp::CLEAR)
+                .store_op(vk::AttachmentStoreOp::STORE)
+                .clear_value(vk::ClearValue {
+                    color: vk::ClearColorValue {
+                        float32: [0.0, 0.0, 0.0, 1.0],
+                    },
+                })];
+            let rendering_info = vk::RenderingInfo::default()
+                .render_area(vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: vk::Extent2D {
+                        width: viewport_w,
+                        height: viewport_h,
+                    },
+                })
+                .layer_count(1)
+                .color_attachments(&color_attachment_infos);
+            device.cmd_begin_rendering(command_buffer, &rendering_info);
+
+            // Begin draw calls.
+            {
+                device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline);
+                device.cmd_draw(command_buffer, 3, 1, 0, 0);
+            }
+
+            device.cmd_end_rendering(command_buffer);
 
             // Convert VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL -> VK_IMAGE_LAYOUT_PRESENT_SRC_KHR.
             device.cmd_pipeline_barrier(
@@ -394,16 +444,13 @@ fn main() {
             let signals = [render_finished];
             let stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
             let command_buffers = [command_buffer];
+            let submit_info = vk::SubmitInfo::default()
+                .wait_semaphores(&waits)
+                .signal_semaphores(&signals)
+                .wait_dst_stage_mask(&stages)
+                .command_buffers(&command_buffers);
             device
-                .queue_submit(
-                    graphics_queue,
-                    &[vk::SubmitInfo::default()
-                        .wait_semaphores(&waits)
-                        .signal_semaphores(&signals)
-                        .wait_dst_stage_mask(&stages)
-                        .command_buffers(&command_buffers)],
-                    frame_in_flight,
-                )
+                .queue_submit(graphics_queue, &[submit_info], frame_in_flight)
                 .unwrap();
 
             //
@@ -419,12 +466,7 @@ fn main() {
                 .unwrap();
         }
 
-        // Block on all semaphores before proceeding to clean up.
-        /*
-        let semaphores = [render_finished, image_available];
-        let wait_info = vk::SemaphoreWaitInfo::default().semaphores(&semaphores);
-        device.wait_semaphores(&wait_info, u64::MAX).unwrap();
-        */
+        // Block until the gpu is finished  before proceeding to clean up.
         device
             .wait_for_fences(&[frame_in_flight], true, u64::MAX)
             .unwrap();
