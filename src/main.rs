@@ -5,6 +5,7 @@ extern crate winit;
 use ash::vk::{Extent2D, ImageUsageFlags, ShaderModuleCreateInfo};
 use ash::{khr, vk, Device, Entry, Instance};
 use std::ffi::CStr;
+use std::thread::sleep;
 use winit::dpi::PhysicalSize;
 use winit::event_loop::EventLoop;
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -283,7 +284,157 @@ fn main() {
             (pipeline, pipeline_layout)
         };
 
-        // Cleanup.
+        let command_pool = {
+            let command_pool_cinfo = vk::CommandPoolCreateInfo::default()
+                .queue_family_index(queue_family_index)
+                .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+            device
+                .create_command_pool(&command_pool_cinfo, None)
+                .unwrap()
+        };
+
+        let command_buffer = {
+            let command_buffer_alloc = vk::CommandBufferAllocateInfo::default()
+                .command_pool(command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY)
+                .command_buffer_count(1);
+            device
+                .allocate_command_buffers(&command_buffer_alloc)
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap()
+        };
+
+        let begin_info = vk::CommandBufferBeginInfo::default();
+        device
+            .begin_command_buffer(command_buffer, &begin_info)
+            .unwrap();
+
+        let image_available = device
+            .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+            .unwrap();
+        let render_finished = device
+            .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+            .unwrap();
+        let frame_in_flight = device
+            .create_fence(
+                &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+                None,
+            )
+            .unwrap();
+
+        // "Gameloop"
+        {
+            device
+                .wait_for_fences(&[frame_in_flight], true, u64::MAX)
+                .unwrap();
+            device.reset_fences(&[frame_in_flight]).unwrap();
+
+            let (image_index, _) = swapchain_device
+                .acquire_next_image(swapchain, u64::MAX, image_available, vk::Fence::null())
+                .unwrap();
+            let image = swapchain_images[image_index as usize];
+
+            // Reset and record.
+            device
+                .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
+                .unwrap();
+            device
+                .begin_command_buffer(command_buffer, &vk::CommandBufferBeginInfo::default())
+                .unwrap();
+
+            // Used to transmute the layout of the next swapchain image.
+            let color_image_memory_barrier = vk::ImageMemoryBarrier::default()
+                .image(image)
+                .subresource_range(
+                    vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .base_mip_level(0)
+                        .level_count(1)
+                        .base_array_layer(0)
+                        .layer_count(1),
+                );
+
+            // Convert VK_IMAGE_LAYOUT_UNDEFINED -> VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL.
+            device.cmd_pipeline_barrier(
+                command_buffer,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[color_image_memory_barrier
+                    .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)],
+            );
+
+            // Begin render.
+            {}
+
+            // Convert VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL -> VK_IMAGE_LAYOUT_PRESENT_SRC_KHR.
+            device.cmd_pipeline_barrier(
+                command_buffer,
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[color_image_memory_barrier
+                    .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                    .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                    .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)],
+            );
+
+            device.end_command_buffer(command_buffer).unwrap();
+
+            // Execute command buffer.
+            let waits = [image_available];
+            let signals = [render_finished];
+            let stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+            let command_buffers = [command_buffer];
+            device
+                .queue_submit(
+                    graphics_queue,
+                    &[vk::SubmitInfo::default()
+                        .wait_semaphores(&waits)
+                        .signal_semaphores(&signals)
+                        .wait_dst_stage_mask(&stages)
+                        .command_buffers(&command_buffers)],
+                    frame_in_flight,
+                )
+                .unwrap();
+
+            //
+            let waits = [render_finished];
+            let swapchains = [swapchain];
+            let images = [image_index];
+            let present_info = vk::PresentInfoKHR::default()
+                .wait_semaphores(&waits)
+                .swapchains(&swapchains)
+                .image_indices(&images);
+            swapchain_device
+                .queue_present(present_queue, &present_info)
+                .unwrap();
+        }
+
+        // Block on all semaphores before proceeding to clean up.
+        /*
+        let semaphores = [render_finished, image_available];
+        let wait_info = vk::SemaphoreWaitInfo::default().semaphores(&semaphores);
+        device.wait_semaphores(&wait_info, u64::MAX).unwrap();
+        */
+        device
+            .wait_for_fences(&[frame_in_flight], true, u64::MAX)
+            .unwrap();
+
+        // Clean up.
+        device.destroy_fence(frame_in_flight, None);
+        device.destroy_semaphore(render_finished, None);
+        device.destroy_semaphore(image_available, None); // bleh
+        device.free_command_buffers(command_pool, &[command_buffer]);
+        device.destroy_command_pool(command_pool, None);
         device.destroy_pipeline(pipeline, None);
         device.destroy_pipeline_layout(pipeline_layout, None);
         swapchain_image_views
