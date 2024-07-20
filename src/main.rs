@@ -293,39 +293,42 @@ fn main() {
                 .unwrap()
         };
 
-        let command_buffer = {
+        let command_buffers = {
             let command_buffer_alloc = vk::CommandBufferAllocateInfo::default()
                 .command_pool(command_pool)
                 .level(vk::CommandBufferLevel::PRIMARY)
-                .command_buffer_count(1);
+                .command_buffer_count(3);
             device
                 .allocate_command_buffers(&command_buffer_alloc)
                 .unwrap()
-                .into_iter()
-                .next()
-                .unwrap()
+                .into_boxed_slice()
         };
 
-        let begin_info = vk::CommandBufferBeginInfo::default();
-        device
-            .begin_command_buffer(command_buffer, &begin_info)
+        // Synchronization primitives for each frame.
+        let image_available: Box<[vk::Semaphore]> = (0..3)
+            .into_iter()
+            .map(|_| device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None))
+            .collect::<Result<_, _>>()
             .unwrap();
-
-        let image_available = device
-            .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+        let render_finished: Box<[vk::Semaphore]> = (0..3)
+            .into_iter()
+            .map(|_| device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None))
+            .collect::<Result<_, _>>()
             .unwrap();
-        let render_finished = device
-            .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
-            .unwrap();
-        let frame_in_flight = device
-            .create_fence(
-                &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
-                None,
-            )
+        let frame_in_flight: Box<[vk::Fence]> = (0..3)
+            .into_iter()
+            .map(|_| {
+                device.create_fence(
+                    &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+                    None,
+                )
+            })
+            .collect::<Result<_, _>>()
             .unwrap();
 
         // "Gameloop"
-        loop {
+        let mut n = 0;
+        for frame in (0..3).into_iter().cycle() {
             // Input.
             let mut exit = false;
             use winit::platform::pump_events::EventLoopExtPumpEvents;
@@ -335,6 +338,7 @@ fn main() {
                         event: winit::event::WindowEvent::CloseRequested,
                         ..
                     } => exit = true,
+
                     // Unhandled.
                     _ => {}
                 }
@@ -345,8 +349,19 @@ fn main() {
             }
 
             // Update.
+            n += 1;
+            if n > 60 {
+                println!("1s");
+                n -= 60;
+            }
 
             // Draw.
+            let command_buffer = command_buffers[frame];
+            let frame_in_flight = frame_in_flight[frame];
+            let render_finished = render_finished[frame];
+            let image_available = image_available[frame];
+
+            // Wait for next image to become available.
             device
                 .wait_for_fences(&[frame_in_flight], true, u64::MAX)
                 .unwrap();
@@ -359,6 +374,10 @@ fn main() {
             let image_view = swapchain_image_views[image_index as usize];
 
             // Reset and record.
+            let begin_info = vk::CommandBufferBeginInfo::default();
+            device
+                .begin_command_buffer(command_buffer, &begin_info)
+                .unwrap();
             device
                 .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
                 .unwrap();
@@ -467,21 +486,22 @@ fn main() {
         }
 
         // Block until the gpu is finished  before proceeding to clean up.
+        /*
         device
             .wait_for_fences(&[frame_in_flight], true, u64::MAX)
             .unwrap();
+        */
 
         // Clean up.
-        device.destroy_fence(frame_in_flight, None);
-        device.destroy_semaphore(render_finished, None);
-        device.destroy_semaphore(image_available, None); // bleh
-        device.free_command_buffers(command_pool, &[command_buffer]);
+        for i in 0..3 {
+            device.destroy_fence(frame_in_flight[i], None);
+            device.destroy_semaphore(render_finished[i], None);
+            device.destroy_semaphore(image_available[i], None); // bleh
+            device.destroy_image_view(swapchain_image_views[i], None);
+        }
         device.destroy_command_pool(command_pool, None);
         device.destroy_pipeline(pipeline, None);
         device.destroy_pipeline_layout(pipeline_layout, None);
-        swapchain_image_views
-            .into_iter()
-            .for_each(|v| device.destroy_image_view(v, None));
         device.destroy_shader_module(vert_shader, None);
         device.destroy_shader_module(frag_shader, None);
         swapchain_device.destroy_swapchain(swapchain, None);
