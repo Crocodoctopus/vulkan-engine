@@ -5,10 +5,16 @@ extern crate winit;
 use ash::vk::{Extent2D, ImageUsageFlags};
 use ash::{khr, vk, Entry};
 use std::ffi::CStr;
+use std::mem::size_of;
 use winit::dpi::PhysicalSize;
 use winit::event_loop::EventLoop;
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::Window;
+
+#[repr(C)]
+struct GlVec2(f32, f32);
+#[repr(C)]
+struct GlVec3(f32, f32, f32);
 
 fn main() {
     // Required Vulkan features.
@@ -199,7 +205,33 @@ fn main() {
         let frag_shader = create_shader_module(include_bytes!("shader.frag.spirv"));
 
         let (pipeline, pipeline_layout) = {
-            let vertex_input_cinfo = vk::PipelineVertexInputStateCreateInfo::default();
+            let binding_desc0 = vk::VertexInputBindingDescription::default()
+                .binding(0)
+                .stride(size_of::<GlVec2>() as u32) // [float, float]
+                .input_rate(vk::VertexInputRate::VERTEX);
+            let attribute_desc0 = vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(0)
+                .format(vk::Format::R32G32_SFLOAT)
+                .offset(0);
+
+            let binding_desc1 = vk::VertexInputBindingDescription::default()
+                .binding(1)
+                .stride(size_of::<GlVec3>() as u32) // [float, float, float]
+                .input_rate(vk::VertexInputRate::VERTEX);
+            let attribute_desc1 = vk::VertexInputAttributeDescription::default()
+                .binding(1)
+                .location(1)
+                .format(vk::Format::R32G32B32_SFLOAT)
+                .offset(0);
+
+            let binding_descs = [binding_desc0, binding_desc1];
+            let attribute_descs = [attribute_desc0, attribute_desc1];
+
+            let vertex_input_cinfo = vk::PipelineVertexInputStateCreateInfo::default()
+                .vertex_binding_descriptions(&binding_descs)
+                .vertex_attribute_descriptions(&attribute_descs);
+
             let input_assembly_cinfo = vk::PipelineInputAssemblyStateCreateInfo::default()
                 .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
                 .primitive_restart_enable(false);
@@ -326,6 +358,115 @@ fn main() {
             .collect::<Result<_, _>>()
             .unwrap();
 
+        let memory_properties = instance.get_physical_device_memory_properties(pdevice);
+
+        let find_memory_type = |type_support: u32, flags| {
+            for i in 0..memory_properties.memory_type_count {
+                // Check if this resource supports this memory type.
+                if type_support & (i << 1) == 0 {
+                    continue;
+                }
+
+                // Check if this memory type has the property flags needed.
+                if memory_properties.memory_types[i as usize]
+                    .property_flags
+                    .contains(flags)
+                {
+                    return i;
+                }
+            }
+            panic!();
+        };
+
+        let (position_buffer, position_buffer_mem) = {
+            let buffer = device
+                .create_buffer(
+                    &vk::BufferCreateInfo::default()
+                        .size(3 * size_of::<GlVec2>() as u64) // [f32, f32]
+                        .usage(vk::BufferUsageFlags::VERTEX_BUFFER)
+                        .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                    None,
+                )
+                .unwrap();
+            let req = device.get_buffer_memory_requirements(buffer);
+            let memory = device
+                .allocate_memory(
+                    &vk::MemoryAllocateInfo::default()
+                        .allocation_size(req.size)
+                        .memory_type_index(find_memory_type(
+                            req.memory_type_bits,
+                            vk::MemoryPropertyFlags::HOST_VISIBLE
+                                | vk::MemoryPropertyFlags::HOST_COHERENT,
+                        )),
+                    None,
+                )
+                .unwrap();
+            device.bind_buffer_memory(buffer, memory, 0).unwrap();
+
+            (buffer, memory)
+        };
+
+        let (color_buffer, color_buffer_mem) = {
+            let buffer = device
+                .create_buffer(
+                    &vk::BufferCreateInfo::default()
+                        .size(3 * size_of::<GlVec3>() as u64) // [f32, f32, f32]
+                        .usage(vk::BufferUsageFlags::VERTEX_BUFFER)
+                        .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                    None,
+                )
+                .unwrap();
+            let req = device.get_buffer_memory_requirements(buffer);
+            let memory = device
+                .allocate_memory(
+                    &vk::MemoryAllocateInfo::default()
+                        .allocation_size(req.size)
+                        .memory_type_index(find_memory_type(
+                            req.memory_type_bits,
+                            vk::MemoryPropertyFlags::HOST_VISIBLE
+                                | vk::MemoryPropertyFlags::HOST_COHERENT,
+                        )),
+                    None,
+                )
+                .unwrap();
+            device.bind_buffer_memory(buffer, memory, 0).unwrap();
+
+            (buffer, memory)
+        };
+
+        {
+            let ptr = device
+                .map_memory(
+                    position_buffer_mem,
+                    0,
+                    3 * size_of::<GlVec2>() as u64,
+                    vk::MemoryMapFlags::empty(),
+                )
+                .unwrap();
+            let position_buffer_map: &mut [GlVec2] = std::slice::from_raw_parts_mut(ptr as _, 3);
+
+            let ptr = device
+                .map_memory(
+                    color_buffer_mem,
+                    0,
+                    3 * size_of::<GlVec3>() as u64,
+                    vk::MemoryMapFlags::empty(),
+                )
+                .unwrap();
+            let color_buffer_map: &mut [GlVec3] = std::slice::from_raw_parts_mut(ptr as _, 3);
+
+            //device.flush_mapped_memory_ranges(&[position_buffer_mem, color_buffer_mem]);
+            position_buffer_map[0] = GlVec2(0.0, -0.5);
+            position_buffer_map[1] = GlVec2(0.5, 0.5);
+            position_buffer_map[2] = GlVec2(-0.5, 0.5);
+            color_buffer_map[0] = GlVec3(1.0, 0.0, 0.0);
+            color_buffer_map[1] = GlVec3(0.0, 1.0, 0.0);
+            color_buffer_map[2] = GlVec3(0.0, 0.0, 1.0);
+
+            device.unmap_memory(position_buffer_mem);
+            device.unmap_memory(color_buffer_mem);
+        }
+
         // "Gameloop"
         let mut n = 0;
         for frame in (0..3).into_iter().cycle() {
@@ -437,6 +578,12 @@ fn main() {
             // Begin draw calls.
             {
                 device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline);
+                device.cmd_bind_vertex_buffers(
+                    command_buffer,
+                    0,
+                    &[position_buffer, color_buffer],
+                    &[0, 0],
+                );
                 device.cmd_draw(command_buffer, 3, 1, 0, 0);
             }
 
@@ -485,14 +632,16 @@ fn main() {
                 .unwrap();
         }
 
-        // Block until the gpu is finished  before proceeding to clean up.
-        /*
+        // Block until the gpu is finished before proceeding to clean up.
         device
-            .wait_for_fences(&[frame_in_flight], true, u64::MAX)
+            .wait_for_fences(&frame_in_flight, true, u64::MAX)
             .unwrap();
-        */
 
         // Clean up.
+        device.destroy_buffer(position_buffer, None);
+        device.destroy_buffer(color_buffer, None);
+        device.free_memory(position_buffer_mem, None);
+        device.free_memory(color_buffer_mem, None);
         for i in 0..3 {
             device.destroy_fence(frame_in_flight[i], None);
             device.destroy_semaphore(render_finished[i], None);
