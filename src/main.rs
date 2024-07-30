@@ -1,5 +1,6 @@
 extern crate ash;
 extern crate ash_window;
+extern crate vk_mem;
 extern crate winit;
 
 use ash::vk::{Extent2D, ImageUsageFlags};
@@ -73,6 +74,9 @@ fn main() {
             .into_iter()
             .next()
             .unwrap();
+
+        // Used for later.
+        let device_memory_properties = instance.get_physical_device_memory_properties(pdevice);
 
         let surface = ash_window::create_surface(
             &entry,
@@ -338,17 +342,14 @@ fn main() {
 
         // Synchronization primitives for each frame.
         let image_available: Box<[vk::Semaphore]> = (0..3)
-            .into_iter()
             .map(|_| device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None))
             .collect::<Result<_, _>>()
             .unwrap();
         let render_finished: Box<[vk::Semaphore]> = (0..3)
-            .into_iter()
             .map(|_| device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None))
             .collect::<Result<_, _>>()
             .unwrap();
         let frame_in_flight: Box<[vk::Fence]> = (0..3)
-            .into_iter()
             .map(|_| {
                 device.create_fence(
                     &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
@@ -378,81 +379,52 @@ fn main() {
             panic!();
         };
 
-        let (position_buffer, position_buffer_mem) = {
-            let buffer = device
-                .create_buffer(
-                    &vk::BufferCreateInfo::default()
-                        .size(3 * size_of::<GlVec2>() as u64) // [f32, f32]
-                        .usage(vk::BufferUsageFlags::VERTEX_BUFFER)
-                        .sharing_mode(vk::SharingMode::EXCLUSIVE),
-                    None,
-                )
-                .unwrap();
-            let req = device.get_buffer_memory_requirements(buffer);
-            let memory = device
-                .allocate_memory(
-                    &vk::MemoryAllocateInfo::default()
-                        .allocation_size(req.size)
-                        .memory_type_index(find_memory_type(
-                            req.memory_type_bits,
-                            vk::MemoryPropertyFlags::HOST_VISIBLE
-                                | vk::MemoryPropertyFlags::HOST_COHERENT,
-                        )),
-                    None,
-                )
-                .unwrap();
-            device.bind_buffer_memory(buffer, memory, 0).unwrap();
+        //
+        let allocator = vk_mem::Allocator::new(vk_mem::AllocatorCreateInfo::new(
+            &instance, &device, pdevice,
+        ))
+        .unwrap();
 
-            (buffer, memory)
-        };
+        use vk_mem::Alloc;
+        let (position_buffer, mut position_alloc) = allocator
+            .create_buffer(
+                &vk::BufferCreateInfo::default()
+                    .size(3 * size_of::<GlVec2>() as u64) // [f32, f32]
+                    .usage(vk::BufferUsageFlags::VERTEX_BUFFER)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                &vk_mem::AllocationCreateInfo {
+                    flags: vk_mem::AllocationCreateFlags::MAPPED
+                        | vk_mem::AllocationCreateFlags::HOST_ACCESS_SEQUENTIAL_WRITE,
+                    usage: vk_mem::MemoryUsage::Auto,
+                    required_flags: vk::MemoryPropertyFlags::HOST_VISIBLE
+                        | vk::MemoryPropertyFlags::HOST_COHERENT,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
 
-        let (color_buffer, color_buffer_mem) = {
-            let buffer = device
-                .create_buffer(
-                    &vk::BufferCreateInfo::default()
-                        .size(3 * size_of::<GlVec3>() as u64) // [f32, f32, f32]
-                        .usage(vk::BufferUsageFlags::VERTEX_BUFFER)
-                        .sharing_mode(vk::SharingMode::EXCLUSIVE),
-                    None,
-                )
-                .unwrap();
-            let req = device.get_buffer_memory_requirements(buffer);
-            let memory = device
-                .allocate_memory(
-                    &vk::MemoryAllocateInfo::default()
-                        .allocation_size(req.size)
-                        .memory_type_index(find_memory_type(
-                            req.memory_type_bits,
-                            vk::MemoryPropertyFlags::HOST_VISIBLE
-                                | vk::MemoryPropertyFlags::HOST_COHERENT,
-                        )),
-                    None,
-                )
-                .unwrap();
-            device.bind_buffer_memory(buffer, memory, 0).unwrap();
-
-            (buffer, memory)
-        };
+        let (color_buffer, mut color_alloc) = allocator
+            .create_buffer(
+                &vk::BufferCreateInfo::default()
+                    .size(3 * size_of::<GlVec3>() as u64) // [f32, f32]
+                    .usage(vk::BufferUsageFlags::VERTEX_BUFFER)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                &vk_mem::AllocationCreateInfo {
+                    flags: vk_mem::AllocationCreateFlags::MAPPED
+                        | vk_mem::AllocationCreateFlags::HOST_ACCESS_SEQUENTIAL_WRITE,
+                    usage: vk_mem::MemoryUsage::Auto,
+                    required_flags: vk::MemoryPropertyFlags::HOST_VISIBLE
+                        | vk::MemoryPropertyFlags::HOST_COHERENT,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
 
         {
-            let ptr = device
-                .map_memory(
-                    position_buffer_mem,
-                    0,
-                    3 * size_of::<GlVec2>() as u64,
-                    vk::MemoryMapFlags::empty(),
-                )
-                .unwrap();
+            let ptr = allocator.map_memory(&mut position_alloc).unwrap();
             let position_buffer_map: &mut [GlVec2] = std::slice::from_raw_parts_mut(ptr as _, 3);
 
-            let ptr = device
-                .map_memory(
-                    color_buffer_mem,
-                    0,
-                    3 * size_of::<GlVec3>() as u64,
-                    vk::MemoryMapFlags::empty(),
-                )
-                .unwrap();
+            let ptr = allocator.map_memory(&mut color_alloc).unwrap();
             let color_buffer_map: &mut [GlVec3] = std::slice::from_raw_parts_mut(ptr as _, 3);
 
             //device.flush_mapped_memory_ranges(&[position_buffer_mem, color_buffer_mem]);
@@ -463,8 +435,8 @@ fn main() {
             color_buffer_map[1] = GlVec3(0.0, 1.0, 0.0);
             color_buffer_map[2] = GlVec3(0.0, 0.0, 1.0);
 
-            device.unmap_memory(position_buffer_mem);
-            device.unmap_memory(color_buffer_mem);
+            allocator.unmap_memory(&mut position_alloc);
+            allocator.unmap_memory(&mut color_alloc);
         }
 
         // "Gameloop"
@@ -638,10 +610,8 @@ fn main() {
             .unwrap();
 
         // Clean up.
-        device.destroy_buffer(position_buffer, None);
-        device.destroy_buffer(color_buffer, None);
-        device.free_memory(position_buffer_mem, None);
-        device.free_memory(color_buffer_mem, None);
+        allocator.destroy_buffer(position_buffer, &mut position_alloc);
+        allocator.destroy_buffer(color_buffer, &mut color_alloc);
         for i in 0..3 {
             device.destroy_fence(frame_in_flight[i], None);
             device.destroy_semaphore(render_finished[i], None);

@@ -10,6 +10,8 @@ fn main() {
     if !output.status.success() {
         panic!("{}", String::from_utf8_lossy(&output.stderr));
     }
+    println!("cargo:rerun-if-changed=resources/shaders/shader.vert");
+    println!("cargo:rerun-if-changed=src/shader.vert.spirv");
 
     // Build fragment shader.
     let output = Command::new("glslc")
@@ -20,8 +22,6 @@ fn main() {
     if !output.status.success() {
         panic!("{}", String::from_utf8_lossy(&output.stderr));
     }
-
-    // Do I need this?
-    println!("cargo:rerun-if-changed=resources/shaders/shader.vert");
     println!("cargo:rerun-if-changed=resources/shaders/shader.frag");
+    println!("cargo:rerun-if-changed=src/shader.frag.spirv");
 }
