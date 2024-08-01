@@ -110,7 +110,7 @@ fn main() {
                     .unwrap();
                 (graphics && present).then_some(index as u32)
             })
-            .expect("Could not find suitable queue.");
+            .expect("Could not find a suitable graphics queue.");
 
         let (device, graphics_queue, present_queue) = {
             let features = vk::PhysicalDeviceFeatures::default();
@@ -386,18 +386,33 @@ fn main() {
         .unwrap();
 
         use vk_mem::Alloc;
-        let (position_buffer, mut position_alloc) = allocator
+        let (staging_buffer, mut staging_alloc) = allocator
             .create_buffer(
                 &vk::BufferCreateInfo::default()
-                    .size(3 * size_of::<GlVec2>() as u64) // [f32, f32]
-                    .usage(vk::BufferUsageFlags::VERTEX_BUFFER)
+                    .size(3 * (size_of::<GlVec2>() + size_of::<GlVec3>()) as u64) // [f32, f32]
+                    .usage(vk::BufferUsageFlags::TRANSFER_SRC)
                     .sharing_mode(vk::SharingMode::EXCLUSIVE),
                 &vk_mem::AllocationCreateInfo {
                     flags: vk_mem::AllocationCreateFlags::MAPPED
                         | vk_mem::AllocationCreateFlags::HOST_ACCESS_SEQUENTIAL_WRITE,
-                    usage: vk_mem::MemoryUsage::Auto,
+                    usage: vk_mem::MemoryUsage::AutoPreferHost,
                     required_flags: vk::MemoryPropertyFlags::HOST_VISIBLE
                         | vk::MemoryPropertyFlags::HOST_COHERENT,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let (position_buffer, mut position_alloc) = allocator
+            .create_buffer(
+                &vk::BufferCreateInfo::default()
+                    .size(3 * size_of::<GlVec2>() as u64) // [f32, f32]
+                    .usage(vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                &vk_mem::AllocationCreateInfo {
+                    flags: vk_mem::AllocationCreateFlags::empty(),
+                    usage: vk_mem::MemoryUsage::AutoPreferDevice,
+                    required_flags: vk::MemoryPropertyFlags::DEVICE_LOCAL,
                     ..Default::default()
                 },
             )
@@ -407,25 +422,25 @@ fn main() {
             .create_buffer(
                 &vk::BufferCreateInfo::default()
                     .size(3 * size_of::<GlVec3>() as u64) // [f32, f32]
-                    .usage(vk::BufferUsageFlags::VERTEX_BUFFER)
+                    .usage(vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)
                     .sharing_mode(vk::SharingMode::EXCLUSIVE),
                 &vk_mem::AllocationCreateInfo {
-                    flags: vk_mem::AllocationCreateFlags::MAPPED
-                        | vk_mem::AllocationCreateFlags::HOST_ACCESS_SEQUENTIAL_WRITE,
-                    usage: vk_mem::MemoryUsage::Auto,
-                    required_flags: vk::MemoryPropertyFlags::HOST_VISIBLE
-                        | vk::MemoryPropertyFlags::HOST_COHERENT,
+                    flags: vk_mem::AllocationCreateFlags::empty(),
+                    usage: vk_mem::MemoryUsage::AutoPreferDevice,
+                    required_flags: vk::MemoryPropertyFlags::DEVICE_LOCAL,
                     ..Default::default()
                 },
             )
             .unwrap();
 
         {
-            let ptr = allocator.map_memory(&mut position_alloc).unwrap();
-            let position_buffer_map: &mut [GlVec2] = std::slice::from_raw_parts_mut(ptr as _, 3);
+            let ptr = allocator.map_memory(&mut staging_alloc).unwrap();
 
-            let ptr = allocator.map_memory(&mut color_alloc).unwrap();
-            let color_buffer_map: &mut [GlVec3] = std::slice::from_raw_parts_mut(ptr as _, 3);
+            let ptr0 = ptr;
+            let ptr1 = ptr.add(size_of::<[GlVec2; 3]>());
+
+            let position_buffer_map: &mut [GlVec2] = std::slice::from_raw_parts_mut(ptr0 as _, 3);
+            let color_buffer_map: &mut [GlVec3] = std::slice::from_raw_parts_mut(ptr1 as _, 3);
 
             //device.flush_mapped_memory_ranges(&[position_buffer_mem, color_buffer_mem]);
             position_buffer_map[0] = GlVec2(0.0, -0.5);
@@ -435,8 +450,7 @@ fn main() {
             color_buffer_map[1] = GlVec3(0.0, 1.0, 0.0);
             color_buffer_map[2] = GlVec3(0.0, 0.0, 1.0);
 
-            allocator.unmap_memory(&mut position_alloc);
-            allocator.unmap_memory(&mut color_alloc);
+            allocator.unmap_memory(&mut staging_alloc);
         }
 
         // "Gameloop"
@@ -497,6 +511,29 @@ fn main() {
             device
                 .begin_command_buffer(command_buffer, &vk::CommandBufferBeginInfo::default())
                 .unwrap();
+
+            // Transfer staging.
+            {
+                device.cmd_copy_buffer(
+                    command_buffer,
+                    staging_buffer,
+                    position_buffer,
+                    &[vk::BufferCopy::default()
+                        .src_offset(0)
+                        .dst_offset(0)
+                        .size(3 * size_of::<GlVec2>() as u64)],
+                );
+
+                device.cmd_copy_buffer(
+                    command_buffer,
+                    staging_buffer,
+                    color_buffer,
+                    &[vk::BufferCopy::default()
+                        .src_offset(3 * size_of::<GlVec2>() as u64)
+                        .dst_offset(0)
+                        .size(3 * size_of::<GlVec3>() as u64)],
+                );
+            }
 
             // Used to transmute the layout of the next swapchain image.
             let color_image_memory_barrier = vk::ImageMemoryBarrier::default()
