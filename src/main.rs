@@ -8,18 +8,11 @@ use ash::vk::{Extent2D, ImageUsageFlags};
 use ash::{khr, vk, Entry};
 use glam::*;
 use std::ffi::CStr;
-use std::mem::{self, offset_of, size_of, size_of_val};
+use std::mem::{offset_of, size_of, size_of_val};
 use winit::dpi::PhysicalSize;
 use winit::event_loop::EventLoop;
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::Window;
-
-#[repr(C)]
-struct GlVec2(f32, f32);
-#[repr(C)]
-struct GlVec3(f32, f32, f32);
-#[repr(C)]
-struct GlMat4([[f32; 4]; 4]);
 
 #[repr(C)]
 struct GlobalDescriptorSet {
@@ -245,7 +238,12 @@ fn main() {
         let (pipeline, pipeline_layout) = {
             let pipeline_layout = device
                 .create_pipeline_layout(
-                    &vk::PipelineLayoutCreateInfo::default().set_layouts(&[global_set_layout]),
+                    &vk::PipelineLayoutCreateInfo::default()
+                        .set_layouts(&[global_set_layout])
+                        .push_constant_ranges(&[vk::PushConstantRange::default()
+                            .offset(0)
+                            .size(size_of::<Mat4>() as u32)
+                            .stage_flags(vk::ShaderStageFlags::VERTEX)]),
                     None,
                 )
                 .unwrap();
@@ -275,11 +273,11 @@ fn main() {
                                 .vertex_binding_descriptions(&[
                                     vk::VertexInputBindingDescription::default()
                                         .binding(0)
-                                        .stride(size_of::<GlVec2>() as u32) // [float, float]
+                                        .stride(size_of::<Vec2>() as u32) // [float, float]
                                         .input_rate(vk::VertexInputRate::VERTEX),
                                     vk::VertexInputBindingDescription::default()
                                         .binding(1)
-                                        .stride(size_of::<GlVec3>() as u32) // [float, float, float]
+                                        .stride(size_of::<Vec3>() as u32) // [float, float, float]
                                         .input_rate(vk::VertexInputRate::VERTEX),
                                 ])
                                 .vertex_attribute_descriptions(&[
@@ -437,10 +435,25 @@ fn main() {
             )
             .unwrap();
 
+        let (index_buffer, mut index_alloc) = allocator
+            .create_buffer(
+                &vk::BufferCreateInfo::default()
+                    .size(6 * size_of::<u16>() as u64)
+                    .usage(vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                &vk_mem::AllocationCreateInfo {
+                    flags: vk_mem::AllocationCreateFlags::empty(),
+                    usage: vk_mem::MemoryUsage::AutoPreferDevice,
+                    required_flags: vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
         let (position_buffer, mut position_alloc) = allocator
             .create_buffer(
                 &vk::BufferCreateInfo::default()
-                    .size(3 * size_of::<GlVec2>() as u64) // [f32, f32]
+                    .size(4 * size_of::<Vec2>() as u64)
                     .usage(vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)
                     .sharing_mode(vk::SharingMode::EXCLUSIVE),
                 &vk_mem::AllocationCreateInfo {
@@ -455,7 +468,7 @@ fn main() {
         let (color_buffer, mut color_alloc) = allocator
             .create_buffer(
                 &vk::BufferCreateInfo::default()
-                    .size(3 * size_of::<GlVec3>() as u64) // [f32, f32]
+                    .size(4 * size_of::<Vec3>() as u64)
                     .usage(vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)
                     .sharing_mode(vk::SharingMode::EXCLUSIVE),
                 &vk_mem::AllocationCreateInfo {
@@ -488,8 +501,9 @@ fn main() {
         {
             #[repr(C)]
             struct Staging {
-                positions: [GlVec2; 3],
-                colors: [GlVec3; 3],
+                indices: [u16; 6],
+                positions: [Vec2; 4],
+                colors: [Vec3; 4],
                 global_set: GlobalDescriptorSet,
             }
 
@@ -497,12 +511,19 @@ fn main() {
             let map: &mut Staging = std::mem::transmute::<*mut u8, &mut Staging>(ptr);
 
             //device.flush_mapped_memory_ranges(&[position_buffer_mem, color_buffer_mem]);
-            map.positions[0] = GlVec2(0.0, -0.5);
-            map.positions[1] = GlVec2(0.5, 0.5);
-            map.positions[2] = GlVec2(-0.5, 0.5);
-            map.colors[0] = GlVec3(1.0, 0.0, 0.0);
-            map.colors[1] = GlVec3(0.0, 1.0, 0.0);
-            map.colors[2] = GlVec3(0.0, 0.0, 1.0);
+            map.indices = [0, 1, 2, 2, 3, 0];
+            map.positions = [
+                Vec2::new(-0.5, -0.5),
+                Vec2::new(0.5, -0.5),
+                Vec2::new(0.5, 0.5),
+                Vec2::new(-0.5, 0.5),
+            ];
+            map.colors = [
+                Vec3::new(1.0, 0.0, 0.0),
+                Vec3::new(0.0, 1.0, 0.0),
+                Vec3::new(0.0, 0.0, 1.0),
+                Vec3::new(1.0, 1.0, 1.0),
+            ];
             map.global_set.proj = Mat4::perspective_rh_gl(
                 std::f32::consts::FRAC_PI_4,
                 viewport_w as f32 / viewport_h as f32,
@@ -526,6 +547,16 @@ fn main() {
                     &vk::CommandBufferBeginInfo::default(),
                 )
                 .unwrap();
+
+            device.cmd_copy_buffer(
+                staging_command_buffer,
+                staging_buffer,
+                index_buffer,
+                &[vk::BufferCopy::default()
+                    .src_offset(offset_of!(Staging, indices) as u64)
+                    .dst_offset(0)
+                    .size(size_of_val(&map.indices) as u64)],
+            );
 
             device.cmd_copy_buffer(
                 staging_command_buffer,
@@ -575,6 +606,8 @@ fn main() {
 
         // "Gameloop"
         let mut n = 0;
+        let mut timestamp = 0u64;
+        let mut time = 0f32;
         for frame in (0..3).cycle() {
             // Input.
             let mut exit = false;
@@ -702,14 +735,32 @@ fn main() {
                     &[],
                 );
 
+                let model = Mat4::from_rotation_z(time * std::f32::consts::FRAC_PI_2);
+                device.cmd_push_constants(
+                    command_buffer,
+                    pipeline_layout,
+                    vk::ShaderStageFlags::VERTEX,
+                    0,
+                    std::slice::from_raw_parts(
+                        model.to_cols_array().as_ptr() as _,
+                        size_of::<Mat4>(),
+                    ),
+                );
+
                 device.cmd_bind_pipeline(command_buffer, vk::PipelineBindPoint::GRAPHICS, pipeline);
+                device.cmd_bind_index_buffer(
+                    command_buffer,
+                    index_buffer,
+                    0,
+                    vk::IndexType::UINT16,
+                );
                 device.cmd_bind_vertex_buffers(
                     command_buffer,
                     0,
                     &[position_buffer, color_buffer],
                     &[0, 0],
                 );
-                device.cmd_draw(command_buffer, 3, 1, 0, 0);
+                device.cmd_draw_indexed(command_buffer, 6, 1, 0, 0, 0);
             }
 
             device.cmd_end_rendering(command_buffer);
@@ -755,6 +806,9 @@ fn main() {
             swapchain_device
                 .queue_present(present_queue, &present_info)
                 .unwrap();
+
+            timestamp += 16666;
+            time += 0.016666 * 0.1;
         }
 
         // Block until the gpu is finished before proceeding to clean up.
