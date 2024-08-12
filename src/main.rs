@@ -74,15 +74,16 @@ fn main() {
                 .expect("Failed to create vulkan instance.")
         };
 
-        // Physical device.
+        // Find first descrete GPU.
         let pdevice = instance
             .enumerate_physical_devices()
             .expect("Could not find any Vulkan compatible devices.")
             .into_iter()
-            .nth(1)
+            .find(|&pdevice| {
+                instance.get_physical_device_properties(pdevice).device_type
+                    == vk::PhysicalDeviceType::DISCRETE_GPU
+            })
             .unwrap();
-        //let pdevice_properties = instance.get_physical_device_properties(pdevice);
-        //println!("{:?}", pdevice_properties);
 
         let surface = ash_window::create_surface(
             &entry,
@@ -117,6 +118,17 @@ fn main() {
                 (graphics && present).then_some(index as u32)
             })
             .expect("Could not find a suitable graphics queue.");
+
+        let test = instance
+            .get_physical_device_queue_family_properties(pdevice)
+            .into_iter()
+            .enumerate()
+            .find_map(|(index, properties)| {
+                let graphics = properties.queue_flags.contains(vk::QueueFlags::GRAPHICS);
+                let transfer = properties.queue_flags.contains(vk::QueueFlags::TRANSFER);
+                (!graphics && transfer).then_some(index as u32)
+            });
+        println!("{test:?}");
 
         let (device, graphics_queue, present_queue) = {
             let features = vk::PhysicalDeviceFeatures::default();
@@ -445,12 +457,7 @@ fn main() {
                     .size(6 * size_of::<u16>() as u64)
                     .usage(vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)
                     .sharing_mode(vk::SharingMode::EXCLUSIVE),
-                &vk_mem::AllocationCreateInfo {
-                    flags: vk_mem::AllocationCreateFlags::empty(),
-                    usage: vk_mem::MemoryUsage::AutoPreferDevice,
-                    required_flags: vk::MemoryPropertyFlags::DEVICE_LOCAL,
-                    ..Default::default()
-                },
+                &vk_mem::AllocationCreateInfo::default(),
             )
             .unwrap();
 
@@ -460,12 +467,7 @@ fn main() {
                     .size(4 * size_of::<Vec2>() as u64)
                     .usage(vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)
                     .sharing_mode(vk::SharingMode::EXCLUSIVE),
-                &vk_mem::AllocationCreateInfo {
-                    flags: vk_mem::AllocationCreateFlags::empty(),
-                    usage: vk_mem::MemoryUsage::AutoPreferDevice,
-                    required_flags: vk::MemoryPropertyFlags::DEVICE_LOCAL,
-                    ..Default::default()
-                },
+                &vk_mem::AllocationCreateInfo::default(),
             )
             .unwrap();
 
@@ -475,12 +477,7 @@ fn main() {
                     .size(4 * size_of::<Vec3>() as u64)
                     .usage(vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)
                     .sharing_mode(vk::SharingMode::EXCLUSIVE),
-                &vk_mem::AllocationCreateInfo {
-                    flags: vk_mem::AllocationCreateFlags::empty(),
-                    usage: vk_mem::MemoryUsage::AutoPreferDevice,
-                    required_flags: vk::MemoryPropertyFlags::DEVICE_LOCAL,
-                    ..Default::default()
-                },
+                &vk_mem::AllocationCreateInfo::default(),
             )
             .unwrap();
 
@@ -492,12 +489,7 @@ fn main() {
                         vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
                     )
                     .sharing_mode(vk::SharingMode::EXCLUSIVE),
-                &vk_mem::AllocationCreateInfo {
-                    flags: vk_mem::AllocationCreateFlags::empty(),
-                    usage: vk_mem::MemoryUsage::AutoPreferDevice,
-                    required_flags: vk::MemoryPropertyFlags::DEVICE_LOCAL,
-                    ..Default::default()
-                },
+                &vk_mem::AllocationCreateInfo::default(),
             )
             .unwrap();
 
