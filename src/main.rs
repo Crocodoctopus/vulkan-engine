@@ -7,10 +7,14 @@ extern crate winit;
 use ash::vk::{Extent2D, ImageUsageFlags};
 use ash::{khr, vk, Entry};
 use glam::*;
+use std::f32::consts::FRAC_PI_2;
+use std::f64::consts::FRAC_PI_3;
 use std::ffi::CStr;
 use std::mem::{offset_of, size_of, size_of_val};
 use winit::dpi::PhysicalSize;
+use winit::event::{ElementState, Event, KeyEvent, WindowEvent};
 use winit::event_loop::EventLoop;
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::Window;
 
@@ -497,14 +501,13 @@ fn main() {
             )
             .unwrap();
 
-        // Transfer staging to device local memory.
+        // Upload vertex buffer data.
         {
             #[repr(C)]
             struct Staging {
                 indices: [u16; 6],
                 positions: [Vec2; 4],
                 colors: [Vec3; 4],
-                global_set: GlobalDescriptorSet,
             }
 
             let ptr = allocator.map_memory(&mut staging_alloc).unwrap();
@@ -524,17 +527,6 @@ fn main() {
                 Vec3::new(0.0, 0.0, 1.0),
                 Vec3::new(1.0, 1.0, 1.0),
             ];
-            map.global_set.proj = Mat4::perspective_rh_gl(
-                std::f32::consts::FRAC_PI_4,
-                viewport_w as f32 / viewport_h as f32,
-                0.1,
-                10.0,
-            );
-            map.global_set.view = Mat4::look_at_rh(
-                Vec3::new(2.0, 2.0, 2.0),
-                Vec3::new(0., 0., 0.),
-                Vec3::new(0.0, 0.0, 1.0),
-            );
 
             allocator.unmap_memory(&mut staging_alloc);
 
@@ -578,16 +570,6 @@ fn main() {
                     .size(size_of_val(&map.colors) as u64)],
             );
 
-            device.cmd_copy_buffer(
-                staging_command_buffer,
-                staging_buffer,
-                matrix_buffer,
-                &[vk::BufferCopy::default()
-                    .src_offset(offset_of!(Staging, global_set) as u64)
-                    .dst_offset(0)
-                    .size(size_of_val(&map.global_set) as u64)],
-            );
-
             device.end_command_buffer(staging_command_buffer).unwrap();
 
             let wait = device
@@ -606,18 +588,62 @@ fn main() {
 
         // "Gameloop"
         let mut n = 0;
-        let mut timestamp = 0u64;
-        let mut time = 0f32;
+        let mut timestamp = 0_u64;
+        let mut time = 0_f32;
+        let mut dt = 0.016666_f32;
+        // Misc.
+        let mut cam_x = 0_f32;
+        let mut cam_y = 0_f32;
+        let mut cam_z = 0_f32;
+        let mut cam_hr = 0_f32;
+        let mut cam_vr = 0_f32;
+        let mut w_down = false;
+        let mut a_down = false;
+        let mut s_down = false;
+        let mut d_down = false;
+        let mut q_down = false;
+        let mut e_down = false;
         for frame in (0..3).cycle() {
             // Input.
             let mut exit = false;
             use winit::platform::pump_events::EventLoopExtPumpEvents;
             let _status = event_loop.pump_events(Some(std::time::Duration::ZERO), |event, _| {
                 match event {
-                    winit::event::Event::WindowEvent {
-                        event: winit::event::WindowEvent::CloseRequested,
+                    Event::WindowEvent {
+                        event: WindowEvent::CloseRequested,
                         ..
                     } => exit = true,
+
+                    Event::WindowEvent {
+                        event:
+                            WindowEvent::KeyboardInput {
+                                event:
+                                    KeyEvent {
+                                        physical_key: PhysicalKey::Code(key),
+                                        state,
+                                        repeat: false,
+                                        ..
+                                    },
+                                ..
+                            },
+                        ..
+                    } => {
+                        // Skip repeats.
+                        let var = match key {
+                            KeyCode::KeyW => &mut w_down,
+                            KeyCode::KeyA => &mut a_down,
+                            KeyCode::KeyS => &mut s_down,
+                            KeyCode::KeyD => &mut d_down,
+                            KeyCode::KeyQ => &mut q_down,
+                            KeyCode::KeyE => &mut e_down,
+                            _ => return,
+                        };
+
+                        match state {
+                            ElementState::Pressed => *var = true,
+                            ElementState::Released => *var = false,
+                        }
+                    }
 
                     // Unhandled.
                     _ => {}
@@ -629,6 +655,34 @@ fn main() {
             }
 
             // Update.
+            if w_down && !s_down {
+                // Forward.
+                cam_z += dt * cam_hr.cos();
+                cam_x -= dt * cam_hr.sin();
+            }
+            if !w_down && s_down {
+                cam_z -= dt * cam_hr.cos();
+                cam_x += dt * cam_hr.sin();
+            }
+            if a_down && !d_down {
+                // Forward.
+                cam_x += dt * cam_hr.cos();
+                cam_z += dt * cam_hr.sin();
+            }
+            if !a_down && d_down {
+                cam_x -= dt * cam_hr.cos();
+                cam_z -= dt * cam_hr.sin();
+            }
+
+            if q_down && !e_down {
+                cam_hr -= dt;
+            }
+            if !q_down && e_down {
+                cam_hr += dt;
+            }
+
+            cam_vr = cam_vr.clamp(-FRAC_PI_2, FRAC_PI_2);
+
             n += 1;
             if n > 60 {
                 println!("1s");
@@ -660,6 +714,40 @@ fn main() {
             device
                 .begin_command_buffer(command_buffer, &vk::CommandBufferBeginInfo::default())
                 .unwrap();
+
+            // Upload global descriptor data.
+            {
+                #[repr(C)]
+                struct Staging {
+                    global_set: GlobalDescriptorSet,
+                }
+
+                let ptr = allocator.map_memory(&mut staging_alloc).unwrap();
+                let map: &mut Staging = std::mem::transmute::<*mut u8, &mut Staging>(ptr);
+
+                map.global_set.proj = Mat4::perspective_rh_gl(
+                    std::f32::consts::FRAC_PI_4,
+                    viewport_w as f32 / viewport_h as f32,
+                    0.1,
+                    10.0,
+                );
+                map.global_set.view = Mat4::from_rotation_translation(
+                    Quat::from_euler(EulerRot::YXZ, cam_hr, 0., 0.),
+                    Vec3::new(0., 0., 0.),
+                ) * Mat4::from_translation(Vec3::new(cam_x, cam_y, cam_z));
+
+                allocator.unmap_memory(&mut staging_alloc);
+
+                device.cmd_copy_buffer(
+                    command_buffer,
+                    staging_buffer,
+                    matrix_buffer,
+                    &[vk::BufferCopy::default()
+                        .src_offset(offset_of!(Staging, global_set) as u64)
+                        .dst_offset(0)
+                        .size(size_of_val(&map.global_set) as u64)],
+                );
+            }
 
             // Used to transmute the layout of the next swapchain image.
             let color_image_memory_barrier = vk::ImageMemoryBarrier::default()
@@ -820,6 +908,9 @@ fn main() {
         allocator.destroy_buffer(matrix_buffer, &mut matrix_alloc);
         allocator.destroy_buffer(position_buffer, &mut position_alloc);
         allocator.destroy_buffer(color_buffer, &mut color_alloc);
+        allocator.destroy_buffer(index_buffer, &mut index_alloc);
+        allocator.destroy_buffer(staging_buffer, &mut staging_alloc);
+        drop(allocator);
         for i in 0..3 {
             device.destroy_fence(frame_in_flight[i], None);
             device.destroy_semaphore(render_finished[i], None);
