@@ -119,16 +119,18 @@ fn main() {
             })
             .expect("Could not find a suitable graphics queue.");
 
-        let test = instance
-            .get_physical_device_queue_family_properties(pdevice)
-            .into_iter()
-            .enumerate()
-            .find_map(|(index, properties)| {
-                let graphics = properties.queue_flags.contains(vk::QueueFlags::GRAPHICS);
-                let transfer = properties.queue_flags.contains(vk::QueueFlags::TRANSFER);
-                (!graphics && transfer).then_some(index as u32)
-            });
-        println!("{test:?}");
+        /*
+            let test = instance
+                .get_physical_device_queue_family_properties(pdevice)
+                .into_iter()
+                .enumerate()
+                .find_map(|(index, properties)| {
+                    let graphics = properties.queue_flags.contains(vk::QueueFlags::GRAPHICS);
+                    let transfer = properties.queue_flags.contains(vk::QueueFlags::TRANSFER);
+                    (!graphics && transfer).then_some(index as u32)
+                });
+            println!("{test:?}");
+        */
 
         let (device, graphics_queue, present_queue) = {
             let features = vk::PhysicalDeviceFeatures::default();
@@ -168,6 +170,39 @@ fn main() {
             (device, graphics_queue, present_queue)
         };
 
+        // AMD memory allocator.
+        use vk_mem::Alloc;
+        let allocator = vk_mem::Allocator::new(vk_mem::AllocatorCreateInfo::new(
+            &instance, &device, pdevice,
+        ))
+        .unwrap();
+
+        // Depth
+        let (depth_image, mut depth_image_alloc) = allocator
+            .create_image(
+                &vk::ImageCreateInfo::default()
+                    .image_type(vk::ImageType::TYPE_2D)
+                    .extent(
+                        vk::Extent3D::default()
+                            .width(viewport_w)
+                            .height(viewport_h)
+                            .depth(1),
+                    )
+                    .mip_levels(1)
+                    .array_layers(1)
+                    .initial_layout(vk::ImageLayout::UNDEFINED)
+                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                    .format(vk::Format::D32_SFLOAT)
+                    .tiling(vk::ImageTiling::OPTIMAL)
+                    .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT),
+                &vk_mem::AllocationCreateInfo {
+                    required_flags: vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
         // Swapchain.
         let swapchain_device = khr::swapchain::Device::new(&instance, &device);
         let swapchain = swapchain_device
@@ -192,31 +227,52 @@ fn main() {
             )
             .unwrap();
 
-        // Extract swapchain images and create image views for them.
+        // Create image views.
         let swapchain_images = swapchain_device.get_swapchain_images(swapchain).unwrap();
-        let swapchain_image_views = swapchain_images
-            .iter()
-            .map(|img| {
-                let image_view_cinfo = vk::ImageViewCreateInfo::default()
-                    .image(*img)
-                    .view_type(vk::ImageViewType::TYPE_2D)
-                    .format(surface_format.format)
-                    .components(vk::ComponentMapping {
-                        r: vk::ComponentSwizzle::IDENTITY,
-                        g: vk::ComponentSwizzle::IDENTITY,
-                        b: vk::ComponentSwizzle::IDENTITY,
-                        a: vk::ComponentSwizzle::IDENTITY,
-                    })
-                    .subresource_range(vk::ImageSubresourceRange {
-                        aspect_mask: vk::ImageAspectFlags::COLOR,
-                        base_mip_level: 0,
-                        level_count: 1,
-                        base_array_layer: 0,
-                        layer_count: 1,
-                    });
-                device.create_image_view(&image_view_cinfo, None).unwrap()
-            })
-            .collect::<Vec<vk::ImageView>>();
+        let (swapchain_color_views, swapchain_depth_views) = {
+            let n = swapchain_images.len();
+            let mut color_views = vec![vk::ImageView::null(); n].into_boxed_slice();
+            let mut depth_views = vec![vk::ImageView::null(); n].into_boxed_slice();
+            for i in 0..n {
+                let swapchain_view = device
+                    .create_image_view(
+                        &vk::ImageViewCreateInfo::default()
+                            .image(swapchain_images[i])
+                            .view_type(vk::ImageViewType::TYPE_2D)
+                            .format(surface_format.format)
+                            .subresource_range(vk::ImageSubresourceRange {
+                                aspect_mask: vk::ImageAspectFlags::COLOR,
+                                base_mip_level: 0,
+                                level_count: 1,
+                                base_array_layer: 0,
+                                layer_count: 1,
+                            }),
+                        None,
+                    )
+                    .unwrap();
+
+                let depth_view = device
+                    .create_image_view(
+                        &vk::ImageViewCreateInfo::default()
+                            .image(depth_image)
+                            .view_type(vk::ImageViewType::TYPE_2D)
+                            .format(vk::Format::D32_SFLOAT)
+                            .subresource_range(vk::ImageSubresourceRange {
+                                aspect_mask: vk::ImageAspectFlags::DEPTH,
+                                base_mip_level: 0,
+                                level_count: 1,
+                                base_array_layer: 0,
+                                layer_count: 1,
+                            }),
+                        None,
+                    )
+                    .unwrap();
+
+                color_views[i] = swapchain_view;
+                depth_views[i] = depth_view;
+            }
+            (color_views, depth_views)
+        };
 
         let create_shader_module = |src: &[u8]| {
             let shader_module_cinfo = vk::ShaderModuleCreateInfo {
@@ -270,9 +326,9 @@ fn main() {
                     &[vk::GraphicsPipelineCreateInfo::default()
                         .push_next(
                             &mut vk::PipelineRenderingCreateInfo::default()
-                                .color_attachment_formats(&[surface_format.format]),
+                                .color_attachment_formats(&[surface_format.format])
+                                .depth_attachment_format(vk::Format::D32_SFLOAT),
                         )
-                        // Define shader stages.
                         .stages(&[
                             vk::PipelineShaderStageCreateInfo::default()
                                 .module(vert_shader)
@@ -283,7 +339,6 @@ fn main() {
                                 .stage(vk::ShaderStageFlags::FRAGMENT)
                                 .name(c"main"),
                         ])
-                        // Define input formats.
                         .vertex_input_state(
                             &vk::PipelineVertexInputStateCreateInfo::default()
                                 .vertex_binding_descriptions(&[
@@ -309,7 +364,6 @@ fn main() {
                                         .offset(0),
                                 ]),
                         )
-                        // Define input protocol.
                         .input_assembly_state(
                             &vk::PipelineInputAssemblyStateCreateInfo::default()
                                 .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
@@ -354,6 +408,12 @@ fn main() {
                                 .attachments(&[vk::PipelineColorBlendAttachmentState::default()
                                     .color_write_mask(vk::ColorComponentFlags::RGBA)
                                     .blend_enable(false)]),
+                        )
+                        .depth_stencil_state(
+                            &vk::PipelineDepthStencilStateCreateInfo::default()
+                                .depth_test_enable(true)
+                                .depth_write_enable(true)
+                                .depth_compare_op(vk::CompareOp::LESS),
                         )
                         .layout(pipeline_layout)],
                     None,
@@ -427,13 +487,6 @@ fn main() {
             .collect::<Result<_, _>>()
             .unwrap();
 
-        //
-        let allocator = vk_mem::Allocator::new(vk_mem::AllocatorCreateInfo::new(
-            &instance, &device, pdevice,
-        ))
-        .unwrap();
-
-        use vk_mem::Alloc;
         let (staging_buffer, mut staging_alloc) = allocator
             .create_buffer(
                 &vk::BufferCreateInfo::default()
@@ -647,30 +700,36 @@ fn main() {
             }
 
             // Update.
+
+            // Forward.
             if w_down && !s_down {
-                // Forward.
                 cam_z += dt * cam_hr.cos();
                 cam_x -= dt * cam_hr.sin();
             }
+            // Backward.
             if !w_down && s_down {
                 cam_z -= dt * cam_hr.cos();
                 cam_x += dt * cam_hr.sin();
             }
+
+            // Strafe left.
             if a_down && !d_down {
-                // Forward.
+                cam_hr -= dt;
+            }
+            // Strafe right.
+            if !a_down && d_down {
+                cam_hr += dt;
+            }
+
+            // Turn left.
+            if q_down && !e_down {
                 cam_x += dt * cam_hr.cos();
                 cam_z += dt * cam_hr.sin();
             }
-            if !a_down && d_down {
+            // Turn right.
+            if !q_down && e_down {
                 cam_x -= dt * cam_hr.cos();
                 cam_z -= dt * cam_hr.sin();
-            }
-
-            if q_down && !e_down {
-                cam_hr -= dt;
-            }
-            if !q_down && e_down {
-                cam_hr += dt;
             }
 
             cam_vr = cam_vr.clamp(-FRAC_PI_2, FRAC_PI_2);
@@ -697,7 +756,8 @@ fn main() {
                 .acquire_next_image(swapchain, u64::MAX, image_available, vk::Fence::null())
                 .unwrap();
             let image = swapchain_images[image_index as usize];
-            let image_view = swapchain_image_views[image_index as usize];
+            let color_view = swapchain_color_views[image_index as usize];
+            let depth_view = swapchain_depth_views[image_index as usize];
 
             // Reset and record.
             device
@@ -741,18 +801,6 @@ fn main() {
                 );
             }
 
-            // Used to transmute the layout of the next swapchain image.
-            let color_image_memory_barrier = vk::ImageMemoryBarrier::default()
-                .image(image)
-                .subresource_range(
-                    vk::ImageSubresourceRange::default()
-                        .aspect_mask(vk::ImageAspectFlags::COLOR)
-                        .base_mip_level(0)
-                        .level_count(1)
-                        .base_array_layer(0)
-                        .layer_count(1),
-                );
-
             // Convert VK_IMAGE_LAYOUT_UNDEFINED -> VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL.
             device.cmd_pipeline_barrier(
                 command_buffer,
@@ -761,34 +809,71 @@ fn main() {
                 vk::DependencyFlags::empty(),
                 &[],
                 &[],
-                &[color_image_memory_barrier
-                    .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-                    .old_layout(vk::ImageLayout::UNDEFINED)
-                    .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)],
+                &[
+                    vk::ImageMemoryBarrier::default()
+                        .image(image)
+                        .subresource_range(
+                            vk::ImageSubresourceRange::default()
+                                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                .base_mip_level(0)
+                                .level_count(1)
+                                .base_array_layer(0)
+                                .layer_count(1),
+                        )
+                        .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                        .old_layout(vk::ImageLayout::UNDEFINED)
+                        .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
+                    vk::ImageMemoryBarrier::default()
+                        .image(depth_image)
+                        .subresource_range(
+                            vk::ImageSubresourceRange::default()
+                                .aspect_mask(vk::ImageAspectFlags::DEPTH)
+                                .base_mip_level(0)
+                                .level_count(1)
+                                .base_array_layer(0)
+                                .layer_count(1),
+                        )
+                        .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                        .old_layout(vk::ImageLayout::UNDEFINED)
+                        .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL),
+                ],
             );
-
             // Begin rendering.
-            let color_attachment_infos = [vk::RenderingAttachmentInfo::default()
-                .image_view(image_view)
-                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                .load_op(vk::AttachmentLoadOp::CLEAR)
-                .store_op(vk::AttachmentStoreOp::STORE)
-                .clear_value(vk::ClearValue {
-                    color: vk::ClearColorValue {
-                        float32: [0.0, 0.0, 0.0, 1.0],
-                    },
-                })];
-            let rendering_info = vk::RenderingInfo::default()
-                .render_area(vk::Rect2D {
-                    offset: vk::Offset2D { x: 0, y: 0 },
-                    extent: vk::Extent2D {
-                        width: viewport_w,
-                        height: viewport_h,
-                    },
-                })
-                .layer_count(1)
-                .color_attachments(&color_attachment_infos);
-            device.cmd_begin_rendering(command_buffer, &rendering_info);
+            device.cmd_begin_rendering(
+                command_buffer,
+                &vk::RenderingInfo::default()
+                    .render_area(vk::Rect2D {
+                        offset: vk::Offset2D { x: 0, y: 0 },
+                        extent: vk::Extent2D {
+                            width: viewport_w,
+                            height: viewport_h,
+                        },
+                    })
+                    .layer_count(1)
+                    .depth_attachment(
+                        &vk::RenderingAttachmentInfo::default()
+                            .image_view(depth_view)
+                            .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                            .load_op(vk::AttachmentLoadOp::CLEAR)
+                            .store_op(vk::AttachmentStoreOp::STORE)
+                            .clear_value(vk::ClearValue {
+                                depth_stencil: vk::ClearDepthStencilValue {
+                                    depth: 1.0,
+                                    stencil: 0,
+                                },
+                            }),
+                    )
+                    .color_attachments(&[vk::RenderingAttachmentInfo::default()
+                        .image_view(color_view)
+                        .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                        .load_op(vk::AttachmentLoadOp::CLEAR)
+                        .store_op(vk::AttachmentStoreOp::STORE)
+                        .clear_value(vk::ClearValue {
+                            color: vk::ClearColorValue {
+                                float32: [0.0, 0.0, 0.0, 1.0],
+                            },
+                        })]),
+            );
 
             // Begin draw calls.
             {
@@ -853,10 +938,34 @@ fn main() {
                 vk::DependencyFlags::empty(),
                 &[],
                 &[],
-                &[color_image_memory_barrier
-                    .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-                    .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                    .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)],
+                &[
+                    vk::ImageMemoryBarrier::default()
+                        .image(image)
+                        .subresource_range(
+                            vk::ImageSubresourceRange::default()
+                                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                .base_mip_level(0)
+                                .level_count(1)
+                                .base_array_layer(0)
+                                .layer_count(1),
+                        )
+                        .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                        .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                        .new_layout(vk::ImageLayout::PRESENT_SRC_KHR),
+                    vk::ImageMemoryBarrier::default()
+                        .image(depth_image)
+                        .subresource_range(
+                            vk::ImageSubresourceRange::default()
+                                .aspect_mask(vk::ImageAspectFlags::DEPTH)
+                                .base_mip_level(0)
+                                .level_count(1)
+                                .base_array_layer(0)
+                                .layer_count(1),
+                        )
+                        .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                        .old_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                        .new_layout(vk::ImageLayout::PRESENT_SRC_KHR),
+                ],
             );
 
             device.end_command_buffer(command_buffer).unwrap();
@@ -889,6 +998,7 @@ fn main() {
 
             timestamp += 16666;
             time += 0.016666 * 0.1;
+            //panic!();
         }
 
         // Block until the gpu is finished before proceeding to clean up.
@@ -902,12 +1012,14 @@ fn main() {
         allocator.destroy_buffer(color_buffer, &mut color_alloc);
         allocator.destroy_buffer(index_buffer, &mut index_alloc);
         allocator.destroy_buffer(staging_buffer, &mut staging_alloc);
+        allocator.destroy_image(depth_image, &mut depth_image_alloc);
         drop(allocator);
         for i in 0..3 {
             device.destroy_fence(frame_in_flight[i], None);
             device.destroy_semaphore(render_finished[i], None);
             device.destroy_semaphore(image_available[i], None); // bleh
-            device.destroy_image_view(swapchain_image_views[i], None);
+            device.destroy_image_view(swapchain_depth_views[i], None);
+            device.destroy_image_view(swapchain_color_views[i], None);
         }
         device.destroy_command_pool(command_pool, None);
         device.destroy_descriptor_pool(descriptor_pool, None);
