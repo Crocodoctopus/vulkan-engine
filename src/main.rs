@@ -29,14 +29,14 @@ struct GlobalDescriptorSet {
 fn main() {
     // File IO.
 
-    let viking_room_tex = {
+    let (viking_room_tex, viking_room_tex_w, viking_room_tex_h) = {
         let viking_room_png = include_bytes!("../resources/textures/viking_room.png");
         let decoder = png::Decoder::new(&viking_room_png[..]);
         let mut reader = decoder.read_info().unwrap();
         let mut buf = vec![0; reader.output_buffer_size()];
         let info = reader.next_frame(&mut buf).unwrap();
         assert_eq!(info.buffer_size(), buf.len());
-        buf
+        (buf, info.width, info.height)
     };
 
     let viking_room_model = {
@@ -61,6 +61,7 @@ fn main() {
 
     // Create window.
     let mut event_loop = EventLoop::new().expect("Could not create window event loop.");
+    #[allow(deprecated)]
     let window = event_loop
         .create_window(
             Window::default_attributes()
@@ -164,7 +165,8 @@ fn main() {
                 let mut descriptor_indexing =
                     vk::PhysicalDeviceDescriptorIndexingFeatures::default()
                         .descriptor_binding_uniform_buffer_update_after_bind(true)
-                        .descriptor_binding_partially_bound(true);
+                        .descriptor_binding_partially_bound(true)
+                        .descriptor_binding_sampled_image_update_after_bind(true);
 
                 let mut dynamic_rendering =
                     vk::PhysicalDeviceDynamicRenderingFeatures::default().dynamic_rendering(true);
@@ -315,14 +317,25 @@ fn main() {
                 &vk::DescriptorSetLayoutCreateInfo::default()
                     .push_next(
                         &mut vk::DescriptorSetLayoutBindingFlagsCreateInfo::default()
-                            .binding_flags(&[vk::DescriptorBindingFlags::PARTIALLY_BOUND
-                                | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND]),
+                            .binding_flags(&[
+                                vk::DescriptorBindingFlags::PARTIALLY_BOUND
+                                    | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
+                                vk::DescriptorBindingFlags::PARTIALLY_BOUND
+                                    | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
+                            ]),
                     )
-                    .bindings(&[vk::DescriptorSetLayoutBinding::default()
-                        .binding(0)
-                        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                        .descriptor_count(1)
-                        .stage_flags(vk::ShaderStageFlags::ALL)])
+                    .bindings(&[
+                        vk::DescriptorSetLayoutBinding::default()
+                            .binding(0)
+                            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                            .descriptor_count(1)
+                            .stage_flags(vk::ShaderStageFlags::ALL),
+                        vk::DescriptorSetLayoutBinding::default()
+                            .binding(1)
+                            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                            .descriptor_count(1024)
+                            .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+                    ])
                     .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL),
                 None,
             )
@@ -511,10 +524,68 @@ fn main() {
             .collect::<Result<_, _>>()
             .unwrap();
 
+        let (viking_room_image, mut viking_room_alloc) = allocator
+            .create_image(
+                &vk::ImageCreateInfo::default()
+                    .image_type(vk::ImageType::TYPE_2D)
+                    .extent(vk::Extent3D {
+                        width: viking_room_tex_w,
+                        height: viking_room_tex_h,
+                        depth: 1,
+                    })
+                    .mip_levels(1)
+                    .array_layers(1)
+                    .format(vk::Format::R8G8B8A8_UNORM)
+                    .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+                    .tiling(vk::ImageTiling::OPTIMAL)
+                    .initial_layout(vk::ImageLayout::UNDEFINED)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                    .samples(vk::SampleCountFlags::TYPE_1),
+                &vk_mem::AllocationCreateInfo {
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let viking_room_view = device
+            .create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(viking_room_image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(vk::Format::R8G8B8A8_UNORM)
+                    .subresource_range(
+                        vk::ImageSubresourceRange::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .base_mip_level(0)
+                            .level_count(1)
+                            .base_array_layer(0)
+                            .layer_count(1),
+                    ),
+                None,
+            )
+            .unwrap();
+
+        let viking_room_sampler = device
+            .create_sampler(
+                &vk::SamplerCreateInfo::default()
+                    .mag_filter(vk::Filter::LINEAR)
+                    .min_filter(vk::Filter::LINEAR)
+                    .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                    .unnormalized_coordinates(false)
+                    .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+                    .mip_lod_bias(0.0)
+                    .min_lod(0.0)
+                    .max_lod(0.0),
+                None,
+            )
+            .unwrap();
+
         let (staging_buffer, mut staging_alloc) = allocator
             .create_buffer(
                 &vk::BufferCreateInfo::default()
-                    .size(102704 + 37840)
+                    .size(10000000) // 10MB
                     .usage(vk::BufferUsageFlags::TRANSFER_SRC)
                     .sharing_mode(vk::SharingMode::EXCLUSIVE),
                 &vk_mem::AllocationCreateInfo {
@@ -602,6 +673,15 @@ fn main() {
                 uv_buffer_len,
             );
 
+            let uv_tex_start = uv_buffer_start + uv_buffer_len;
+            //let uv_tex_len = viking_room_tex_w * viking_room_tex_h * 4 * size_of::<u8>() as u32;
+            for i in 0..viking_room_tex.len() / 3 {
+                *ptr.add(uv_tex_start).add(4 * i) = viking_room_tex[3 * i];
+                *ptr.add(uv_tex_start).add(4 * i + 1) = viking_room_tex[3 * i + 1];
+                *ptr.add(uv_tex_start).add(4 * i + 2) = viking_room_tex[3 * i + 2];
+                *ptr.add(uv_tex_start).add(4 * i + 3) = 255;
+            }
+
             allocator.unmap_memory(&mut staging_alloc);
 
             device
@@ -644,6 +724,80 @@ fn main() {
                     .size(uv_buffer_len as u64)],
             );
 
+            device.cmd_pipeline_barrier(
+                staging_command_buffer,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[vk::ImageMemoryBarrier::default()
+                    .image(viking_room_image)
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .subresource_range(
+                        vk::ImageSubresourceRange::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .base_mip_level(0)
+                            .level_count(1)
+                            .base_array_layer(0)
+                            .layer_count(1),
+                    )
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .src_access_mask(vk::AccessFlags::empty())
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)],
+            );
+
+            device.cmd_copy_buffer_to_image(
+                staging_command_buffer,
+                staging_buffer,
+                viking_room_image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[vk::BufferImageCopy::default()
+                    .buffer_offset(uv_tex_start as u64)
+                    .buffer_row_length(0)
+                    .buffer_image_height(0)
+                    .image_subresource(
+                        vk::ImageSubresourceLayers::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .mip_level(0)
+                            .base_array_layer(0)
+                            .layer_count(1),
+                    )
+                    .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
+                    .image_extent(vk::Extent3D {
+                        width: viking_room_tex_w,
+                        height: viking_room_tex_h,
+                        depth: 1,
+                    })],
+            );
+
+            device.cmd_pipeline_barrier(
+                staging_command_buffer,
+                vk::PipelineStageFlags::TRANSFER,
+                vk::PipelineStageFlags::FRAGMENT_SHADER,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[vk::ImageMemoryBarrier::default()
+                    .image(viking_room_image)
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                    .subresource_range(
+                        vk::ImageSubresourceRange::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .base_mip_level(0)
+                            .level_count(1)
+                            .base_array_layer(0)
+                            .layer_count(1),
+                    )
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ)],
+            );
+
             device.end_command_buffer(staging_command_buffer).unwrap();
 
             let wait = device
@@ -661,13 +815,12 @@ fn main() {
         }
 
         // "Gameloop"
-        let mut n = 0;
-        let mut timestamp = 0_u64;
+        //let mut timestamp = 0_u64;
         let mut time = 0_f32;
-        let mut dt = 0.016666_f32;
+        let dt = 0.016666_f32;
         // Misc.
         let mut cam_x = 0_f32;
-        let mut cam_y = 0_f32;
+        let cam_y = 0_f32;
         let mut cam_z = 0_f32;
         let mut cam_hr = 0_f32;
         let mut cam_vr = 0_f32;
@@ -681,6 +834,7 @@ fn main() {
             // Input.
             let mut exit = false;
             use winit::platform::pump_events::EventLoopExtPumpEvents;
+            #[allow(deprecated)]
             let _status = event_loop.pump_events(Some(std::time::Duration::ZERO), |event, _| {
                 match event {
                     Event::WindowEvent {
@@ -763,12 +917,6 @@ fn main() {
 
             cam_vr = cam_vr.clamp(-FRAC_PI_2, FRAC_PI_2);
 
-            n += 1;
-            if n > 60 {
-                println!("1s");
-                n -= 60;
-            }
-
             // Draw.
             let command_buffer = graphics_command_buffers[frame];
             let frame_in_flight = frame_in_flight[frame];
@@ -809,11 +957,11 @@ fn main() {
                 map.global_set.proj = Mat4::perspective_rh_gl(
                     std::f32::consts::FRAC_PI_4,
                     viewport_w as f32 / viewport_h as f32,
-                    0.1,
+                    0.01,
                     10.0,
                 );
                 map.global_set.view = Mat4::from_rotation_translation(
-                    Quat::from_euler(EulerRot::YXZ, cam_hr, 0., 0.),
+                    Quat::from_euler(EulerRot::XYZ, -std::f32::consts::FRAC_PI_8, cam_hr, 0.),
                     Vec3::new(0., 0., 0.),
                 ) * Mat4::from_translation(Vec3::new(cam_x, cam_y, cam_z));
 
@@ -907,16 +1055,28 @@ fn main() {
             // Begin draw calls.
             {
                 device.update_descriptor_sets(
-                    &[vk::WriteDescriptorSet::default()
-                        .dst_set(global_sets[frame])
-                        .dst_binding(0)
-                        .dst_array_element(0)
-                        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                        .descriptor_count(1)
-                        .buffer_info(&[vk::DescriptorBufferInfo::default()
-                            .buffer(matrix_buffer)
-                            .offset(0)
-                            .range(vk::WHOLE_SIZE)])],
+                    &[
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(global_sets[frame])
+                            .dst_binding(0)
+                            .dst_array_element(0)
+                            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                            .descriptor_count(1)
+                            .buffer_info(&[vk::DescriptorBufferInfo::default()
+                                .buffer(matrix_buffer)
+                                .offset(0)
+                                .range(vk::WHOLE_SIZE)]),
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(global_sets[frame])
+                            .dst_binding(1)
+                            .dst_array_element(0)
+                            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                            .descriptor_count(1)
+                            .image_info(&[vk::DescriptorImageInfo::default()
+                                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                                .image_view(viking_room_view)
+                                .sampler(viking_room_sampler)]),
+                    ],
                     &[],
                 );
 
@@ -929,7 +1089,9 @@ fn main() {
                     &[],
                 );
 
-                let model = Mat4::from_rotation_z(time * std::f32::consts::FRAC_PI_2);
+                let model = Mat4::from_translation(Vec3::new(0., 1., 0.));
+                let model = model * Mat4::from_rotation_y(time * std::f32::consts::FRAC_PI_2);
+                let model = model * Mat4::from_rotation_x(std::f32::consts::FRAC_PI_2);
                 device.cmd_push_constants(
                     command_buffer,
                     pipeline_layout,
@@ -1032,7 +1194,7 @@ fn main() {
                 .queue_present(present_queue, &present_info)
                 .unwrap();
 
-            timestamp += 16666;
+            //timestamp += 16666;
             time += 0.016666 * 0.1;
             //panic!();
         }
@@ -1043,6 +1205,9 @@ fn main() {
             .unwrap();
 
         // Clean up.
+        device.destroy_sampler(viking_room_sampler, None);
+        device.destroy_image_view(viking_room_view, None);
+        allocator.destroy_image(viking_room_image, &mut viking_room_alloc);
         allocator.destroy_buffer(matrix_buffer, &mut matrix_alloc);
         allocator.destroy_buffer(position_buffer, &mut position_alloc);
         allocator.destroy_buffer(uv_buffer, &mut uv_alloc);
