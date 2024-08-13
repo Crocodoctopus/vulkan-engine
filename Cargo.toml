@@ -9,3 +9,5 @@ ash-window = "0.13.0"
 winit = { version = "0.30.0", default-features = false, features = ["rwh_06", "x11"] }
 vk-mem = "0.4.0"
 glam = "0.28"
+tobj = "0.1.7"
+png = "0.17.13"

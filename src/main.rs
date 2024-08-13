@@ -1,6 +1,8 @@
 extern crate ash;
 extern crate ash_window;
 extern crate glam;
+extern crate png;
+extern crate tobj;
 extern crate vk_mem;
 extern crate winit;
 
@@ -8,8 +10,8 @@ use ash::vk::{Extent2D, ImageUsageFlags};
 use ash::{khr, vk, Entry};
 use glam::*;
 use std::f32::consts::FRAC_PI_2;
-use std::f64::consts::FRAC_PI_3;
 use std::ffi::CStr;
+use std::io::BufReader;
 use std::mem::{offset_of, size_of, size_of_val};
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, Event, KeyEvent, WindowEvent};
@@ -25,6 +27,28 @@ struct GlobalDescriptorSet {
 }
 
 fn main() {
+    // File IO.
+
+    let viking_room_tex = {
+        let viking_room_png = include_bytes!("../resources/textures/viking_room.png");
+        let decoder = png::Decoder::new(&viking_room_png[..]);
+        let mut reader = decoder.read_info().unwrap();
+        let mut buf = vec![0; reader.output_buffer_size()];
+        let info = reader.next_frame(&mut buf).unwrap();
+        assert_eq!(info.buffer_size(), buf.len());
+        buf
+    };
+
+    let viking_room_model = {
+        let viking_room_obj = include_bytes!("../resources/models/viking_room.obj");
+        let (viking_room_models, _) = tobj::load_obj_buf(
+            &mut BufReader::new(&viking_room_obj[..]),
+            |_| unreachable!(),
+        )
+        .unwrap();
+        viking_room_models.into_iter().next().unwrap().mesh
+    };
+
     // Required Vulkan features.
     let instance_extensions = [];
     let validation_layers = [c"VK_LAYER_KHRONOS_validation"];
@@ -178,7 +202,7 @@ fn main() {
         .unwrap();
 
         // Depth
-        let (depth_image, mut depth_image_alloc) = allocator
+        let (depth_image, mut depth_alloc) = allocator
             .create_image(
                 &vk::ImageCreateInfo::default()
                     .image_type(vk::ImageType::TYPE_2D)
@@ -344,23 +368,23 @@ fn main() {
                                 .vertex_binding_descriptions(&[
                                     vk::VertexInputBindingDescription::default()
                                         .binding(0)
-                                        .stride(size_of::<Vec2>() as u32) // [float, float]
+                                        .stride(size_of::<Vec3>() as u32)
                                         .input_rate(vk::VertexInputRate::VERTEX),
                                     vk::VertexInputBindingDescription::default()
                                         .binding(1)
-                                        .stride(size_of::<Vec3>() as u32) // [float, float, float]
+                                        .stride(size_of::<Vec2>() as u32)
                                         .input_rate(vk::VertexInputRate::VERTEX),
                                 ])
                                 .vertex_attribute_descriptions(&[
                                     vk::VertexInputAttributeDescription::default()
                                         .binding(0)
                                         .location(0)
-                                        .format(vk::Format::R32G32_SFLOAT)
+                                        .format(vk::Format::R32G32B32_SFLOAT)
                                         .offset(0),
                                     vk::VertexInputAttributeDescription::default()
                                         .binding(1)
                                         .location(1)
-                                        .format(vk::Format::R32G32B32_SFLOAT)
+                                        .format(vk::Format::R32G32_SFLOAT)
                                         .offset(0),
                                 ]),
                         )
@@ -490,7 +514,7 @@ fn main() {
         let (staging_buffer, mut staging_alloc) = allocator
             .create_buffer(
                 &vk::BufferCreateInfo::default()
-                    .size(1024)
+                    .size(102704 + 37840)
                     .usage(vk::BufferUsageFlags::TRANSFER_SRC)
                     .sharing_mode(vk::SharingMode::EXCLUSIVE),
                 &vk_mem::AllocationCreateInfo {
@@ -507,7 +531,7 @@ fn main() {
         let (index_buffer, mut index_alloc) = allocator
             .create_buffer(
                 &vk::BufferCreateInfo::default()
-                    .size(6 * size_of::<u16>() as u64)
+                    .size((viking_room_model.indices.len() * size_of::<u32>()) as u64)
                     .usage(vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)
                     .sharing_mode(vk::SharingMode::EXCLUSIVE),
                 &vk_mem::AllocationCreateInfo::default(),
@@ -517,17 +541,17 @@ fn main() {
         let (position_buffer, mut position_alloc) = allocator
             .create_buffer(
                 &vk::BufferCreateInfo::default()
-                    .size(4 * size_of::<Vec2>() as u64)
+                    .size((viking_room_model.positions.len() * size_of::<f32>()) as u64)
                     .usage(vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)
                     .sharing_mode(vk::SharingMode::EXCLUSIVE),
                 &vk_mem::AllocationCreateInfo::default(),
             )
             .unwrap();
 
-        let (color_buffer, mut color_alloc) = allocator
+        let (uv_buffer, mut uv_alloc) = allocator
             .create_buffer(
                 &vk::BufferCreateInfo::default()
-                    .size(4 * size_of::<Vec3>() as u64)
+                    .size((viking_room_model.texcoords.len() * size_of::<f32>()) as u64)
                     .usage(vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)
                     .sharing_mode(vk::SharingMode::EXCLUSIVE),
                 &vk_mem::AllocationCreateInfo::default(),
@@ -548,30 +572,35 @@ fn main() {
 
         // Upload vertex buffer data.
         {
-            #[repr(C)]
-            struct Staging {
-                indices: [u16; 6],
-                positions: [Vec2; 4],
-                colors: [Vec3; 4],
-            }
+            let map = allocator.map_memory(&mut staging_alloc).unwrap();
+            let ptr = map;
 
-            let ptr = allocator.map_memory(&mut staging_alloc).unwrap();
-            let map: &mut Staging = std::mem::transmute::<*mut u8, &mut Staging>(ptr);
+            // Copy indices.
+            let index_buffer_start = 0;
+            let index_buffer_len = viking_room_model.indices.len() * size_of::<u32>();
+            std::ptr::copy_nonoverlapping(
+                viking_room_model.indices.as_ptr() as *const u8,
+                ptr.add(index_buffer_start),
+                index_buffer_len,
+            );
 
-            //device.flush_mapped_memory_ranges(&[position_buffer_mem, color_buffer_mem]);
-            map.indices = [0, 1, 2, 2, 3, 0];
-            map.positions = [
-                Vec2::new(-0.5, -0.5),
-                Vec2::new(0.5, -0.5),
-                Vec2::new(0.5, 0.5),
-                Vec2::new(-0.5, 0.5),
-            ];
-            map.colors = [
-                Vec3::new(1.0, 0.0, 0.0),
-                Vec3::new(0.0, 1.0, 0.0),
-                Vec3::new(0.0, 0.0, 1.0),
-                Vec3::new(1.0, 1.0, 1.0),
-            ];
+            // Copy positions.
+            let position_buffer_start = index_buffer_start + index_buffer_len;
+            let position_buffer_len = viking_room_model.positions.len() * size_of::<f32>();
+            std::ptr::copy_nonoverlapping(
+                viking_room_model.positions.as_ptr() as *const u8,
+                ptr.add(position_buffer_start),
+                position_buffer_len,
+            );
+
+            // Copy positions.
+            let uv_buffer_start = position_buffer_start + position_buffer_len;
+            let uv_buffer_len = viking_room_model.texcoords.len() * size_of::<f32>();
+            std::ptr::copy_nonoverlapping(
+                viking_room_model.texcoords.as_ptr() as *const u8,
+                ptr.add(uv_buffer_start),
+                uv_buffer_len,
+            );
 
             allocator.unmap_memory(&mut staging_alloc);
 
@@ -590,9 +619,9 @@ fn main() {
                 staging_buffer,
                 index_buffer,
                 &[vk::BufferCopy::default()
-                    .src_offset(offset_of!(Staging, indices) as u64)
+                    .src_offset(index_buffer_start as u64)
                     .dst_offset(0)
-                    .size(size_of_val(&map.indices) as u64)],
+                    .size(index_buffer_len as u64)],
             );
 
             device.cmd_copy_buffer(
@@ -600,19 +629,19 @@ fn main() {
                 staging_buffer,
                 position_buffer,
                 &[vk::BufferCopy::default()
-                    .src_offset(offset_of!(Staging, positions) as u64)
+                    .src_offset(position_buffer_start as u64)
                     .dst_offset(0)
-                    .size(size_of_val(&map.positions) as u64)],
+                    .size(position_buffer_len as u64)],
             );
 
             device.cmd_copy_buffer(
                 staging_command_buffer,
                 staging_buffer,
-                color_buffer,
+                uv_buffer,
                 &[vk::BufferCopy::default()
-                    .src_offset(offset_of!(Staging, colors) as u64)
+                    .src_offset(uv_buffer_start as u64)
                     .dst_offset(0)
-                    .size(size_of_val(&map.colors) as u64)],
+                    .size(uv_buffer_len as u64)],
             );
 
             device.end_command_buffer(staging_command_buffer).unwrap();
@@ -917,15 +946,22 @@ fn main() {
                     command_buffer,
                     index_buffer,
                     0,
-                    vk::IndexType::UINT16,
+                    vk::IndexType::UINT32,
                 );
                 device.cmd_bind_vertex_buffers(
                     command_buffer,
                     0,
-                    &[position_buffer, color_buffer],
+                    &[position_buffer, uv_buffer],
                     &[0, 0],
                 );
-                device.cmd_draw_indexed(command_buffer, 6, 1, 0, 0, 0);
+                device.cmd_draw_indexed(
+                    command_buffer,
+                    viking_room_model.indices.len() as u32,
+                    1,
+                    0,
+                    0,
+                    0,
+                );
             }
 
             device.cmd_end_rendering(command_buffer);
@@ -1009,10 +1045,10 @@ fn main() {
         // Clean up.
         allocator.destroy_buffer(matrix_buffer, &mut matrix_alloc);
         allocator.destroy_buffer(position_buffer, &mut position_alloc);
-        allocator.destroy_buffer(color_buffer, &mut color_alloc);
+        allocator.destroy_buffer(uv_buffer, &mut uv_alloc);
         allocator.destroy_buffer(index_buffer, &mut index_alloc);
         allocator.destroy_buffer(staging_buffer, &mut staging_alloc);
-        allocator.destroy_image(depth_image, &mut depth_image_alloc);
+        allocator.destroy_image(depth_image, &mut depth_alloc);
         drop(allocator);
         for i in 0..3 {
             device.destroy_fence(frame_in_flight[i], None);
