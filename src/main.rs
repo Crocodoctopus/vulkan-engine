@@ -1,18 +1,22 @@
 extern crate ash;
 extern crate ash_window;
 extern crate glam;
+extern crate itertools;
 extern crate png;
 extern crate tobj;
 extern crate vk_mem;
 extern crate winit;
 
+mod staging;
+
 use ash::vk::{Extent2D, ImageUsageFlags};
 use ash::{khr, vk, Entry};
 use glam::*;
+use itertools::Itertools;
 use std::f32::consts::FRAC_PI_2;
 use std::ffi::CStr;
 use std::io::BufReader;
-use std::mem::{offset_of, size_of, size_of_val};
+use std::mem::size_of;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, Event, KeyEvent, WindowEvent};
 use winit::event_loop::EventLoop;
@@ -20,7 +24,10 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::Window;
 
+use crate::staging::StagingBuffer;
+
 #[repr(C)]
+#[derive(Copy, Clone, Debug)]
 struct GlobalDescriptorSet {
     proj: Mat4,
     view: Mat4,
@@ -28,7 +35,6 @@ struct GlobalDescriptorSet {
 
 fn main() {
     // File IO.
-
     let (viking_room_tex, viking_room_tex_w, viking_room_tex_h) = {
         let viking_room_png = include_bytes!("../resources/textures/viking_room.png");
         let decoder = png::Decoder::new(&viking_room_png[..]);
@@ -582,22 +588,8 @@ fn main() {
             )
             .unwrap();
 
-        let (staging_buffer, mut staging_alloc) = allocator
-            .create_buffer(
-                &vk::BufferCreateInfo::default()
-                    .size(10000000) // 10MB
-                    .usage(vk::BufferUsageFlags::TRANSFER_SRC)
-                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
-                &vk_mem::AllocationCreateInfo {
-                    flags: vk_mem::AllocationCreateFlags::MAPPED
-                        | vk_mem::AllocationCreateFlags::HOST_ACCESS_SEQUENTIAL_WRITE,
-                    usage: vk_mem::MemoryUsage::AutoPreferHost,
-                    required_flags: vk::MemoryPropertyFlags::HOST_VISIBLE
-                        | vk::MemoryPropertyFlags::HOST_COHERENT,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+        // TODO: delete
+        let mut staging_buffer = StagingBuffer::new(10000000, &allocator);
 
         let (index_buffer, mut index_alloc) = allocator
             .create_buffer(
@@ -643,47 +635,6 @@ fn main() {
 
         // Upload vertex buffer data.
         {
-            let map = allocator.map_memory(&mut staging_alloc).unwrap();
-            let ptr = map;
-
-            // Copy indices.
-            let index_buffer_start = 0;
-            let index_buffer_len = viking_room_model.indices.len() * size_of::<u32>();
-            std::ptr::copy_nonoverlapping(
-                viking_room_model.indices.as_ptr() as *const u8,
-                ptr.add(index_buffer_start),
-                index_buffer_len,
-            );
-
-            // Copy positions.
-            let position_buffer_start = index_buffer_start + index_buffer_len;
-            let position_buffer_len = viking_room_model.positions.len() * size_of::<f32>();
-            std::ptr::copy_nonoverlapping(
-                viking_room_model.positions.as_ptr() as *const u8,
-                ptr.add(position_buffer_start),
-                position_buffer_len,
-            );
-
-            // Copy positions.
-            let uv_buffer_start = position_buffer_start + position_buffer_len;
-            let uv_buffer_len = viking_room_model.texcoords.len() * size_of::<f32>();
-            std::ptr::copy_nonoverlapping(
-                viking_room_model.texcoords.as_ptr() as *const u8,
-                ptr.add(uv_buffer_start),
-                uv_buffer_len,
-            );
-
-            let uv_tex_start = uv_buffer_start + uv_buffer_len;
-            //let uv_tex_len = viking_room_tex_w * viking_room_tex_h * 4 * size_of::<u8>() as u32;
-            for i in 0..viking_room_tex.len() / 3 {
-                *ptr.add(uv_tex_start).add(4 * i) = viking_room_tex[3 * i];
-                *ptr.add(uv_tex_start).add(4 * i + 1) = viking_room_tex[3 * i + 1];
-                *ptr.add(uv_tex_start).add(4 * i + 2) = viking_room_tex[3 * i + 2];
-                *ptr.add(uv_tex_start).add(4 * i + 3) = 255;
-            }
-
-            allocator.unmap_memory(&mut staging_alloc);
-
             device
                 .reset_command_buffer(staging_command_buffer, vk::CommandBufferResetFlags::empty())
                 .unwrap();
@@ -694,115 +645,30 @@ fn main() {
                 )
                 .unwrap();
 
-            device.cmd_copy_buffer(
-                staging_command_buffer,
-                staging_buffer,
-                index_buffer,
-                &[vk::BufferCopy::default()
-                    .src_offset(index_buffer_start as u64)
-                    .dst_offset(0)
-                    .size(index_buffer_len as u64)],
-            );
-
-            device.cmd_copy_buffer(
-                staging_command_buffer,
-                staging_buffer,
-                position_buffer,
-                &[vk::BufferCopy::default()
-                    .src_offset(position_buffer_start as u64)
-                    .dst_offset(0)
-                    .size(position_buffer_len as u64)],
-            );
-
-            device.cmd_copy_buffer(
-                staging_command_buffer,
-                staging_buffer,
-                uv_buffer,
-                &[vk::BufferCopy::default()
-                    .src_offset(uv_buffer_start as u64)
-                    .dst_offset(0)
-                    .size(uv_buffer_len as u64)],
-            );
-
-            device.cmd_pipeline_barrier(
-                staging_command_buffer,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[vk::ImageMemoryBarrier::default()
-                    .image(viking_room_image)
-                    .old_layout(vk::ImageLayout::UNDEFINED)
-                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                    .subresource_range(
-                        vk::ImageSubresourceRange::default()
-                            .aspect_mask(vk::ImageAspectFlags::COLOR)
-                            .base_mip_level(0)
-                            .level_count(1)
-                            .base_array_layer(0)
-                            .layer_count(1),
-                    )
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .src_access_mask(vk::AccessFlags::empty())
-                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)],
-            );
-
-            device.cmd_copy_buffer_to_image(
-                staging_command_buffer,
-                staging_buffer,
-                viking_room_image,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                &[vk::BufferImageCopy::default()
-                    .buffer_offset(uv_tex_start as u64)
-                    .buffer_row_length(0)
-                    .buffer_image_height(0)
-                    .image_subresource(
-                        vk::ImageSubresourceLayers::default()
-                            .aspect_mask(vk::ImageAspectFlags::COLOR)
-                            .mip_level(0)
-                            .base_array_layer(0)
-                            .layer_count(1),
-                    )
-                    .image_offset(vk::Offset3D { x: 0, y: 0, z: 0 })
-                    .image_extent(vk::Extent3D {
-                        width: viking_room_tex_w,
-                        height: viking_room_tex_h,
-                        depth: 1,
-                    })],
-            );
-
-            device.cmd_pipeline_barrier(
-                staging_command_buffer,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::PipelineStageFlags::FRAGMENT_SHADER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[vk::ImageMemoryBarrier::default()
-                    .image(viking_room_image)
-                    .old_layout(vk::ImageLayout::UNDEFINED)
-                    .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
-                    .subresource_range(
-                        vk::ImageSubresourceRange::default()
-                            .aspect_mask(vk::ImageAspectFlags::COLOR)
-                            .base_mip_level(0)
-                            .level_count(1)
-                            .base_array_layer(0)
-                            .layer_count(1),
-                    )
-                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                    .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                    .dst_access_mask(vk::AccessFlags::SHADER_READ)],
-            );
+            staging_buffer
+                .begin_transfer(&device, staging_command_buffer)
+                .stage_buffer::<u32>(index_buffer, 0, &viking_room_model.indices)
+                .stage_buffer(position_buffer, 0, viking_room_model.positions)
+                .stage_buffer(uv_buffer, 0, viking_room_model.texcoords)
+                .stage_image(
+                    viking_room_image,
+                    viking_room_tex_w,
+                    viking_room_tex_h,
+                    viking_room_tex
+                        .iter()
+                        .tuples()
+                        .flat_map(|(&x, &y, &z)| [x, y, z, 255]),
+                )
+                .finish();
 
             device.end_command_buffer(staging_command_buffer).unwrap();
 
+            // Create wait fence.
             let wait = device
                 .create_fence(&vk::FenceCreateInfo::default(), None)
                 .unwrap();
+
+            // Submit.
             device
                 .queue_submit(
                     graphics_queue,
@@ -810,6 +676,8 @@ fn main() {
                     wait,
                 )
                 .unwrap();
+
+            // Wait.
             device.wait_for_fences(&[wait], true, u64::MAX).unwrap();
             device.destroy_fence(wait, None);
         }
@@ -945,38 +813,30 @@ fn main() {
                 .unwrap();
 
             // Upload global descriptor data.
-            {
-                #[repr(C)]
-                struct Staging {
-                    global_set: GlobalDescriptorSet,
-                }
-
-                let ptr = allocator.map_memory(&mut staging_alloc).unwrap();
-                let map: &mut Staging = std::mem::transmute::<*mut u8, &mut Staging>(ptr);
-
-                map.global_set.proj = Mat4::perspective_rh_gl(
-                    std::f32::consts::FRAC_PI_4,
-                    viewport_w as f32 / viewport_h as f32,
-                    0.01,
-                    10.0,
-                );
-                map.global_set.view = Mat4::from_rotation_translation(
-                    Quat::from_euler(EulerRot::XYZ, -std::f32::consts::FRAC_PI_8, cam_hr, 0.),
-                    Vec3::new(0., 0., 0.),
-                ) * Mat4::from_translation(Vec3::new(cam_x, cam_y, cam_z));
-
-                allocator.unmap_memory(&mut staging_alloc);
-
-                device.cmd_copy_buffer(
-                    command_buffer,
-                    staging_buffer,
+            staging_buffer
+                .begin_transfer(&device, command_buffer)
+                .stage_buffer(
                     matrix_buffer,
-                    &[vk::BufferCopy::default()
-                        .src_offset(offset_of!(Staging, global_set) as u64)
-                        .dst_offset(0)
-                        .size(size_of_val(&map.global_set) as u64)],
-                );
-            }
+                    0,
+                    std::iter::once_with(|| GlobalDescriptorSet {
+                        proj: Mat4::perspective_rh_gl(
+                            std::f32::consts::FRAC_PI_4,
+                            viewport_w as f32 / viewport_h as f32,
+                            0.01,
+                            10.0,
+                        ),
+                        view: Mat4::from_rotation_translation(
+                            Quat::from_euler(
+                                EulerRot::XYZ,
+                                -std::f32::consts::FRAC_PI_8,
+                                cam_hr,
+                                0.,
+                            ),
+                            Vec3::new(0., 0., 0.),
+                        ) * Mat4::from_translation(Vec3::new(cam_x, cam_y, cam_z)),
+                    }),
+                )
+                .finish();
 
             // Convert VK_IMAGE_LAYOUT_UNDEFINED -> VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL.
             device.cmd_pipeline_barrier(
@@ -1212,7 +1072,7 @@ fn main() {
         allocator.destroy_buffer(position_buffer, &mut position_alloc);
         allocator.destroy_buffer(uv_buffer, &mut uv_alloc);
         allocator.destroy_buffer(index_buffer, &mut index_alloc);
-        allocator.destroy_buffer(staging_buffer, &mut staging_alloc);
+        staging_buffer.destroy(&allocator);
         allocator.destroy_image(depth_image, &mut depth_alloc);
         drop(allocator);
         for i in 0..3 {
