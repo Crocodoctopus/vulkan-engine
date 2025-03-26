@@ -148,6 +148,10 @@ impl Renderer {
                 let extensions = device_extensions.map(|x: &CStr| x.as_ptr());
 
                 let device = {
+                    let mut device_address =
+                        vk::PhysicalDeviceBufferDeviceAddressFeatures::default()
+                            .buffer_device_address(true);
+
                     let mut descriptor_indexing =
                         vk::PhysicalDeviceDescriptorIndexingFeatures::default()
                             .descriptor_binding_uniform_buffer_update_after_bind(true)
@@ -167,6 +171,7 @@ impl Renderer {
                     let device_cinfo = vk::DeviceCreateInfo::default()
                         .push_next(&mut descriptor_indexing)
                         .push_next(&mut dynamic_rendering)
+                        .push_next(&mut device_address)
                         .queue_create_infos(&queue_cinfo)
                         .enabled_extension_names(&extensions)
                         .enabled_features(&features);
@@ -185,12 +190,10 @@ impl Renderer {
 
             // AMD memory allocator.
             use vk_mem::Alloc;
-            let allocator = vk_mem::Allocator::new(vk_mem::AllocatorCreateInfo::new(
-                &instance,
-                &device,
-                physical_device,
-            ))
-            .unwrap();
+            let mut allocator_cinfo =
+                vk_mem::AllocatorCreateInfo::new(&instance, &device, physical_device);
+            allocator_cinfo.flags |= vk_mem::AllocatorCreateFlags::BUFFER_DEVICE_ADDRESS;
+            let allocator = vk_mem::Allocator::new(allocator_cinfo).unwrap();
 
             // Create depth attachment for rendering.
             let (depth_image, depth_alloc) = allocator

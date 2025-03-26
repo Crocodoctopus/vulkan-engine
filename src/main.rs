@@ -15,7 +15,7 @@ use ash::vk;
 use glam::*;
 use itertools::Itertools;
 use std::f32::consts::FRAC_PI_2;
-use std::fs::{self, OpenOptions};
+use std::fmt::LowerHex;
 use std::io::BufReader;
 use std::mem::size_of;
 use vk_mem::Alloc;
@@ -32,6 +32,22 @@ use crate::staging::StagingBuffer;
 struct GlobalDescriptorSet {
     proj: Mat4,
     view: Mat4,
+}
+
+#[repr(C)]
+struct PushConstant {
+    model: Mat4,
+    buffer: vk::DeviceAddress,
+}
+
+#[repr(C)]
+#[derive(Clone, Debug, Default)]
+struct Vertex {
+    position: Vec3,
+    u: f32,
+    normal: Vec3,
+    v: f32,
+    color: Vec4,
 }
 
 fn main() {
@@ -122,7 +138,7 @@ fn main() {
                         .set_layouts(&[global_set_layout])
                         .push_constant_ranges(&[vk::PushConstantRange::default()
                             .offset(0)
-                            .size(size_of::<Mat4>() as u32)
+                            .size(size_of::<PushConstant>() as u32)
                             .stage_flags(vk::ShaderStageFlags::VERTEX)]),
                     None,
                 )
@@ -148,31 +164,7 @@ fn main() {
                                 .stage(vk::ShaderStageFlags::FRAGMENT)
                                 .name(c"main"),
                         ])
-                        .vertex_input_state(
-                            &vk::PipelineVertexInputStateCreateInfo::default()
-                                .vertex_binding_descriptions(&[
-                                    vk::VertexInputBindingDescription::default()
-                                        .binding(0)
-                                        .stride(size_of::<Vec3>() as u32)
-                                        .input_rate(vk::VertexInputRate::VERTEX),
-                                    vk::VertexInputBindingDescription::default()
-                                        .binding(1)
-                                        .stride(size_of::<Vec2>() as u32)
-                                        .input_rate(vk::VertexInputRate::VERTEX),
-                                ])
-                                .vertex_attribute_descriptions(&[
-                                    vk::VertexInputAttributeDescription::default()
-                                        .binding(0)
-                                        .location(0)
-                                        .format(vk::Format::R32G32B32_SFLOAT)
-                                        .offset(0),
-                                    vk::VertexInputAttributeDescription::default()
-                                        .binding(1)
-                                        .location(1)
-                                        .format(vk::Format::R32G32_SFLOAT)
-                                        .offset(0),
-                                ]),
-                        )
+                        .vertex_input_state(&vk::PipelineVertexInputStateCreateInfo::default())
                         .input_assembly_state(
                             &vk::PipelineInputAssemblyStateCreateInfo::default()
                                 .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
@@ -383,25 +375,20 @@ fn main() {
             )
             .unwrap();
 
-        let (position_buffer, mut position_alloc) = renderer
+        let vertex_buffer = renderer
             .allocator
             .create_buffer(
                 &vk::BufferCreateInfo::default()
-                    .size((viking_room_model.positions.len() * size_of::<f32>()) as u64)
-                    .usage(vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)
+                    .size((viking_room_model.positions.len() * size_of::<Vertex>()) as u64)
+                    .usage(
+                        vk::BufferUsageFlags::VERTEX_BUFFER
+                            | vk::BufferUsageFlags::TRANSFER_DST
+                            | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                    )
                     .sharing_mode(vk::SharingMode::EXCLUSIVE),
-                &vk_mem::AllocationCreateInfo::default(),
-            )
-            .unwrap();
-
-        let (uv_buffer, mut uv_alloc) = renderer
-            .allocator
-            .create_buffer(
-                &vk::BufferCreateInfo::default()
-                    .size((viking_room_model.texcoords.len() * size_of::<f32>()) as u64)
-                    .usage(vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)
-                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
-                &vk_mem::AllocationCreateInfo::default(),
+                &vk_mem::AllocationCreateInfo {
+                    ..Default::default()
+                },
             )
             .unwrap();
 
@@ -432,11 +419,28 @@ fn main() {
                 )
                 .unwrap();
 
+            let vertices: Box<[Vertex]> = (0..viking_room_model.positions.len() / 3)
+                .map(|i| Vertex {
+                    position: Vec3::new(
+                        viking_room_model.positions[3 * i],
+                        viking_room_model.positions[3 * i + 1],
+                        viking_room_model.positions[3 * i + 2],
+                    ),
+                    u: viking_room_model.texcoords[2 * i],
+                    normal: Vec3::new(
+                        viking_room_model.normals[3 * i],
+                        viking_room_model.normals[3 * i + 1],
+                        viking_room_model.normals[3 * i + 2],
+                    ),
+                    v: viking_room_model.texcoords[2 * i + 1],
+                    color: Vec4::splat(1.0),
+                })
+                .collect();
+
             staging_buffer
                 .begin_transfer(&renderer.device, staging_command_buffer)
                 .stage_buffer::<u32>(index_buffer, 0, &viking_room_model.indices)
-                .stage_buffer(position_buffer, 0, viking_room_model.positions)
-                .stage_buffer(uv_buffer, 0, viking_room_model.texcoords)
+                .stage_buffer(vertex_buffer.0, 0, vertices)
                 .stage_image(
                     viking_room_image,
                     viking_room_tex_w,
@@ -756,14 +760,20 @@ fn main() {
                 let model = Mat4::from_translation(Vec3::new(0., 1., 0.));
                 let model = model * Mat4::from_rotation_y(time * std::f32::consts::FRAC_PI_2);
                 let model = model * Mat4::from_rotation_x(std::f32::consts::FRAC_PI_2);
+                let push_constant = PushConstant {
+                    model,
+                    buffer: renderer.device.get_buffer_device_address(
+                        &vk::BufferDeviceAddressInfo::default().buffer(vertex_buffer.0),
+                    ),
+                };
                 renderer.device.cmd_push_constants(
                     command_buffer,
                     pipeline_layout,
                     vk::ShaderStageFlags::VERTEX,
                     0,
                     std::slice::from_raw_parts(
-                        model.to_cols_array().as_ptr() as _,
-                        size_of::<Mat4>(),
+                        &push_constant as *const PushConstant as *const u8,
+                        size_of::<PushConstant>(),
                     ),
                 );
 
@@ -777,12 +787,6 @@ fn main() {
                     index_buffer,
                     0,
                     vk::IndexType::UINT32,
-                );
-                renderer.device.cmd_bind_vertex_buffers(
-                    command_buffer,
-                    0,
-                    &[position_buffer, uv_buffer],
-                    &[0, 0],
                 );
                 renderer.device.cmd_draw_indexed(
                     command_buffer,

@@ -70,7 +70,7 @@ pub struct Staging<'a> {
 }
 
 impl<'a> Staging<'a> {
-    pub unsafe fn stage_buffer<T: Copy>(
+    pub unsafe fn stage_buffer<T: Clone>(
         mut self,
         dst: vk::Buffer,
         offset: u64,
@@ -78,7 +78,7 @@ impl<'a> Staging<'a> {
     ) -> Self {
         let start = self.ptr;
         for t in data {
-            *(self.ptr as *mut T) = *t.borrow();
+            *(self.ptr as *mut T) = t.borrow().clone();
             self.ptr = self.ptr.wrapping_add(std::mem::size_of::<T>());
         }
 
