@@ -50,9 +50,19 @@ pub struct Renderer {
     pub swapchain_images: Box<[vk::Image]>,
     pub swapchain_color_views: Box<[vk::ImageView]>,
     pub swapchain_depth_views: Box<[vk::ImageView]>,
+    //    pub sets_per_pool: u32,
+    //    pub pools: Vec<vk::DescriptorPool>,
 }
 
 impl Renderer {
+    /*
+        pub fn create_pool(&mut self)
+
+        pub fn get_pool(&mut self) -> &vk::DescriptorPool {
+            let last_pool = self.pools.last().unwrap();
+        }
+    */
+
     pub fn new(
         viewport_w: u32,
         viewport_h: u32,
@@ -148,19 +158,16 @@ impl Renderer {
                 let extensions = device_extensions.map(|x: &CStr| x.as_ptr());
 
                 let device = {
-                    let mut device_address =
-                        vk::PhysicalDeviceBufferDeviceAddressFeatures::default()
-                            .buffer_device_address(true);
+                    let mut vk12features = vk::PhysicalDeviceVulkan12Features::default()
+                        .buffer_device_address(true)
+                        .descriptor_binding_uniform_buffer_update_after_bind(true)
+                        .descriptor_binding_partially_bound(true)
+                        .descriptor_binding_sampled_image_update_after_bind(true)
+                        .descriptor_indexing(true)
+                        .runtime_descriptor_array(true);
 
-                    let mut descriptor_indexing =
-                        vk::PhysicalDeviceDescriptorIndexingFeatures::default()
-                            .descriptor_binding_uniform_buffer_update_after_bind(true)
-                            .descriptor_binding_partially_bound(true)
-                            .descriptor_binding_sampled_image_update_after_bind(true);
-
-                    let mut dynamic_rendering =
-                        vk::PhysicalDeviceDynamicRenderingFeatures::default()
-                            .dynamic_rendering(true);
+                    let mut vk13features =
+                        vk::PhysicalDeviceVulkan13Features::default().dynamic_rendering(true);
 
                     let priority = [1.0];
 
@@ -169,9 +176,8 @@ impl Renderer {
                         .queue_priorities(&priority)];
 
                     let device_cinfo = vk::DeviceCreateInfo::default()
-                        .push_next(&mut descriptor_indexing)
-                        .push_next(&mut dynamic_rendering)
-                        .push_next(&mut device_address)
+                        .push_next(&mut vk12features)
+                        .push_next(&mut vk13features)
                         .queue_create_infos(&queue_cinfo)
                         .enabled_extension_names(&extensions)
                         .enabled_features(&features);

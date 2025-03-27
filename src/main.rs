@@ -15,7 +15,6 @@ use ash::vk;
 use glam::*;
 use itertools::Itertools;
 use std::f32::consts::FRAC_PI_2;
-use std::fmt::LowerHex;
 use std::io::BufReader;
 use std::mem::size_of;
 use vk_mem::Alloc;
@@ -38,6 +37,7 @@ struct GlobalDescriptorSet {
 struct PushConstant {
     model: Mat4,
     buffer: vk::DeviceAddress,
+    texture_id: u32,
 }
 
 #[repr(C)]
@@ -238,15 +238,17 @@ fn main() {
             )
             .unwrap();
 
-        let global_sets = renderer
+        let global_set = renderer
             .device
             .allocate_descriptor_sets(
                 &vk::DescriptorSetAllocateInfo::default()
                     .descriptor_pool(descriptor_pool)
-                    .set_layouts(&[global_set_layout, global_set_layout, global_set_layout]),
+                    .set_layouts(&[global_set_layout]),
             )
             .unwrap()
-            .into_boxed_slice();
+            .into_iter()
+            .next()
+            .unwrap();
 
         let command_pool = renderer
             .device
@@ -722,10 +724,19 @@ fn main() {
 
             // Begin draw calls.
             {
+                renderer.device.cmd_bind_descriptor_sets(
+                    command_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    pipeline_layout,
+                    0,
+                    &[global_set],
+                    &[],
+                );
+
                 renderer.device.update_descriptor_sets(
                     &[
                         vk::WriteDescriptorSet::default()
-                            .dst_set(global_sets[frame])
+                            .dst_set(global_set)
                             .dst_binding(0)
                             .dst_array_element(0)
                             .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
@@ -735,7 +746,7 @@ fn main() {
                                 .offset(0)
                                 .range(vk::WHOLE_SIZE)]),
                         vk::WriteDescriptorSet::default()
-                            .dst_set(global_sets[frame])
+                            .dst_set(global_set)
                             .dst_binding(1)
                             .dst_array_element(0)
                             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
@@ -748,15 +759,6 @@ fn main() {
                     &[],
                 );
 
-                renderer.device.cmd_bind_descriptor_sets(
-                    command_buffer,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    pipeline_layout,
-                    0,
-                    &[global_sets[frame]],
-                    &[],
-                );
-
                 let model = Mat4::from_translation(Vec3::new(0., 1., 0.));
                 let model = model * Mat4::from_rotation_y(time * std::f32::consts::FRAC_PI_2);
                 let model = model * Mat4::from_rotation_x(std::f32::consts::FRAC_PI_2);
@@ -765,6 +767,7 @@ fn main() {
                     buffer: renderer.device.get_buffer_device_address(
                         &vk::BufferDeviceAddressInfo::default().buffer(vertex_buffer.0),
                     ),
+                    texture_id: 0,
                 };
                 renderer.device.cmd_push_constants(
                     command_buffer,
