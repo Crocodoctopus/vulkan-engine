@@ -1,3 +1,4 @@
+//use crate::util::Map2;
 use ash::vk::{Extent2D, ImageUsageFlags};
 use ash::{khr, vk};
 use glam::*;
@@ -27,6 +28,11 @@ impl Drop for Buffer {
     }
 }
 
+pub struct BufferHandle(u16);
+pub struct ImageHandle(u16);
+pub struct PipelineLayoutHandle(u16);
+pub struct PipelineHandle(u16);
+
 pub struct Renderer {
     pub entry: ash::Entry,
     pub instance: ash::Instance,
@@ -50,18 +56,35 @@ pub struct Renderer {
     pub swapchain_images: Box<[vk::Image]>,
     pub swapchain_color_views: Box<[vk::ImageView]>,
     pub swapchain_depth_views: Box<[vk::ImageView]>,
-    //    pub sets_per_pool: u32,
-    //    pub pools: Vec<vk::DescriptorPool>,
+    //pub pipeline_layouts: Map2<u16, vk::PipelineLayout>,
+    //pub pipelines: Map2<u16, vk::Pipeline>,
+    //pub buffers: Map2<u16, vk::Buffer>,
 }
 
 impl Renderer {
-    /*
-        pub fn create_pool(&mut self)
+    /*pub fn create_pipeline_layout(
+        &mut self,
+        pipeline_layout: vk::PipelineLayoutCreateInfo,
+    ) -> PipelineLayoutHandle {
+        let pipeline_layout = unsafe {
+            self.device
+                .create_pipeline_layout(&pipeline_layout, None)
+                .unwrap()
+        };
 
-        pub fn get_pool(&mut self) -> &vk::DescriptorPool {
-            let last_pool = self.pools.last().unwrap();
+        self.pipeline_layouts.insert(pipeline_layout)
+    }
+
+    pub fn create_pipeline(&mut self, pipeline: vk::GraphicsPipelineCreateInfo) -> PipelineHandle {
+        unsafe {
+            let pipeline = self
+                .device
+                .create_graphics_pipelines(vk::PipelineCache::null(), pipeline, None)
+                .unwrap();
+
+            self.pipelines.insert(pipeline)
         }
-    */
+    }*/
 
     pub fn new(
         viewport_w: u32,
@@ -161,6 +184,7 @@ impl Renderer {
                     let mut vk12features = vk::PhysicalDeviceVulkan12Features::default()
                         .buffer_device_address(true)
                         .descriptor_binding_uniform_buffer_update_after_bind(true)
+                        .descriptor_binding_storage_buffer_update_after_bind(true)
                         .descriptor_binding_partially_bound(true)
                         .descriptor_binding_sampled_image_update_after_bind(true)
                         .descriptor_indexing(true)

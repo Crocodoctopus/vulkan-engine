@@ -9,6 +9,7 @@ extern crate winit;
 
 mod renderer;
 mod staging;
+//mod util;
 
 use crate::renderer::*;
 use ash::vk;
@@ -33,10 +34,11 @@ struct GlobalDescriptorSet {
     view: Mat4,
 }
 
+#[derive(Clone)]
 #[repr(C)]
-struct PushConstant {
+struct Instance {
     model: Mat4,
-    buffer: vk::DeviceAddress,
+    vertex_buffer: vk::DeviceAddress,
     texture_id: u32,
 }
 
@@ -48,6 +50,30 @@ struct Vertex {
     normal: Vec3,
     v: f32,
     color: Vec4,
+}
+
+/*
+struct App {
+    // Window stuff.
+    viewport_w: u32,
+    viewport_h: u32,
+    event_loop: EventLoop<()>,
+    window: Window,
+
+    // Render engine.
+    engine: Renderer,
+
+    // Misc.
+    vertex_buffer: u16,
+    matrix_buffer: u16,
+    viking_texture: u16,
+}
+    */
+
+struct Meshlet {
+    indices: Box<[u8]>,
+    positions: Box<[f32]>,
+    texcoords: Box<[f32]>,
 }
 
 fn main() {
@@ -68,6 +94,70 @@ fn main() {
             tobj::load_obj_buf(&mut BufReader::new(&data[..]), |_| unreachable!()).unwrap();
         viking_room_models.into_iter().next().unwrap().mesh
     };
+
+    /*
+        let viking_room_meshlets: meshopt::Meshlets = {
+            struct Vertex {
+                position: Vec3,
+                texcoord: Vec2,
+            }
+
+            let vertex_count = viking_room_model.positions.len();
+            let vertices: Box<[Vertex]> = (0..vertex_count / 3)
+                .map(|i| Vertex {
+                    position: Vec3::new(
+                        viking_room_model.positions[3 * i],
+                        viking_room_model.positions[3 * i + 1],
+                        viking_room_model.positions[3 * i + 2],
+                    ),
+                    texcoord: Vec2::new(
+                        viking_room_model.texcoords[2 * i],
+                        viking_room_model.texcoords[2 * i + 1],
+                    ),
+                })
+                .collect();
+
+            let adapter = meshopt::VertexDataAdapter {
+                reader: std::io::Cursor::new(unsafe {
+                    std::slice::from_raw_parts(
+                        vertices.as_ptr() as *const u8,
+                        size_of::<Vertex>() * vertex_count,
+                    )
+                }),
+                vertex_count,
+                vertex_stride: size_of::<Vertex>(),
+                position_offset: 0,
+            };
+
+            meshopt::build_meshlets(&viking_room_model.indices, &adapter, 64, 124, 0.25)
+            /*.iter()
+            .map(|meshlet| Meshlet {
+                indices: meshlet.triangles.to_owned().into_boxed_slice(),
+                positions: meshlet
+                    .vertices
+                    .iter()
+                    .flat_map(|&i| {
+                        [
+                            vertices[i as usize].position.x,
+                            vertices[i as usize].position.y,
+                            vertices[i as usize].position.z,
+                        ]
+                    })
+                    .collect(),
+                texcoords: meshlet
+                    .vertices
+                    .iter()
+                    .flat_map(|&i| {
+                        [
+                            vertices[i as usize].texcoord.x,
+                            vertices[i as usize].texcoord.y,
+                        ]
+                    })
+                    .collect(),
+            })
+            .collect()*/
+        };
+    */
 
     // Create window.
     let (viewport_w, viewport_h) = (1080_u32, 720_u32);
@@ -108,6 +198,8 @@ fn main() {
                                     | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
                                 vk::DescriptorBindingFlags::PARTIALLY_BOUND
                                     | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
+                                vk::DescriptorBindingFlags::PARTIALLY_BOUND
+                                    | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
                             ]),
                     )
                     .bindings(&[
@@ -121,6 +213,11 @@ fn main() {
                             .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                             .descriptor_count(1024)
                             .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+                        vk::DescriptorSetLayoutBinding::default()
+                            .binding(2)
+                            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                            .descriptor_count(1)
+                            .stage_flags(vk::ShaderStageFlags::VERTEX),
                     ])
                     .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL),
                 None,
@@ -134,12 +231,7 @@ fn main() {
             let pipeline_layout = renderer
                 .device
                 .create_pipeline_layout(
-                    &vk::PipelineLayoutCreateInfo::default()
-                        .set_layouts(&[global_set_layout])
-                        .push_constant_ranges(&[vk::PushConstantRange::default()
-                            .offset(0)
-                            .size(size_of::<PushConstant>() as u32)
-                            .stage_flags(vk::ShaderStageFlags::VERTEX)]),
+                    &vk::PipelineLayoutCreateInfo::default().set_layouts(&[global_set_layout]),
                     None,
                 )
                 .unwrap();
@@ -377,6 +469,32 @@ fn main() {
             )
             .unwrap();
 
+        let instance_buffer = renderer
+            .allocator
+            .create_buffer(
+                &vk::BufferCreateInfo::default()
+                    .size((3 * size_of::<Instance>()) as u64)
+                    .usage(
+                        vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+                    )
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                &vk_mem::AllocationCreateInfo::default(),
+            )
+            .unwrap();
+
+        let indirect_cmd_buffer = renderer
+            .allocator
+            .create_buffer(
+                &vk::BufferCreateInfo::default()
+                    .size((1 * size_of::<vk::DrawIndexedIndirectCommand>()) as u64)
+                    .usage(
+                        vk::BufferUsageFlags::INDIRECT_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+                    )
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                &vk_mem::AllocationCreateInfo::default(),
+            )
+            .unwrap();
+
         let vertex_buffer = renderer
             .allocator
             .create_buffer(
@@ -421,28 +539,48 @@ fn main() {
                 )
                 .unwrap();
 
-            let vertices: Box<[Vertex]> = (0..viking_room_model.positions.len() / 3)
-                .map(|i| Vertex {
-                    position: Vec3::new(
-                        viking_room_model.positions[3 * i],
-                        viking_room_model.positions[3 * i + 1],
-                        viking_room_model.positions[3 * i + 2],
-                    ),
-                    u: viking_room_model.texcoords[2 * i],
-                    normal: Vec3::new(
-                        viking_room_model.normals[3 * i],
-                        viking_room_model.normals[3 * i + 1],
-                        viking_room_model.normals[3 * i + 2],
-                    ),
-                    v: viking_room_model.texcoords[2 * i + 1],
-                    color: Vec4::splat(1.0),
-                })
-                .collect();
+            let vertices = (0..viking_room_model.positions.len() / 3).map(|i| Vertex {
+                position: Vec3::new(
+                    viking_room_model.positions[3 * i],
+                    viking_room_model.positions[3 * i + 1],
+                    viking_room_model.positions[3 * i + 2],
+                ),
+                u: viking_room_model.texcoords[2 * i],
+                normal: Vec3::new(
+                    viking_room_model.normals[3 * i],
+                    viking_room_model.normals[3 * i + 1],
+                    viking_room_model.normals[3 * i + 2],
+                ),
+                v: viking_room_model.texcoords[2 * i + 1],
+                color: Vec4::splat(1.0),
+            });
+
+            /*let vertices = vec![];
+            let indices = vec![];
+            let draw_cmds = vec![];
+            for meshlet in viking_room_meshlets.iter() {
+                draw_cmds.push(vk::DrawIndexedIndirectCommand {
+                    index_count: 0,
+                    instance_count: 1,
+                    first_index: 0,
+                    vertex_offset: size_of::<Vertex>() as i32,
+                    first_instance: 0,
+                });
+            }*/
+
+            let indirect_cmds = std::iter::once(vk::DrawIndexedIndirectCommand {
+                index_count: viking_room_model.indices.len() as u32,
+                instance_count: 3,
+                first_index: 0,
+                vertex_offset: 0,
+                first_instance: 0,
+            });
 
             staging_buffer
                 .begin_transfer(&renderer.device, staging_command_buffer)
                 .stage_buffer::<u32>(index_buffer, 0, &viking_room_model.indices)
                 .stage_buffer(vertex_buffer.0, 0, vertices)
+                .stage_buffer(indirect_cmd_buffer.0, 0, indirect_cmds)
                 .stage_image(
                     viking_room_image,
                     viking_room_tex_w,
@@ -622,7 +760,37 @@ fn main() {
                 .begin_command_buffer(command_buffer, &vk::CommandBufferBeginInfo::default())
                 .unwrap();
 
-            // Upload global descriptor data.
+            let model0 = Mat4::from_translation(Vec3::new(0., 0.5, 0.));
+            let model1 = Mat4::from_translation(Vec3::new(1., 0.5, 0.));
+            let model2 = Mat4::from_translation(Vec3::new(2., 0.5, 0.));
+            let mult = Mat4::from_scale(Vec3::splat(0.5))
+                * Mat4::from_rotation_y(time * std::f32::consts::FRAC_PI_2)
+                * Mat4::from_rotation_x(std::f32::consts::FRAC_PI_2);
+            let instance = [
+                Instance {
+                    model: model0 * mult,
+                    vertex_buffer: renderer.device.get_buffer_device_address(
+                        &vk::BufferDeviceAddressInfo::default().buffer(vertex_buffer.0),
+                    ),
+                    texture_id: 0,
+                },
+                Instance {
+                    model: model1 * mult,
+                    vertex_buffer: renderer.device.get_buffer_device_address(
+                        &vk::BufferDeviceAddressInfo::default().buffer(vertex_buffer.0),
+                    ),
+                    texture_id: 0,
+                },
+                Instance {
+                    model: model2 * mult,
+                    vertex_buffer: renderer.device.get_buffer_device_address(
+                        &vk::BufferDeviceAddressInfo::default().buffer(vertex_buffer.0),
+                    ),
+                    texture_id: 0,
+                },
+            ];
+
+            // Upload global descriptor data & instance data.
             staging_buffer
                 .begin_transfer(&renderer.device, command_buffer)
                 .stage_buffer(
@@ -646,6 +814,7 @@ fn main() {
                         ) * Mat4::from_translation(Vec3::new(cam_x, cam_y, cam_z)),
                     }),
                 )
+                .stage_buffer(instance_buffer.0, 0, instance)
                 .finish();
 
             // Convert VK_IMAGE_LAYOUT_UNDEFINED -> VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL.
@@ -755,29 +924,18 @@ fn main() {
                                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                                 .image_view(viking_room_view)
                                 .sampler(viking_room_sampler)]),
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(global_set)
+                            .dst_binding(2)
+                            .dst_array_element(0)
+                            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                            .descriptor_count(1)
+                            .buffer_info(&[vk::DescriptorBufferInfo::default()
+                                .buffer(instance_buffer.0)
+                                .offset(0)
+                                .range(vk::WHOLE_SIZE)]),
                     ],
                     &[],
-                );
-
-                let model = Mat4::from_translation(Vec3::new(0., 1., 0.));
-                let model = model * Mat4::from_rotation_y(time * std::f32::consts::FRAC_PI_2);
-                let model = model * Mat4::from_rotation_x(std::f32::consts::FRAC_PI_2);
-                let push_constant = PushConstant {
-                    model,
-                    buffer: renderer.device.get_buffer_device_address(
-                        &vk::BufferDeviceAddressInfo::default().buffer(vertex_buffer.0),
-                    ),
-                    texture_id: 0,
-                };
-                renderer.device.cmd_push_constants(
-                    command_buffer,
-                    pipeline_layout,
-                    vk::ShaderStageFlags::VERTEX,
-                    0,
-                    std::slice::from_raw_parts(
-                        &push_constant as *const PushConstant as *const u8,
-                        size_of::<PushConstant>(),
-                    ),
                 );
 
                 renderer.device.cmd_bind_pipeline(
@@ -791,13 +949,12 @@ fn main() {
                     0,
                     vk::IndexType::UINT32,
                 );
-                renderer.device.cmd_draw_indexed(
+                renderer.device.cmd_draw_indexed_indirect(
                     command_buffer,
-                    viking_room_model.indices.len() as u32,
+                    indirect_cmd_buffer.0,
+                    0,
                     1,
-                    0,
-                    0,
-                    0,
+                    size_of::<vk::DrawIndexedIndirectCommand>() as u32,
                 );
             }
 
