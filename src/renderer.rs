@@ -177,10 +177,13 @@ impl Renderer {
 
             // Create logical device and its associated queues.
             let (device, graphics_queue, present_queue) = {
-                let features = vk::PhysicalDeviceFeatures::default();
+                let features = vk::PhysicalDeviceFeatures::default().multi_draw_indirect(true);
                 let extensions = device_extensions.map(|x: &CStr| x.as_ptr());
 
                 let device = {
+                    let mut vk11features =
+                        vk::PhysicalDeviceVulkan11Features::default().shader_draw_parameters(true);
+
                     let mut vk12features = vk::PhysicalDeviceVulkan12Features::default()
                         .buffer_device_address(true)
                         .descriptor_binding_uniform_buffer_update_after_bind(true)
@@ -200,6 +203,7 @@ impl Renderer {
                         .queue_priorities(&priority)];
 
                     let device_cinfo = vk::DeviceCreateInfo::default()
+                        .push_next(&mut vk11features)
                         .push_next(&mut vk12features)
                         .push_next(&mut vk13features)
                         .queue_create_infos(&queue_cinfo)

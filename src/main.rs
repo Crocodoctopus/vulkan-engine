@@ -29,16 +29,16 @@ use crate::staging::StagingBuffer;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
-struct GlobalDescriptorSet {
+struct Global {
     proj: Mat4,
     view: Mat4,
+    vertex_buffer: vk::DeviceAddress,
 }
 
 #[derive(Clone)]
 #[repr(C)]
-struct Instance {
+struct Object {
     model: Mat4,
-    vertex_buffer: vk::DeviceAddress,
     texture_id: u32,
 }
 
@@ -70,6 +70,7 @@ struct App {
 }
     */
 
+#[repr(C)]
 struct Meshlet {
     indices: Box<[u8]>,
     positions: Box<[f32]>,
@@ -88,76 +89,45 @@ fn main() {
         (buf, info.width, info.height)
     };
 
-    let viking_room_model = {
-        let data = include_bytes!("../resources/models/viking_room.obj");
-        let (viking_room_models, _) =
-            tobj::load_obj_buf(&mut BufReader::new(&data[..]), |_| unreachable!()).unwrap();
-        viking_room_models.into_iter().next().unwrap().mesh
-    };
+    let viking_room_meshlets: Box<[Meshlet]> = {
+        let viking_room_model = {
+            let data = include_bytes!("../resources/models/viking_room.obj");
+            let (viking_room_models, _) =
+                tobj::load_obj_buf(&mut BufReader::new(&data[..]), |_| unreachable!()).unwrap();
+            viking_room_models.into_iter().next().unwrap().mesh
+        };
 
-    /*
-        let viking_room_meshlets: meshopt::Meshlets = {
-            struct Vertex {
-                position: Vec3,
-                texcoord: Vec2,
-            }
+        let adapter = meshopt::VertexDataAdapter {
+            reader: std::io::Cursor::new(unsafe {
+                std::slice::from_raw_parts(
+                    viking_room_model.positions.as_ptr() as *const u8,
+                    viking_room_model.positions.len() * size_of::<f32>(),
+                )
+            }),
+            vertex_count: viking_room_model.positions.len() / 3,
+            vertex_stride: 3 * size_of::<f32>(),
+            position_offset: 0,
+        };
 
-            let vertex_count = viking_room_model.positions.len();
-            let vertices: Box<[Vertex]> = (0..vertex_count / 3)
-                .map(|i| Vertex {
-                    position: Vec3::new(
-                        viking_room_model.positions[3 * i],
-                        viking_room_model.positions[3 * i + 1],
-                        viking_room_model.positions[3 * i + 2],
-                    ),
-                    texcoord: Vec2::new(
-                        viking_room_model.texcoords[2 * i],
-                        viking_room_model.texcoords[2 * i + 1],
-                    ),
-                })
-                .collect();
-
-            let adapter = meshopt::VertexDataAdapter {
-                reader: std::io::Cursor::new(unsafe {
-                    std::slice::from_raw_parts(
-                        vertices.as_ptr() as *const u8,
-                        size_of::<Vertex>() * vertex_count,
-                    )
-                }),
-                vertex_count,
-                vertex_stride: size_of::<Vertex>(),
-                position_offset: 0,
-            };
-
-            meshopt::build_meshlets(&viking_room_model.indices, &adapter, 64, 124, 0.25)
-            /*.iter()
+        meshopt::build_meshlets(&viking_room_model.indices, &adapter, 64, 124, 0.25)
+            .iter()
             .map(|meshlet| Meshlet {
                 indices: meshlet.triangles.to_owned().into_boxed_slice(),
                 positions: meshlet
                     .vertices
                     .iter()
-                    .flat_map(|&i| {
-                        [
-                            vertices[i as usize].position.x,
-                            vertices[i as usize].position.y,
-                            vertices[i as usize].position.z,
-                        ]
-                    })
+                    .flat_map(|&i: &u32| &viking_room_model.positions[3 * i as usize..][0..3])
+                    .copied()
                     .collect(),
                 texcoords: meshlet
                     .vertices
                     .iter()
-                    .flat_map(|&i| {
-                        [
-                            vertices[i as usize].texcoord.x,
-                            vertices[i as usize].texcoord.y,
-                        ]
-                    })
+                    .flat_map(|&i| &viking_room_model.texcoords[2 * i as usize..][0..2])
+                    .copied()
                     .collect(),
             })
-            .collect()*/
-        };
-    */
+            .collect()
+    };
 
     // Create window.
     let (viewport_w, viewport_h) = (1080_u32, 720_u32);
@@ -458,22 +428,25 @@ fn main() {
         // TODO: delete
         let mut staging_buffer = StagingBuffer::new(10000000, &renderer.allocator);
 
-        let (index_buffer, mut index_alloc) = renderer
+        let index_count = viking_room_meshlets
+            .iter()
+            .fold(0, |acc, meshlet| acc + meshlet.indices.len());
+        let index_buffer = renderer
             .allocator
             .create_buffer(
                 &vk::BufferCreateInfo::default()
-                    .size((viking_room_model.indices.len() * size_of::<u32>()) as u64)
+                    .size((index_count * size_of::<u32>()) as u64)
                     .usage(vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)
                     .sharing_mode(vk::SharingMode::EXCLUSIVE),
                 &vk_mem::AllocationCreateInfo::default(),
             )
             .unwrap();
 
-        let instance_buffer = renderer
+        let object_buffer = renderer
             .allocator
             .create_buffer(
                 &vk::BufferCreateInfo::default()
-                    .size((3 * size_of::<Instance>()) as u64)
+                    .size((1 * size_of::<Object>()) as u64)
                     .usage(
                         vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
                     )
@@ -486,7 +459,10 @@ fn main() {
             .allocator
             .create_buffer(
                 &vk::BufferCreateInfo::default()
-                    .size((1 * size_of::<vk::DrawIndexedIndirectCommand>()) as u64)
+                    .size(
+                        (viking_room_meshlets.len() * size_of::<vk::DrawIndexedIndirectCommand>())
+                            as u64,
+                    )
                     .usage(
                         vk::BufferUsageFlags::INDIRECT_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
                     )
@@ -495,11 +471,14 @@ fn main() {
             )
             .unwrap();
 
+        let vertex_count = viking_room_meshlets
+            .iter()
+            .fold(0, |acc, meshlet| acc + meshlet.positions.len() / 3);
         let vertex_buffer = renderer
             .allocator
             .create_buffer(
                 &vk::BufferCreateInfo::default()
-                    .size((viking_room_model.positions.len() * size_of::<Vertex>()) as u64)
+                    .size((vertex_count * size_of::<Vertex>()) as u64)
                     .usage(
                         vk::BufferUsageFlags::VERTEX_BUFFER
                             | vk::BufferUsageFlags::TRANSFER_DST
@@ -512,11 +491,11 @@ fn main() {
             )
             .unwrap();
 
-        let (matrix_buffer, mut matrix_alloc) = renderer
+        let global_buffer = renderer
             .allocator
             .create_buffer(
                 &vk::BufferCreateInfo::default()
-                    .size(2 * size_of::<Mat4>() as u64)
+                    .size(size_of::<Global>() as u64)
                     .usage(
                         vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
                     )
@@ -539,46 +518,50 @@ fn main() {
                 )
                 .unwrap();
 
-            let vertices = (0..viking_room_model.positions.len() / 3).map(|i| Vertex {
-                position: Vec3::new(
-                    viking_room_model.positions[3 * i],
-                    viking_room_model.positions[3 * i + 1],
-                    viking_room_model.positions[3 * i + 2],
-                ),
-                u: viking_room_model.texcoords[2 * i],
-                normal: Vec3::new(
-                    viking_room_model.normals[3 * i],
-                    viking_room_model.normals[3 * i + 1],
-                    viking_room_model.normals[3 * i + 2],
-                ),
-                v: viking_room_model.texcoords[2 * i + 1],
-                color: Vec4::splat(1.0),
-            });
+            // Create a single gigabuffer.
+            let mut vertices = vec![];
+            let mut indices = vec![];
+            let mut indirect_cmds = vec![];
+            for meshlet in &viking_room_meshlets {
+                let first_index = indices.len() as u32;
+                let index_offset = vertices.len() as u32;
 
-            /*let vertices = vec![];
-            let indices = vec![];
-            let draw_cmds = vec![];
-            for meshlet in viking_room_meshlets.iter() {
-                draw_cmds.push(vk::DrawIndexedIndirectCommand {
-                    index_count: 0,
+                indices.extend(
+                    meshlet
+                        .indices
+                        .iter()
+                        .map(|&index| index as u32 + index_offset),
+                );
+
+                vertices.extend((0..meshlet.positions.len() / 3).map(|i| Vertex {
+                    position: Vec3::new(
+                        meshlet.positions[3 * i],
+                        meshlet.positions[3 * i + 1],
+                        meshlet.positions[3 * i + 2],
+                    ),
+                    u: meshlet.texcoords[2 * i],
+                    normal: Vec3::splat(0.0),
+                    /*normals: Vec3::new(
+                        meshlet.normals[3 * i],
+                        meshlet.normals[3 * i + 1],
+                        meshlet.normals[3 * i + 2],
+                    )*/
+                    v: meshlet.texcoords[2 * i + 1],
+                    color: Vec4::splat(1.0),
+                }));
+
+                indirect_cmds.push(vk::DrawIndexedIndirectCommand {
+                    index_count: meshlet.indices.len() as u32,
                     instance_count: 1,
-                    first_index: 0,
-                    vertex_offset: size_of::<Vertex>() as i32,
+                    first_index,
+                    vertex_offset: 0,
                     first_instance: 0,
                 });
-            }*/
-
-            let indirect_cmds = std::iter::once(vk::DrawIndexedIndirectCommand {
-                index_count: viking_room_model.indices.len() as u32,
-                instance_count: 3,
-                first_index: 0,
-                vertex_offset: 0,
-                first_instance: 0,
-            });
+            }
 
             staging_buffer
                 .begin_transfer(&renderer.device, staging_command_buffer)
-                .stage_buffer::<u32>(index_buffer, 0, &viking_room_model.indices)
+                .stage_buffer(index_buffer.0, 0, indices)
                 .stage_buffer(vertex_buffer.0, 0, vertices)
                 .stage_buffer(indirect_cmd_buffer.0, 0, indirect_cmds)
                 .stage_image(
@@ -702,21 +685,21 @@ fn main() {
                 cam_x += dt * cam_hr.sin();
             }
 
-            // Strafe left.
+            // Turn left.
             if a_down && !d_down {
                 cam_hr -= dt;
             }
-            // Strafe right.
+            // Turn right.
             if !a_down && d_down {
                 cam_hr += dt;
             }
 
-            // Turn left.
+            // Strafe left.
             if q_down && !e_down {
                 cam_x += dt * cam_hr.cos();
                 cam_z += dt * cam_hr.sin();
             }
-            // Turn right.
+            // Strafe right.
             if !q_down && e_down {
                 cam_x -= dt * cam_hr.cos();
                 cam_z -= dt * cam_hr.sin();
@@ -766,37 +749,18 @@ fn main() {
             let mult = Mat4::from_scale(Vec3::splat(0.5))
                 * Mat4::from_rotation_y(time * std::f32::consts::FRAC_PI_2)
                 * Mat4::from_rotation_x(std::f32::consts::FRAC_PI_2);
-            let instance = [
-                Instance {
-                    model: model0 * mult,
-                    vertex_buffer: renderer.device.get_buffer_device_address(
-                        &vk::BufferDeviceAddressInfo::default().buffer(vertex_buffer.0),
-                    ),
-                    texture_id: 0,
-                },
-                Instance {
-                    model: model1 * mult,
-                    vertex_buffer: renderer.device.get_buffer_device_address(
-                        &vk::BufferDeviceAddressInfo::default().buffer(vertex_buffer.0),
-                    ),
-                    texture_id: 0,
-                },
-                Instance {
-                    model: model2 * mult,
-                    vertex_buffer: renderer.device.get_buffer_device_address(
-                        &vk::BufferDeviceAddressInfo::default().buffer(vertex_buffer.0),
-                    ),
-                    texture_id: 0,
-                },
-            ];
+            let objects = [Object {
+                model: model0 * mult,
+                texture_id: 0,
+            }];
 
-            // Upload global descriptor data & instance data.
+            // Upload global descriptor data & object data.
             staging_buffer
                 .begin_transfer(&renderer.device, command_buffer)
                 .stage_buffer(
-                    matrix_buffer,
+                    global_buffer.0,
                     0,
-                    std::iter::once_with(|| GlobalDescriptorSet {
+                    std::iter::once_with(|| Global {
                         proj: Mat4::perspective_rh_gl(
                             std::f32::consts::FRAC_PI_4,
                             viewport_w as f32 / viewport_h as f32,
@@ -812,9 +776,12 @@ fn main() {
                             ),
                             Vec3::new(0., 0., 0.),
                         ) * Mat4::from_translation(Vec3::new(cam_x, cam_y, cam_z)),
+                        vertex_buffer: renderer.device.get_buffer_device_address(
+                            &vk::BufferDeviceAddressInfo::default().buffer(vertex_buffer.0),
+                        ),
                     }),
                 )
-                .stage_buffer(instance_buffer.0, 0, instance)
+                .stage_buffer(object_buffer.0, 0, objects)
                 .finish();
 
             // Convert VK_IMAGE_LAYOUT_UNDEFINED -> VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL.
@@ -911,7 +878,7 @@ fn main() {
                             .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                             .descriptor_count(1)
                             .buffer_info(&[vk::DescriptorBufferInfo::default()
-                                .buffer(matrix_buffer)
+                                .buffer(global_buffer.0)
                                 .offset(0)
                                 .range(vk::WHOLE_SIZE)]),
                         vk::WriteDescriptorSet::default()
@@ -931,7 +898,7 @@ fn main() {
                             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                             .descriptor_count(1)
                             .buffer_info(&[vk::DescriptorBufferInfo::default()
-                                .buffer(instance_buffer.0)
+                                .buffer(object_buffer.0)
                                 .offset(0)
                                 .range(vk::WHOLE_SIZE)]),
                     ],
@@ -945,7 +912,7 @@ fn main() {
                 );
                 renderer.device.cmd_bind_index_buffer(
                     command_buffer,
-                    index_buffer,
+                    index_buffer.0,
                     0,
                     vk::IndexType::UINT32,
                 );
@@ -953,7 +920,7 @@ fn main() {
                     command_buffer,
                     indirect_cmd_buffer.0,
                     0,
-                    1,
+                    viking_room_meshlets.len() as u32,
                     size_of::<vk::DrawIndexedIndirectCommand>() as u32,
                 );
             }
