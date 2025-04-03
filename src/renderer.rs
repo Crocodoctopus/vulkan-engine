@@ -2,6 +2,7 @@
 use ash::vk::{Extent2D, ImageUsageFlags};
 use ash::{khr, vk};
 use glam::*;
+use std::collections::HashMap;
 use std::ffi::CStr;
 use vk_mem::Alloc;
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -16,13 +17,31 @@ impl Drop for Shader {
 }
 
 #[derive(Debug)]
-pub struct Buffer {
+pub struct Buffer<T> {
+    phantom: std::marker::PhantomData<T>,
     buffer: vk::Buffer,
-    alloc: vk_mem::Allocation,
-    size: u64,
+    len: u32,
 }
 
-impl Drop for Buffer {
+impl<T> Buffer<T> {
+    pub fn len(&self) -> u32 {
+        self.len
+    }
+
+    pub fn size(&self) -> usize {
+        self.len as usize * size_of::<T>()
+    }
+
+    pub fn stride(&self) -> u32 {
+        size_of::<T>() as u32
+    }
+
+    pub fn vk_handle(&self) -> vk::Buffer {
+        self.buffer
+    }
+}
+
+impl<T> Drop for Buffer<T> {
     fn drop(&mut self) {
         panic!("This type must be dropped via Renderer::delete_buffer!");
     }
@@ -59,6 +78,7 @@ pub struct Renderer {
     //pub pipeline_layouts: Map2<u16, vk::PipelineLayout>,
     //pub pipelines: Map2<u16, vk::Pipeline>,
     //pub buffers: Map2<u16, vk::Buffer>,
+    buffer_allocs: HashMap<vk::Buffer, vk_mem::Allocation>,
 }
 
 impl Renderer {
@@ -185,6 +205,7 @@ impl Renderer {
                         vk::PhysicalDeviceVulkan11Features::default().shader_draw_parameters(true);
 
                     let mut vk12features = vk::PhysicalDeviceVulkan12Features::default()
+                        .draw_indirect_count(true)
                         .buffer_device_address(true)
                         .descriptor_binding_uniform_buffer_update_after_bind(true)
                         .descriptor_binding_storage_buffer_update_after_bind(true)
@@ -352,6 +373,8 @@ impl Renderer {
                 swapchain_images,
                 swapchain_color_views,
                 swapchain_depth_views,
+
+                buffer_allocs: HashMap::new(),
             }
         }
     }
@@ -376,17 +399,19 @@ impl Renderer {
         std::mem::forget(shader);
     }
 
-    pub fn create_buffer(
-        &self,
-        size: u64,
+    pub fn create_buffer<T>(
+        &mut self,
+        len: u32,
         vk_usage: vk::BufferUsageFlags,
         vma_usage: vk_mem::MemoryUsage,
-    ) -> Buffer {
+    ) -> Buffer<T> {
         unsafe {
             let (buffer, alloc) = self
                 .allocator
                 .create_buffer(
-                    &vk::BufferCreateInfo::default().size(size).usage(vk_usage),
+                    &vk::BufferCreateInfo::default()
+                        .size(len as u64 * size_of::<T>() as u64)
+                        .usage(vk_usage),
                     &vk_mem::AllocationCreateInfo {
                         usage: vma_usage,
                         ..Default::default()
@@ -394,19 +419,51 @@ impl Renderer {
                 )
                 .unwrap();
 
+            self.buffer_allocs.insert(buffer, alloc);
+
             Buffer {
+                phantom: std::marker::PhantomData,
                 buffer,
-                alloc,
-                size,
+                len,
             }
         }
     }
 
-    pub fn delete_buffer(&self, mut buffer: Buffer) {
+    pub fn delete_buffer<T>(&mut self, buffer: Buffer<T>) {
+        let mut alloc = self.buffer_allocs.remove(&buffer.buffer).unwrap();
         unsafe {
-            self.allocator
-                .destroy_buffer(buffer.buffer, &mut buffer.alloc);
+            self.allocator.destroy_buffer(buffer.buffer, &mut alloc);
         }
         std::mem::forget(buffer);
+    }
+}
+
+impl Drop for Renderer {
+    fn drop(&mut self) {
+        unsafe {
+            // Free buffers.
+            for (buffer, mut alloc) in std::mem::take(&mut self.buffer_allocs).into_iter() {
+                self.allocator.destroy_buffer(buffer, &mut alloc);
+            }
+
+            // Free images.
+            self.allocator
+                .destroy_image(self.depth_image.0, &mut self.depth_image.1);
+
+            // Free images.
+            for i in 0..3 {
+                self.device
+                    .destroy_image_view(self.swapchain_depth_views[i], None);
+                self.device
+                    .destroy_image_view(self.swapchain_color_views[i], None);
+            }
+
+            // Free the rest.
+            self.swapchain_device
+                .destroy_swapchain(self.swapchain, None);
+            self.device.destroy_device(None);
+            self.surface_instance.destroy_surface(self.surface, None);
+            self.instance.destroy_instance(None);
+        }
     }
 }

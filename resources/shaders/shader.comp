@@ -1,0 +1,29 @@
+#version 450
+
+layout (local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+struct VkDrawIndexedIndirectCommand {
+    uint index_count;
+    uint instance_count;
+    uint first_index;
+    int vertex_offset;
+    uint first_instance;
+};
+
+layout (std430, set = 0, binding = 0) buffer Global {
+    uint counter;
+};
+
+layout (std430, set = 0, binding = 1) restrict readonly buffer Input {
+    VkDrawIndexedIndirectCommand in_cmds[];
+};
+
+layout (std430, set = 0, binding = 2) restrict writeonly buffer Output {
+    VkDrawIndexedIndirectCommand out_cmds[];  
+};
+
+void main() {
+    // 1:1 copy
+    uint i = atomicAdd(counter, 1);
+    out_cmds[i] = in_cmds[i];
+}

@@ -24,4 +24,16 @@ fn main() {
     }
     println!("cargo:rerun-if-changed=resources/shaders/shader.frag");
     println!("cargo:rerun-if-changed=src/shader.frag.spirv");
+
+    // Build fragment shader.
+    let output = Command::new("glslc")
+        .arg("resources/shaders/shader.comp")
+        .args(["-o", "src/shader.comp.spirv"])
+        .output()
+        .unwrap();
+    if !output.status.success() {
+        panic!("{}", String::from_utf8_lossy(&output.stderr));
+    }
+    println!("cargo:rerun-if-changed=resources/shaders/shader.comp");
+    println!("cargo:rerun-if-changed=src/shader.comp.spirv");
 }

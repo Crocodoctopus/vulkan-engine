@@ -24,7 +24,7 @@ layout (set = 0, binding = 0) uniform Global {
     VertexBuffer vertex_buffer;
 };
 
-layout (std140, set = 0, binding = 2) readonly buffer ObjectBuffer {
+layout (std430, set = 0, binding = 2) readonly buffer ObjectBuffer {
     Object objects[];
 };
 
