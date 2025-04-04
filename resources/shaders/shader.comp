@@ -1,4 +1,6 @@
 #version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout: require
 
 layout (local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
@@ -10,20 +12,97 @@ struct VkDrawIndexedIndirectCommand {
     uint first_instance;
 };
 
+struct MeshletData {
+    vec3 cone_apex;
+    float pad0;
+    vec3 cone_axis;
+    float cone_cutoff;
+    VkDrawIndexedIndirectCommand cmd;
+};
+
+//////
+
+layout (buffer_reference, std430) buffer IndirectCountBuffer {
+    uint counter;
+};
+
+layout (buffer_reference, std430) readonly buffer InputBuffer {
+    MeshletData data[];
+};
+
+layout (buffer_reference, std430) writeonly buffer OutputBuffer {
+    VkDrawIndexedIndirectCommand data[];  
+};
+
+layout (std430, set = 0, binding = 0) uniform Global {
+    vec3 camera_position;
+    uint instances;
+    IndirectCountBuffer count;
+    InputBuffer _in;
+    OutputBuffer _out;
+};
+
+bool cone_apex_test(vec3 apex, vec3 axis, float cutoff) {
+    return dot(normalize(apex - camera_position), axis) < cutoff;
+}
+
+void main() {
+    // 
+    if (gl_GlobalInvocationID.x >= instances) return;
+        
+    const uint i = atomicAdd(count.counter, 1);//gl_GlobalInvocationID.x;
+    _out.data[i].index_count = _in.data[i].cmd.index_count;
+    _out.data[i].first_index = _in.data[i].cmd.first_index;
+    _out.data[i].instance_count = 1;
+    _out.data[i].vertex_offset = 0;
+    _out.data[i].first_instance = 0;
+    
+    //MeshletData data = _in.data[gl_GlobalInvocationID.x];
+    //if (cone_apex_test(data.cone_apex, data.cone_axis, data.cone_cutoff)) {
+        //uint i = atomicAdd(count.counter, 1);
+        //uint i = gl_GlobalInvocationID.x;
+        //_out.data[i] = data.cmd;
+        /*
+        _out.data[i].index_count = data.cmd.index_count;
+        _out.data[i].first_index = data.cmd.first_index;
+        _out.data[i].instance_count = 1;
+        _out.data[i].vertex_offset = 0;
+        _out.data[i].first_instance = 0;*/
+    //}
+}
+
+/////
+
+/*
 layout (std430, set = 0, binding = 0) buffer Global {
     uint counter;
 };
 
 layout (std430, set = 0, binding = 1) restrict readonly buffer Input {
-    VkDrawIndexedIndirectCommand in_cmds[];
+    MeshletData _in[];
 };
 
 layout (std430, set = 0, binding = 2) restrict writeonly buffer Output {
-    VkDrawIndexedIndirectCommand out_cmds[];  
+    VkDrawIndexedIndirectCommand _out[];  
 };
 
-void main() {
-    // 1:1 copy
-    uint i = atomicAdd(counter, 1);
-    out_cmds[i] = in_cmds[i];
+//layout (set = 0, binding = 3) uniform vec3 camera_pos;
+
+bool cone_apex_test(vec3 apex, vec3 axis, float cutoff) {
+    return true;
+    //return dot(normlize(apex - camera_position), axis) < cutoff;
 }
+
+void main() {
+    // 1:1 cop
+    MeshletData data = _in[gl_GlobalInvocationID.x];
+
+    if (cone_apex_test(data.cone_apex, data.cone_axis, data.cone_cutoff)) {
+        uint i = atomicAdd(counter, 1);
+        _out[i].index_count = _in[i].cmd.index_count;
+        _out[i].first_index = _in[i].cmd.first_index;
+        _out[i].instance_count = 1;
+        _out[i].vertex_offset = 0;
+        _out[i].first_instance = 0;
+    }
+}*/

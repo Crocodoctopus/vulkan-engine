@@ -13,7 +13,7 @@ impl StagingBuffer {
         let (buffer, mut alloc) = allocator
             .create_buffer(
                 &vk::BufferCreateInfo::default()
-                    .size(len as u64)
+                    .size(len)
                     .usage(vk::BufferUsageFlags::TRANSFER_SRC)
                     .sharing_mode(vk::SharingMode::EXCLUSIVE),
                 &vk_mem::AllocationCreateInfo {
@@ -36,7 +36,7 @@ impl StagingBuffer {
         &'a mut self,
         device: &'a ash::Device,
         command_buffer: vk::CommandBuffer,
-    ) -> Staging {
+    ) -> Staging<'a> {
         Staging {
             device,
             ptr: self.map,
@@ -69,19 +69,25 @@ pub struct Staging<'a> {
     buffer: &'a mut StagingBuffer,
 }
 
-impl<'a> Staging<'a> {
+impl Staging<'_> {
     pub unsafe fn stage_buffer<T: Clone>(
         mut self,
         dst: vk::Buffer,
         offset: u64,
         data: impl IntoIterator<Item = impl Borrow<T>>,
     ) -> Self {
+        // Correct alignment.
+        let alignment = std::mem::align_of::<T>();
+        self.ptr = (self.ptr as usize / alignment * alignment + alignment) as *mut u8;
+
+        // Push data to staging buffer.
         let start = self.ptr;
         for t in data {
             *(self.ptr as *mut T) = t.borrow().clone();
             self.ptr = self.ptr.wrapping_add(std::mem::size_of::<T>());
         }
 
+        // Record transfer from staging to dst.
         self.device.cmd_copy_buffer(
             self.command_buffer,
             self.buffer.buffer,

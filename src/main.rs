@@ -27,22 +27,41 @@ use winit::window::Window;
 
 use crate::staging::StagingBuffer;
 
-#[repr(C)]
+#[repr(C, align(16))]
 #[derive(Copy, Clone, Debug)]
-struct Global {
+struct MeshletRenderGlobal {
     proj: Mat4,
     view: Mat4,
     vertex_buffer: vk::DeviceAddress,
 }
 
+#[repr(C, align(16))]
+#[derive(Copy, Clone, Debug)]
+struct MeshletCullGlobal {
+    camera_position: Vec3,
+    instances: u32,
+    draw_count: vk::DeviceAddress,
+    meshlets: vk::DeviceAddress,
+    draw_cmds: vk::DeviceAddress,
+}
+
 #[derive(Clone)]
-#[repr(C)]
+#[repr(C, align(16))]
 struct Object {
     model: Mat4,
     texture_id: u32,
 }
 
-#[repr(C)]
+#[derive(Clone)]
+#[repr(C, align(16))]
+struct MeshletData {
+    cone_apex: Vec4,
+    cone_axis: Vec3,
+    cone_cutoff: f32,
+    cmd: vk::DrawIndexedIndirectCommand,
+}
+
+#[repr(C, align(16))]
 #[derive(Clone, Debug, Default)]
 struct Vertex {
     position: Vec3,
@@ -52,26 +71,10 @@ struct Vertex {
     color: Vec4,
 }
 
-/*
-struct App {
-    // Window stuff.
-    viewport_w: u32,
-    viewport_h: u32,
-    event_loop: EventLoop<()>,
-    window: Window,
-
-    // Render engine.
-    engine: Renderer,
-
-    // Misc.
-    vertex_buffer: u16,
-    matrix_buffer: u16,
-    viking_texture: u16,
-}
-    */
-
-#[repr(C)]
 struct Meshlet {
+    cone_apex: Vec3,
+    cone_axis: Vec3,
+    cone_cutoff: f32,
     indices: Box<[u8]>,
     positions: Box<[f32]>,
     texcoords: Box<[f32]>,
@@ -111,20 +114,26 @@ fn main() {
 
         meshopt::build_meshlets(&viking_room_model.indices, &adapter, 64, 124, 0.25)
             .iter()
-            .map(|meshlet| Meshlet {
-                indices: meshlet.triangles.to_owned().into_boxed_slice(),
-                positions: meshlet
-                    .vertices
-                    .iter()
-                    .flat_map(|&i: &u32| &viking_room_model.positions[3 * i as usize..][0..3])
-                    .copied()
-                    .collect(),
-                texcoords: meshlet
-                    .vertices
-                    .iter()
-                    .flat_map(|&i| &viking_room_model.texcoords[2 * i as usize..][0..2])
-                    .copied()
-                    .collect(),
+            .map(|meshlet| {
+                let bounds = meshopt::compute_meshlet_bounds(meshlet, &adapter);
+                Meshlet {
+                    cone_apex: Vec3::from_array(bounds.cone_apex),
+                    cone_axis: Vec3::from_array(bounds.cone_axis),
+                    cone_cutoff: bounds.cone_cutoff,
+                    indices: meshlet.triangles.to_owned().into_boxed_slice(),
+                    positions: meshlet
+                        .vertices
+                        .iter()
+                        .flat_map(|&i: &u32| &viking_room_model.positions[3 * i as usize..][0..3])
+                        .copied()
+                        .collect(),
+                    texcoords: meshlet
+                        .vertices
+                        .iter()
+                        .flat_map(|&i| &viking_room_model.texcoords[2 * i as usize..][0..2])
+                        .copied()
+                        .collect(),
+                }
             })
             .collect()
     };
@@ -299,32 +308,14 @@ fn main() {
                 &vk::DescriptorSetLayoutCreateInfo::default()
                     .push_next(
                         &mut vk::DescriptorSetLayoutBindingFlagsCreateInfo::default()
-                            .binding_flags(&[
-                                vk::DescriptorBindingFlags::PARTIALLY_BOUND
-                                    | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
-                                vk::DescriptorBindingFlags::PARTIALLY_BOUND
-                                    | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
-                                vk::DescriptorBindingFlags::PARTIALLY_BOUND
-                                    | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
-                            ]),
+                            .binding_flags(&[vk::DescriptorBindingFlags::PARTIALLY_BOUND
+                                | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND]),
                     )
-                    .bindings(&[
-                        vk::DescriptorSetLayoutBinding::default()
-                            .binding(0)
-                            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                            .descriptor_count(1)
-                            .stage_flags(vk::ShaderStageFlags::COMPUTE),
-                        vk::DescriptorSetLayoutBinding::default()
-                            .binding(1)
-                            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                            .descriptor_count(1)
-                            .stage_flags(vk::ShaderStageFlags::COMPUTE),
-                        vk::DescriptorSetLayoutBinding::default()
-                            .binding(2)
-                            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                            .descriptor_count(1)
-                            .stage_flags(vk::ShaderStageFlags::COMPUTE),
-                    ])
+                    .bindings(&[vk::DescriptorSetLayoutBinding::default()
+                        .binding(0)
+                        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                        .descriptor_count(1)
+                        .stage_flags(vk::ShaderStageFlags::COMPUTE)])
                     .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL),
                 None,
             )
@@ -511,16 +502,25 @@ fn main() {
             vk_mem::MemoryUsage::AutoPreferDevice,
         );
 
-        let comp_indirect_cmd_buffer: Buffer<vk::DrawIndexedIndirectCommand> = renderer
-            .create_buffer(
-                viking_room_meshlets.len() as u32,
-                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-                vk_mem::MemoryUsage::AutoPreferDevice,
-            );
+        let meshlet_data_buffer: Buffer<MeshletData> = renderer.create_buffer(
+            viking_room_meshlets.len() as u32,
+            vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::TRANSFER_DST
+                | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+            vk_mem::MemoryUsage::AutoPreferDevice,
+        );
+
+        let meshlet_cull_global_buffer: Buffer<MeshletCullGlobal> = renderer.create_buffer(
+            1,
+            vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            vk_mem::MemoryUsage::AutoPreferDevice,
+        );
 
         let indirect_cmd_buffer: Buffer<vk::DrawIndexedIndirectCommand> = renderer.create_buffer(
             viking_room_meshlets.len() as u32,
-            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::INDIRECT_BUFFER,
+            vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::INDIRECT_BUFFER
+                | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
             vk_mem::MemoryUsage::AutoPreferDevice,
         );
 
@@ -528,7 +528,8 @@ fn main() {
             1,
             vk::BufferUsageFlags::STORAGE_BUFFER
                 | vk::BufferUsageFlags::INDIRECT_BUFFER
-                | vk::BufferUsageFlags::TRANSFER_DST,
+                | vk::BufferUsageFlags::TRANSFER_DST
+                | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
             vk_mem::MemoryUsage::AutoPreferDevice,
         );
 
@@ -543,7 +544,7 @@ fn main() {
             vk_mem::MemoryUsage::AutoPreferDevice,
         );
 
-        let global_buffer: Buffer<Global> = renderer.create_buffer(
+        let global_buffer: Buffer<MeshletRenderGlobal> = renderer.create_buffer(
             1,
             vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
             vk_mem::MemoryUsage::AutoPreferDevice,
@@ -554,7 +555,7 @@ fn main() {
             // Create a single gigabuffer.
             let mut vertices = vec![];
             let mut indices = vec![];
-            let mut indirect_cmds = vec![];
+            let mut meshlet_data = vec![];
             for meshlet in &viking_room_meshlets {
                 let first_index = indices.len() as u32;
                 let index_offset = vertices.len() as u32;
@@ -583,12 +584,26 @@ fn main() {
                     color: Vec4::splat(1.0),
                 }));
 
-                indirect_cmds.push(vk::DrawIndexedIndirectCommand {
-                    index_count: meshlet.indices.len() as u32,
-                    instance_count: 1,
-                    first_index,
-                    vertex_offset: 0,
-                    first_instance: 0,
+                meshlet_data.push(MeshletData {
+                    cone_apex: Vec4::new(
+                        meshlet.cone_apex[0],
+                        meshlet.cone_apex[1],
+                        meshlet.cone_apex[2],
+                        0., // unused
+                    ),
+                    cone_axis: Vec3::new(
+                        meshlet.cone_axis[0],
+                        meshlet.cone_axis[1],
+                        meshlet.cone_apex[2],
+                    ),
+                    cone_cutoff: meshlet.cone_cutoff,
+                    cmd: vk::DrawIndexedIndirectCommand {
+                        index_count: meshlet.indices.len() as u32,
+                        first_index,
+                        instance_count: 1,
+                        vertex_offset: 0,
+                        first_instance: 0,
+                    },
                 });
             }
 
@@ -609,7 +624,7 @@ fn main() {
                 .begin_transfer(&renderer.device, staging_command_buffer)
                 .stage_buffer(index_buffer.vk_handle(), 0, indices)
                 .stage_buffer(vertex_buffer.vk_handle(), 0, vertices)
-                .stage_buffer(comp_indirect_cmd_buffer.vk_handle(), 0, indirect_cmds)
+                .stage_buffer(meshlet_data_buffer.vk_handle(), 0, meshlet_data)
                 .stage_image(
                     viking_room_image,
                     viking_room_tex_w,
@@ -680,30 +695,10 @@ fn main() {
                     .dst_set(comp_set)
                     .dst_binding(0)
                     .dst_array_element(0)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                    .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                     .descriptor_count(1)
                     .buffer_info(&[vk::DescriptorBufferInfo::default()
-                        .buffer(comp_buffer.vk_handle())
-                        .offset(0)
-                        .range(vk::WHOLE_SIZE)]),
-                vk::WriteDescriptorSet::default()
-                    .dst_set(comp_set)
-                    .dst_binding(1)
-                    .dst_array_element(0)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .descriptor_count(1)
-                    .buffer_info(&[vk::DescriptorBufferInfo::default()
-                        .buffer(comp_indirect_cmd_buffer.vk_handle())
-                        .offset(0)
-                        .range(vk::WHOLE_SIZE)]),
-                vk::WriteDescriptorSet::default()
-                    .dst_set(comp_set)
-                    .dst_binding(2)
-                    .dst_array_element(0)
-                    .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                    .descriptor_count(1)
-                    .buffer_info(&[vk::DescriptorBufferInfo::default()
-                        .buffer(indirect_cmd_buffer.vk_handle())
+                        .buffer(meshlet_cull_global_buffer.vk_handle())
                         .offset(0)
                         .range(vk::WHOLE_SIZE)]),
                 //
@@ -777,7 +772,7 @@ fn main() {
 
                 renderer.device.cmd_dispatch(
                     command_buffer,
-                    viking_room_meshlets.len() as u32,
+                    viking_room_meshlets.len().div_ceil(64) as u32,
                     1,
                     1,
                 );
@@ -1092,7 +1087,7 @@ fn main() {
                     .stage_buffer(
                         global_buffer.vk_handle(),
                         0,
-                        std::iter::once_with(|| Global {
+                        [MeshletRenderGlobal {
                             proj: Mat4::perspective_rh_gl(
                                 std::f32::consts::FRAC_PI_4,
                                 viewport_w as f32 / viewport_h as f32,
@@ -1112,7 +1107,27 @@ fn main() {
                                 &vk::BufferDeviceAddressInfo::default()
                                     .buffer(vertex_buffer.vk_handle()),
                             ),
-                        }),
+                        }],
+                    )
+                    .stage_buffer(
+                        meshlet_cull_global_buffer.vk_handle(),
+                        0,
+                        [MeshletCullGlobal {
+                            instances: viking_room_meshlets.len() as u32,
+                            camera_position: Vec3::splat(0.), //([0., 0., 0.]),
+                            draw_count: renderer.device.get_buffer_device_address(
+                                &vk::BufferDeviceAddressInfo::default()
+                                    .buffer(comp_buffer.vk_handle()),
+                            ),
+                            meshlets: renderer.device.get_buffer_device_address(
+                                &vk::BufferDeviceAddressInfo::default()
+                                    .buffer(meshlet_data_buffer.vk_handle()),
+                            ),
+                            draw_cmds: renderer.device.get_buffer_device_address(
+                                &vk::BufferDeviceAddressInfo::default()
+                                    .buffer(indirect_cmd_buffer.vk_handle()),
+                            ),
+                        }],
                     )
                     .stage_buffer(object_buffer.vk_handle(), 0, objects)
                     .stage_buffer(comp_buffer.vk_handle(), 0, [0i32])
