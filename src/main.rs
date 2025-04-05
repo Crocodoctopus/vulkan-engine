@@ -33,6 +33,8 @@ struct MeshletRenderGlobal {
     proj: Mat4,
     view: Mat4,
     vertex_buffer: vk::DeviceAddress,
+    instance_buffer: vk::DeviceAddress,
+    object_buffer: vk::DeviceAddress,
 }
 
 #[repr(C, align(16))]
@@ -40,9 +42,10 @@ struct MeshletRenderGlobal {
 struct MeshletCullGlobal {
     camera_position: Vec3,
     instances: u32,
-    draw_count: vk::DeviceAddress,
-    meshlets: vk::DeviceAddress,
-    draw_cmds: vk::DeviceAddress,
+    draw_count_buffer: vk::DeviceAddress,
+    meshlet_buffer: vk::DeviceAddress,
+    draw_cmd_buffer: vk::DeviceAddress,
+    instance_buffer: vk::DeviceAddress,
 }
 
 #[derive(Clone)]
@@ -53,9 +56,16 @@ struct Object {
 }
 
 #[derive(Clone)]
+#[repr(C, align(4))]
+struct Instance {
+    object_id: u32,
+}
+
+#[derive(Clone)]
 #[repr(C, align(16))]
 struct MeshletData {
-    cone_apex: Vec4,
+    cone_apex: Vec3,
+    object_id: u32,
     cone_axis: Vec3,
     cone_cutoff: f32,
     cmd: vk::DrawIndexedIndirectCommand,
@@ -497,13 +507,21 @@ fn main() {
         );
 
         let object_buffer: Buffer<Object> = renderer.create_buffer(
-            1,
-            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            3,
+            vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::TRANSFER_DST
+                | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+            vk_mem::MemoryUsage::AutoPreferDevice,
+        );
+
+        let instance_buffer: Buffer<Instance> = renderer.create_buffer(
+            3 * viking_room_meshlets.len() as u32,
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
             vk_mem::MemoryUsage::AutoPreferDevice,
         );
 
         let meshlet_data_buffer: Buffer<MeshletData> = renderer.create_buffer(
-            viking_room_meshlets.len() as u32,
+            3 * viking_room_meshlets.len() as u32,
             vk::BufferUsageFlags::STORAGE_BUFFER
                 | vk::BufferUsageFlags::TRANSFER_DST
                 | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
@@ -517,7 +535,7 @@ fn main() {
         );
 
         let indirect_cmd_buffer: Buffer<vk::DrawIndexedIndirectCommand> = renderer.create_buffer(
-            viking_room_meshlets.len() as u32,
+            3 * viking_room_meshlets.len() as u32,
             vk::BufferUsageFlags::STORAGE_BUFFER
                 | vk::BufferUsageFlags::INDIRECT_BUFFER
                 | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
@@ -551,7 +569,7 @@ fn main() {
         );
 
         // Upload vertex buffer data.
-        {
+        let instances: u32 = {
             // Create a single gigabuffer.
             let mut vertices = vec![];
             let mut indices = vec![];
@@ -584,28 +602,31 @@ fn main() {
                     color: Vec4::splat(1.0),
                 }));
 
-                meshlet_data.push(MeshletData {
-                    cone_apex: Vec4::new(
-                        meshlet.cone_apex[0],
-                        meshlet.cone_apex[1],
-                        meshlet.cone_apex[2],
-                        0., // unused
-                    ),
-                    cone_axis: Vec3::new(
-                        meshlet.cone_axis[0],
-                        meshlet.cone_axis[1],
-                        meshlet.cone_apex[2],
-                    ),
-                    cone_cutoff: meshlet.cone_cutoff,
-                    cmd: vk::DrawIndexedIndirectCommand {
-                        index_count: meshlet.indices.len() as u32,
-                        first_index,
-                        instance_count: 1,
-                        vertex_offset: 0,
-                        first_instance: 0,
-                    },
-                });
+                for object_id in 0..3 {
+                    meshlet_data.push(MeshletData {
+                        cone_apex: Vec3::new(
+                            meshlet.cone_apex[0],
+                            meshlet.cone_apex[1],
+                            meshlet.cone_apex[2],
+                        ),
+                        object_id,
+                        cone_axis: Vec3::new(
+                            meshlet.cone_axis[0],
+                            meshlet.cone_axis[1],
+                            meshlet.cone_apex[2],
+                        ),
+                        cone_cutoff: meshlet.cone_cutoff,
+                        cmd: vk::DrawIndexedIndirectCommand {
+                            index_count: meshlet.indices.len() as u32,
+                            first_index,
+                            instance_count: 1,
+                            vertex_offset: 0,
+                            first_instance: 0,
+                        },
+                    });
+                }
             }
+            let instances = meshlet_data.len() as u32;
 
             //
             renderer
@@ -663,7 +684,9 @@ fn main() {
                 .wait_for_fences(&[wait], true, u64::MAX)
                 .unwrap();
             renderer.device.destroy_fence(wait, None);
-        }
+
+            instances
+        };
 
         //
         let descriptor_pool = renderer
@@ -770,12 +793,9 @@ fn main() {
                     comp_pipeline,
                 );
 
-                renderer.device.cmd_dispatch(
-                    command_buffer,
-                    viking_room_meshlets.len().div_ceil(64) as u32,
-                    1,
-                    1,
-                );
+                renderer
+                    .device
+                    .cmd_dispatch(command_buffer, instances, 1, 1);
             }
 
             // Convert VK_IMAGE_LAYOUT_UNDEFINED -> VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL.
@@ -882,7 +902,7 @@ fn main() {
                     0,
                     comp_buffer.vk_handle(),
                     0,
-                    viking_room_meshlets.len() as u32,
+                    instances,
                     size_of::<vk::DrawIndexedIndirectCommand>() as u32,
                 );
             }
@@ -1076,14 +1096,25 @@ fn main() {
                 let mult = Mat4::from_scale(Vec3::splat(0.5))
                     * Mat4::from_rotation_y(time * std::f32::consts::FRAC_PI_2)
                     * Mat4::from_rotation_x(std::f32::consts::FRAC_PI_2);
-                let objects = [Object {
-                    model: model0 * mult,
-                    texture_id: 0,
-                }];
+                let object_data = [
+                    Object {
+                        model: model0 * mult,
+                        texture_id: 0,
+                    },
+                    Object {
+                        model: model1 * mult,
+                        texture_id: 0,
+                    },
+                    Object {
+                        model: model2 * mult,
+                        texture_id: 0,
+                    },
+                ];
 
                 // Upload global descriptor data & object data.
                 staging_buffer
                     .begin_transfer(&renderer.device, command_buffer)
+                    .stage_buffer(object_buffer.vk_handle(), 0, object_data)
                     .stage_buffer(
                         global_buffer.vk_handle(),
                         0,
@@ -1107,29 +1138,40 @@ fn main() {
                                 &vk::BufferDeviceAddressInfo::default()
                                     .buffer(vertex_buffer.vk_handle()),
                             ),
+                            instance_buffer: renderer.device.get_buffer_device_address(
+                                &vk::BufferDeviceAddressInfo::default()
+                                    .buffer(instance_buffer.vk_handle()),
+                            ),
+                            object_buffer: renderer.device.get_buffer_device_address(
+                                &vk::BufferDeviceAddressInfo::default()
+                                    .buffer(object_buffer.vk_handle()),
+                            ),
                         }],
                     )
                     .stage_buffer(
                         meshlet_cull_global_buffer.vk_handle(),
                         0,
                         [MeshletCullGlobal {
-                            instances: viking_room_meshlets.len() as u32,
+                            instances,
                             camera_position: Vec3::splat(0.), //([0., 0., 0.]),
-                            draw_count: renderer.device.get_buffer_device_address(
+                            draw_count_buffer: renderer.device.get_buffer_device_address(
                                 &vk::BufferDeviceAddressInfo::default()
                                     .buffer(comp_buffer.vk_handle()),
                             ),
-                            meshlets: renderer.device.get_buffer_device_address(
+                            meshlet_buffer: renderer.device.get_buffer_device_address(
                                 &vk::BufferDeviceAddressInfo::default()
                                     .buffer(meshlet_data_buffer.vk_handle()),
                             ),
-                            draw_cmds: renderer.device.get_buffer_device_address(
+                            draw_cmd_buffer: renderer.device.get_buffer_device_address(
                                 &vk::BufferDeviceAddressInfo::default()
                                     .buffer(indirect_cmd_buffer.vk_handle()),
                             ),
+                            instance_buffer: renderer.device.get_buffer_device_address(
+                                &vk::BufferDeviceAddressInfo::default()
+                                    .buffer(instance_buffer.vk_handle()),
+                            ),
                         }],
                     )
-                    .stage_buffer(object_buffer.vk_handle(), 0, objects)
                     .stage_buffer(comp_buffer.vk_handle(), 0, [0i32])
                     .finish();
             }

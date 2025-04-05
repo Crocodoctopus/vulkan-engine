@@ -14,32 +14,41 @@ struct VkDrawIndexedIndirectCommand {
 
 struct MeshletData {
     vec3 cone_apex;
-    float pad0;
+    uint object_id;
     vec3 cone_axis;
     float cone_cutoff;
     VkDrawIndexedIndirectCommand cmd;
 };
 
+struct Instance {
+    uint object_id;   
+};
+
 //////
 
-layout (buffer_reference, std430) buffer IndirectCountBuffer {
+layout (buffer_reference, std430) buffer DrawCountBuffer {
     uint counter;
 };
 
-layout (buffer_reference, std430) readonly buffer InputBuffer {
+layout (buffer_reference, std430) readonly buffer MeshletBuffer {
     MeshletData data[];
 };
 
-layout (buffer_reference, std430) writeonly buffer OutputBuffer {
+layout (buffer_reference, std430) writeonly buffer DrawCmdBuffer {
     VkDrawIndexedIndirectCommand data[];  
+};
+
+layout (buffer_reference, std430) writeonly buffer InstanceBuffer {
+    Instance data[];  
 };
 
 layout (std430, set = 0, binding = 0) uniform Global {
     vec3 camera_position;
     uint instances;
-    IndirectCountBuffer count;
-    InputBuffer _in;
-    OutputBuffer _out;
+    DrawCountBuffer draw_count_buffer;
+    MeshletBuffer meshlet_buffer;
+    DrawCmdBuffer draw_cmd_buffer;
+    InstanceBuffer instance_buffer;
 };
 
 bool cone_apex_test(vec3 apex, vec3 axis, float cutoff) {
@@ -49,13 +58,18 @@ bool cone_apex_test(vec3 apex, vec3 axis, float cutoff) {
 void main() {
     // 
     if (gl_GlobalInvocationID.x >= instances) return;
-        
-    const uint i = atomicAdd(count.counter, 1);//gl_GlobalInvocationID.x;
-    _out.data[i].index_count = _in.data[i].cmd.index_count;
-    _out.data[i].first_index = _in.data[i].cmd.first_index;
-    _out.data[i].instance_count = 1;
-    _out.data[i].vertex_offset = 0;
-    _out.data[i].first_instance = 0;
+
+    //#define meshlet (meshlet_buffer.data[i])
+    //#define cmd (draw_cmd_buffer.data[i])
+    const uint i = atomicAdd(draw_count_buffer.counter, 1);//gl_GlobalInvocationID.x;
+    MeshletData meshlet = meshlet_buffer.data[i];
+    draw_cmd_buffer.data[i].index_count = meshlet.cmd.index_count;
+    draw_cmd_buffer.data[i].first_index = meshlet.cmd.first_index;
+    draw_cmd_buffer.data[i].instance_count = 1;
+    draw_cmd_buffer.data[i].vertex_offset = 0;
+    draw_cmd_buffer.data[i].first_instance = 0;
+    instance_buffer.data[i].object_id = meshlet.object_id;
+    
     
     //MeshletData data = _in.data[gl_GlobalInvocationID.x];
     //if (cone_apex_test(data.cone_apex, data.cone_axis, data.cone_cutoff)) {
