@@ -205,6 +205,8 @@ impl Renderer {
                         vk::PhysicalDeviceVulkan11Features::default().shader_draw_parameters(true);
 
                     let mut vk12features = vk::PhysicalDeviceVulkan12Features::default()
+                        .shader_int8(true)
+                        .storage_buffer8_bit_access(true)
                         .draw_indirect_count(true)
                         .buffer_device_address(true)
                         .descriptor_binding_uniform_buffer_update_after_bind(true)
@@ -430,11 +432,15 @@ impl Renderer {
     }
 
     pub fn delete_buffer<T>(&mut self, buffer: Buffer<T>) {
-        let mut alloc = self.buffer_allocs.remove(&buffer.buffer).unwrap();
-        unsafe {
-            self.allocator.destroy_buffer(buffer.buffer, &mut alloc);
-        }
+        let alloc = self.buffer_allocs.remove(&buffer.buffer).unwrap();
+        self.vk_delete_buffer(buffer.buffer, alloc);
         std::mem::forget(buffer);
+    }
+
+    fn vk_delete_buffer(&mut self, buffer: vk::Buffer, mut alloc: vk_mem::Allocation) {
+        unsafe {
+            self.allocator.destroy_buffer(buffer, &mut alloc);
+        }
     }
 }
 
@@ -442,8 +448,8 @@ impl Drop for Renderer {
     fn drop(&mut self) {
         unsafe {
             // Free buffers.
-            for (buffer, mut alloc) in std::mem::take(&mut self.buffer_allocs).into_iter() {
-                self.allocator.destroy_buffer(buffer, &mut alloc);
+            for (buffer, alloc) in std::mem::take(&mut self.buffer_allocs).into_iter() {
+                self.vk_delete_buffer(buffer, alloc);
             }
 
             // Free images.

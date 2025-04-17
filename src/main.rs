@@ -14,11 +14,9 @@ mod staging;
 use crate::renderer::*;
 use ash::vk;
 use glam::*;
-use itertools::Itertools;
 use std::f32::consts::FRAC_PI_2;
 use std::io::BufReader;
 use std::mem::size_of;
-use vk_mem::Alloc;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, Event, KeyEvent, WindowEvent};
 use winit::event_loop::EventLoop;
@@ -30,8 +28,7 @@ use crate::staging::StagingBuffer;
 #[repr(C, align(16))]
 #[derive(Copy, Clone, Debug)]
 struct MeshletRenderGlobal {
-    proj: Mat4,
-    view: Mat4,
+    pv: Mat4,
     vertex_buffer: vk::DeviceAddress,
     instance_buffer: vk::DeviceAddress,
     object_buffer: vk::DeviceAddress,
@@ -40,12 +37,21 @@ struct MeshletRenderGlobal {
 #[repr(C, align(16))]
 #[derive(Copy, Clone, Debug)]
 struct MeshletCullGlobal {
-    camera_position: Vec3,
+    camera_position: [f32; 3],
     instances: u32,
+
+    frustum_left: [f32; 4],
+    frustum_right: [f32; 4],
+    frustum_top: [f32; 4],
+    frustum_bottom: [f32; 4],
+    frustum_near: [f32; 4],
+    frustum_far: [f32; 4],
+
     draw_count_buffer: vk::DeviceAddress,
     meshlet_buffer: vk::DeviceAddress,
     draw_cmd_buffer: vk::DeviceAddress,
     instance_buffer: vk::DeviceAddress,
+    object_buffer: vk::DeviceAddress,
 }
 
 #[derive(Clone)]
@@ -64,11 +70,18 @@ struct Instance {
 #[derive(Clone)]
 #[repr(C, align(16))]
 struct MeshletData {
-    cone_apex: Vec3,
-    object_id: u32,
-    cone_axis: Vec3,
+    // Culling.
+    center: [f32; 3],
+    radius: f32,
+    cone_apex: [f32; 3],
+    pad0: f32,
+    cone_axis: [f32; 3],
     cone_cutoff: f32,
-    cmd: vk::DrawIndexedIndirectCommand,
+
+    // Draw cmd.
+    object_id: u32,
+    index_count: u32,
+    first_index: u32,
 }
 
 #[repr(C, align(16))]
@@ -82,8 +95,10 @@ struct Vertex {
 }
 
 struct Meshlet {
-    cone_apex: Vec3,
-    cone_axis: Vec3,
+    center: [f32; 3],
+    radius: f32,
+    cone_apex: [f32; 3],
+    cone_axis: [f32; 3],
     cone_cutoff: f32,
     indices: Box<[u8]>,
     positions: Box<[f32]>,
@@ -92,7 +107,7 @@ struct Meshlet {
 
 fn main() {
     // File IO.
-    let (viking_room_tex, viking_room_tex_w, viking_room_tex_h) = {
+    /*let (viking_room_tex, viking_room_tex_w, viking_room_tex_h) = {
         let data = include_bytes!("../resources/textures/viking_room.png"); //fs::read("../resources/textures/viking_room.png").unwrap();
         let decoder = png::Decoder::new(&data[..]);
         let mut reader = decoder.read_info().unwrap();
@@ -143,6 +158,50 @@ fn main() {
                         .flat_map(|&i| &viking_room_model.texcoords[2 * i as usize..][0..2])
                         .copied()
                         .collect(),
+                }
+            })
+            .collect()
+    };*/
+
+    let bunny_meshlets: Box<[Meshlet]> = {
+        let model = {
+            let data = include_bytes!("../resources/models/bunny.obj");
+            let (models, _) =
+                tobj::load_obj_buf(&mut BufReader::new(&data[..]), |_| unreachable!()).unwrap();
+            models.into_iter().next().unwrap().mesh
+        };
+
+        let adapter = meshopt::VertexDataAdapter {
+            reader: std::io::Cursor::new(unsafe {
+                std::slice::from_raw_parts(
+                    model.positions.as_ptr() as *const u8,
+                    model.positions.len() * size_of::<f32>(),
+                )
+            }),
+            vertex_count: model.positions.len() / 3,
+            vertex_stride: 3 * size_of::<f32>(),
+            position_offset: 0,
+        };
+
+        meshopt::build_meshlets(&model.indices, &adapter, 64, 124, 0.5)
+            .iter()
+            .map(|meshlet| {
+                let bounds = meshopt::compute_meshlet_bounds(meshlet, &adapter);
+                println!("{:?} vs {:?}", bounds.center, bounds.cone_apex);
+                Meshlet {
+                    center: bounds.cone_apex,
+                    radius: bounds.radius,
+                    cone_apex: bounds.cone_apex,
+                    cone_axis: bounds.cone_axis,
+                    cone_cutoff: bounds.cone_cutoff,
+                    indices: meshlet.triangles.to_owned().into_boxed_slice(),
+                    positions: meshlet
+                        .vertices
+                        .iter()
+                        .flat_map(|&i: &u32| &model.positions[3 * i as usize..][0..3])
+                        .copied()
+                        .collect(),
+                    texcoords: Box::new([]),
                 }
             })
             .collect()
@@ -433,29 +492,29 @@ fn main() {
             .collect::<Result<_, _>>()
             .unwrap();
 
-        let (viking_room_image, mut viking_room_alloc) = renderer
-            .allocator
-            .create_image(
-                &vk::ImageCreateInfo::default()
-                    .image_type(vk::ImageType::TYPE_2D)
-                    .extent(vk::Extent3D {
-                        width: viking_room_tex_w,
-                        height: viking_room_tex_h,
-                        depth: 1,
-                    })
-                    .mip_levels(1)
-                    .array_layers(1)
-                    .format(vk::Format::R8G8B8A8_UNORM)
-                    .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
-                    .tiling(vk::ImageTiling::OPTIMAL)
-                    .initial_layout(vk::ImageLayout::UNDEFINED)
-                    .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                    .samples(vk::SampleCountFlags::TYPE_1),
-                &vk_mem::AllocationCreateInfo {
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+        /*let (viking_room_image, mut viking_room_alloc) = renderer
+        .allocator
+        .create_image(
+            &vk::ImageCreateInfo::default()
+                .image_type(vk::ImageType::TYPE_2D)
+                .extent(vk::Extent3D {
+                    width: viking_room_tex_w,
+                    height: viking_room_tex_h,
+                    depth: 1,
+                })
+                .mip_levels(1)
+                .array_layers(1)
+                .format(vk::Format::R8G8B8A8_UNORM)
+                .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .initial_layout(vk::ImageLayout::UNDEFINED)
+                .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                .samples(vk::SampleCountFlags::TYPE_1),
+            &vk_mem::AllocationCreateInfo {
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
         let viking_room_view = renderer
             .device
@@ -477,27 +536,27 @@ fn main() {
             .unwrap();
 
         let viking_room_sampler = renderer
-            .device
-            .create_sampler(
-                &vk::SamplerCreateInfo::default()
-                    .mag_filter(vk::Filter::LINEAR)
-                    .min_filter(vk::Filter::LINEAR)
-                    .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-                    .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-                    .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-                    .unnormalized_coordinates(false)
-                    .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
-                    .mip_lod_bias(0.0)
-                    .min_lod(0.0)
-                    .max_lod(0.0),
-                None,
-            )
-            .unwrap();
+        .device
+        .create_sampler(
+            &vk::SamplerCreateInfo::default()
+                .mag_filter(vk::Filter::LINEAR)
+                .min_filter(vk::Filter::LINEAR)
+                .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .unnormalized_coordinates(false)
+                .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+                .mip_lod_bias(0.0)
+                .min_lod(0.0)
+                .max_lod(0.0),
+            None,
+        )
+        .unwrap();*/
 
         // TODO: delete
         let mut staging_buffer = StagingBuffer::new(10000000, &renderer.allocator);
 
-        let index_count = viking_room_meshlets
+        let index_count = bunny_meshlets
             .iter()
             .fold(0, |acc, meshlet| acc + meshlet.indices.len());
         let index_buffer: Buffer<u32> = renderer.create_buffer(
@@ -515,13 +574,13 @@ fn main() {
         );
 
         let instance_buffer: Buffer<Instance> = renderer.create_buffer(
-            3 * viking_room_meshlets.len() as u32,
+            3 * bunny_meshlets.len() as u32,
             vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
             vk_mem::MemoryUsage::AutoPreferDevice,
         );
 
         let meshlet_data_buffer: Buffer<MeshletData> = renderer.create_buffer(
-            3 * viking_room_meshlets.len() as u32,
+            3 * bunny_meshlets.len() as u32,
             vk::BufferUsageFlags::STORAGE_BUFFER
                 | vk::BufferUsageFlags::TRANSFER_DST
                 | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
@@ -535,7 +594,7 @@ fn main() {
         );
 
         let indirect_cmd_buffer: Buffer<vk::DrawIndexedIndirectCommand> = renderer.create_buffer(
-            3 * viking_room_meshlets.len() as u32,
+            3 * bunny_meshlets.len() as u32,
             vk::BufferUsageFlags::STORAGE_BUFFER
                 | vk::BufferUsageFlags::INDIRECT_BUFFER
                 | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
@@ -551,7 +610,7 @@ fn main() {
             vk_mem::MemoryUsage::AutoPreferDevice,
         );
 
-        let vertex_count = viking_room_meshlets
+        let vertex_count = bunny_meshlets
             .iter()
             .fold(0, |acc, meshlet| acc + meshlet.positions.len() / 3);
         let vertex_buffer: Buffer<Vertex> = renderer.create_buffer(
@@ -574,7 +633,7 @@ fn main() {
             let mut vertices = vec![];
             let mut indices = vec![];
             let mut meshlet_data = vec![];
-            for meshlet in &viking_room_meshlets {
+            for meshlet in &bunny_meshlets {
                 let first_index = indices.len() as u32;
                 let index_offset = vertices.len() as u32;
 
@@ -591,38 +650,28 @@ fn main() {
                         meshlet.positions[3 * i + 1],
                         meshlet.positions[3 * i + 2],
                     ),
-                    u: meshlet.texcoords[2 * i],
+                    u: 0., //meshlet.texcoords[2 * i],
                     normal: Vec3::splat(0.0),
                     /*normals: Vec3::new(
                         meshlet.normals[3 * i],
                         meshlet.normals[3 * i + 1],
                         meshlet.normals[3 * i + 2],
                     )*/
-                    v: meshlet.texcoords[2 * i + 1],
+                    v: 0., //meshlet.texcoords[2 * i + 1],
                     color: Vec4::splat(1.0),
                 }));
 
-                for object_id in 0..3 {
+                for object_id in 0..1 {
                     meshlet_data.push(MeshletData {
-                        cone_apex: Vec3::new(
-                            meshlet.cone_apex[0],
-                            meshlet.cone_apex[1],
-                            meshlet.cone_apex[2],
-                        ),
-                        object_id,
-                        cone_axis: Vec3::new(
-                            meshlet.cone_axis[0],
-                            meshlet.cone_axis[1],
-                            meshlet.cone_apex[2],
-                        ),
+                        center: meshlet.center,
+                        radius: meshlet.radius,
+                        cone_apex: meshlet.cone_apex,
+                        pad0: 0.,
+                        cone_axis: meshlet.cone_axis,
                         cone_cutoff: meshlet.cone_cutoff,
-                        cmd: vk::DrawIndexedIndirectCommand {
-                            index_count: meshlet.indices.len() as u32,
-                            first_index,
-                            instance_count: 1,
-                            vertex_offset: 0,
-                            first_instance: 0,
-                        },
+                        object_id,
+                        index_count: meshlet.indices.len() as u32,
+                        first_index,
                     });
                 }
             }
@@ -646,7 +695,7 @@ fn main() {
                 .stage_buffer(index_buffer.vk_handle(), 0, indices)
                 .stage_buffer(vertex_buffer.vk_handle(), 0, vertices)
                 .stage_buffer(meshlet_data_buffer.vk_handle(), 0, meshlet_data)
-                .stage_image(
+                /*.stage_image(
                     viking_room_image,
                     viking_room_tex_w,
                     viking_room_tex_h,
@@ -654,7 +703,7 @@ fn main() {
                         .iter()
                         .tuples()
                         .flat_map(|(&x, &y, &z)| [x, y, z, 255]),
-                )
+                )*/
                 .finish();
 
             renderer
@@ -735,16 +784,16 @@ fn main() {
                         .buffer(global_buffer.vk_handle())
                         .offset(0)
                         .range(vk::WHOLE_SIZE)]),
-                vk::WriteDescriptorSet::default()
-                    .dst_set(global_set)
-                    .dst_binding(1)
-                    .dst_array_element(0)
-                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                    .descriptor_count(1)
-                    .image_info(&[vk::DescriptorImageInfo::default()
-                        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                        .image_view(viking_room_view)
-                        .sampler(viking_room_sampler)]),
+                /*vk::WriteDescriptorSet::default()
+                .dst_set(global_set)
+                .dst_binding(1)
+                .dst_array_element(0)
+                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(1)
+                .image_info(&[vk::DescriptorImageInfo::default()
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                    .image_view(viking_room_view)
+                    .sampler(viking_room_sampler)]),*/
                 vk::WriteDescriptorSet::default()
                     .dst_set(global_set)
                     .dst_binding(2)
@@ -758,6 +807,8 @@ fn main() {
             ],
             &[],
         );
+
+        println!("{}", instances);
 
         // Pre-record scene command buffers.
         for i in 0..3 {
@@ -795,7 +846,7 @@ fn main() {
 
                 renderer
                     .device
-                    .cmd_dispatch(command_buffer, instances, 1, 1);
+                    .cmd_dispatch(command_buffer, instances.div_ceil(64), 1, 1);
             }
 
             // Convert VK_IMAGE_LAYOUT_UNDEFINED -> VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL.
@@ -1090,12 +1141,16 @@ fn main() {
 
             // Transfer some global state data.
             {
-                let model0 = Mat4::from_translation(Vec3::new(0., 0.5, 0.));
-                let model1 = Mat4::from_translation(Vec3::new(1., 0.5, 0.));
-                let model2 = Mat4::from_translation(Vec3::new(2., 0.5, 0.));
-                let mult = Mat4::from_scale(Vec3::splat(0.5))
+                /*let model0 = Mat4::IDENTITY;
+                let model1 = model0;
+                let model2 = model1;
+                let mult = model0;*/
+                let model0 = Mat4::from_translation(Vec3::new(0., 0.8, 0.));
+                let model1 = Mat4::from_translation(Vec3::new(1., 0.8, 0.));
+                let model2 = Mat4::from_translation(Vec3::new(2., 0.8, 0.));
+                let mult = Mat4::from_scale(Vec3::splat(2.0))
                     * Mat4::from_rotation_y(time * std::f32::consts::FRAC_PI_2)
-                    * Mat4::from_rotation_x(std::f32::consts::FRAC_PI_2);
+                    * Mat4::from_rotation_x(std::f32::consts::PI);
                 let object_data = [
                     Object {
                         model: model0 * mult,
@@ -1112,6 +1167,36 @@ fn main() {
                 ];
 
                 // Upload global descriptor data & object data.
+                let projection = Mat4::perspective_rh_gl(
+                    std::f32::consts::FRAC_PI_4,
+                    viewport_w as f32 / viewport_h as f32,
+                    0.01,
+                    10.0,
+                );
+                let view = Mat4::from_rotation_translation(
+                    Quat::from_euler(EulerRot::XYZ, -std::f32::consts::FRAC_PI_8, cam_hr, 0.),
+                    Vec3::new(0., 0., 0.),
+                ) * Mat4::from_translation(Vec3::new(cam_x, cam_y, cam_z));
+
+                // Frustum plane data.
+                let mut frustum_left = [0f32; 4];
+                let mut frustum_right = [0f32; 4];
+                let mut frustum_top = [0f32; 4];
+                let mut frustum_bottom = [0f32; 4];
+                let mut frustum_near = [0f32; 4];
+                let mut frustum_far = [0f32; 4];
+                let pv = projection * view;
+                let mat = pv.to_cols_array_2d();
+                for i in 0..4 {
+                    let row = mat[i];
+                    frustum_left[i] = row[3] + row[0];
+                    frustum_right[i] = row[3] - row[0];
+                    frustum_bottom[i] = row[3] + row[1];
+                    frustum_top[i] = row[3] - row[1];
+                    frustum_near[i] = row[3] + row[2];
+                    frustum_far[i] = row[3] - row[2];
+                }
+
                 staging_buffer
                     .begin_transfer(&renderer.device, command_buffer)
                     .stage_buffer(object_buffer.vk_handle(), 0, object_data)
@@ -1119,21 +1204,7 @@ fn main() {
                         global_buffer.vk_handle(),
                         0,
                         [MeshletRenderGlobal {
-                            proj: Mat4::perspective_rh_gl(
-                                std::f32::consts::FRAC_PI_4,
-                                viewport_w as f32 / viewport_h as f32,
-                                0.01,
-                                10.0,
-                            ),
-                            view: Mat4::from_rotation_translation(
-                                Quat::from_euler(
-                                    EulerRot::XYZ,
-                                    -std::f32::consts::FRAC_PI_8,
-                                    cam_hr,
-                                    0.,
-                                ),
-                                Vec3::new(0., 0., 0.),
-                            ) * Mat4::from_translation(Vec3::new(cam_x, cam_y, cam_z)),
+                            pv: projection * view,
                             vertex_buffer: renderer.device.get_buffer_device_address(
                                 &vk::BufferDeviceAddressInfo::default()
                                     .buffer(vertex_buffer.vk_handle()),
@@ -1152,8 +1223,14 @@ fn main() {
                         meshlet_cull_global_buffer.vk_handle(),
                         0,
                         [MeshletCullGlobal {
+                            camera_position: [-cam_x, cam_y, -cam_z],
                             instances,
-                            camera_position: Vec3::splat(0.), //([0., 0., 0.]),
+                            frustum_left,
+                            frustum_right,
+                            frustum_top,
+                            frustum_bottom,
+                            frustum_near,
+                            frustum_far,
                             draw_count_buffer: renderer.device.get_buffer_device_address(
                                 &vk::BufferDeviceAddressInfo::default()
                                     .buffer(comp_buffer.vk_handle()),
@@ -1169,6 +1246,10 @@ fn main() {
                             instance_buffer: renderer.device.get_buffer_device_address(
                                 &vk::BufferDeviceAddressInfo::default()
                                     .buffer(instance_buffer.vk_handle()),
+                            ),
+                            object_buffer: renderer.device.get_buffer_device_address(
+                                &vk::BufferDeviceAddressInfo::default()
+                                    .buffer(object_buffer.vk_handle()),
                             ),
                         }],
                     )
