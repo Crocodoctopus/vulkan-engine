@@ -61,16 +61,12 @@ layout (buffer_reference, std430) writeonly buffer InstanceBuffer {
 };
 
 layout (std430, set = 0, binding = 0) uniform Global {
+    mat4 view;
     vec3 camera_position;
     uint instances;
 
     // Frustum.
-    vec4 frustum_left;
-    vec4 frustum_right;
-    vec4 frustum_top;
-    vec4 frustum_bottom;
-    vec4 frustum_near;
-    vec4 frustum_far;
+    vec4 frustum;    
 
     // Buffers.
     DrawCountBuffer draw_count_buffer;
@@ -92,11 +88,23 @@ void main() {
     Object object = object_buffer.data[meshlet.object_id];
 
     // Frustum cull.
+    vec4 center = view * object.model * vec4(meshlet.center, 1.0);
+    float radius = meshlet.radius;
+
+    float znear = 1.0;
+    float zfar = 2.0;
+    bool visible_x = center.z * frustum[1] - abs(center.x) * frustum[0] > -radius;
+    bool visible_y = center.z * frustum[3] - abs(center.y) * frustum[2] > -radius;
+    bool visible_z = true;//center.z + radius > znear && center.z - radius < zfar;
+    if (!(visible_x && visible_y && visible_z)) return;
+    
+    /*
     vec4 center = object.model * vec4(meshlet.center, 1.0);
     float d0 = min(dot(center, frustum_left), dot(center, frustum_right));
     float d1 = min(dot(center, frustum_bottom), dot(center, frustum_top));
-    float d2 = min(dot(center, frustum_near), dot(center, frustum_far));
-    if (min(min(d0, d1), d2) + meshlet.radius <= 0) return;
+    //float d2 = min(dot(center, frustum_near), dot(center, frustum_far));
+    if (min(d0, d1) + meshlet.radius < 0) return;
+    */
         
     // Backface cull.
 	vec3 cone_apex = (object.model * vec4(
@@ -107,7 +115,7 @@ void main() {
 
 	float cone_cutoff = meshlet.cone_cutoff;
 	
-    //if (dot(normalize(cone_apex - camera_position), cone_axis) < cone_cutoff) return;
+    //if (dot(normalize(cone_apex - camera_position), cone_axis) >= cone_cutoff) return;
 //	bool bConeCulled = dot(normalize(coneApex - cameraPosition), center) >= coneCutoff;
 ///   `dot(normalize(cone_apex - camera_position), cone_axis) >= cone_cutoff`
 		

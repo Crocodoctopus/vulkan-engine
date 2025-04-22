@@ -14,6 +14,7 @@ mod staging;
 use crate::renderer::*;
 use ash::vk;
 use glam::*;
+use itertools::Itertools;
 use std::f32::consts::FRAC_PI_2;
 use std::io::BufReader;
 use std::mem::size_of;
@@ -37,15 +38,11 @@ struct MeshletRenderGlobal {
 #[repr(C, align(16))]
 #[derive(Copy, Clone, Debug)]
 struct MeshletCullGlobal {
+    view: [f32; 4 * 4],
     camera_position: [f32; 3],
     instances: u32,
 
-    frustum_left: [f32; 4],
-    frustum_right: [f32; 4],
-    frustum_top: [f32; 4],
-    frustum_bottom: [f32; 4],
-    frustum_near: [f32; 4],
-    frustum_far: [f32; 4],
+    frustum: [f32; 4],
 
     draw_count_buffer: vk::DeviceAddress,
     meshlet_buffer: vk::DeviceAddress,
@@ -171,22 +168,38 @@ fn main() {
             models.into_iter().next().unwrap().mesh
         };
 
+        let mut indices: Box<[u32]> = model.indices.into_boxed_slice();
+        let mut positions: Box<[[f32; 3]]> = model
+            .positions
+            .chunks_exact(3)
+            .map(|v| [v[0], v[1], v[2]])
+            .collect();
+
+        // Optimize index count.
+        meshopt::optimize_vertex_cache_in_place(&mut indices, positions.len());
+
+        // Optimize overdraw.
+        meshopt::optimize_overdraw_in_place_decoder(&mut indices, &positions, 1.05);
+
+        // Optimize vertex fetch.
+        meshopt::optimize_vertex_fetch_in_place(&mut indices, &mut positions);
+
         let adapter = meshopt::VertexDataAdapter {
             reader: std::io::Cursor::new(unsafe {
                 std::slice::from_raw_parts(
-                    model.positions.as_ptr() as *const u8,
-                    model.positions.len() * size_of::<f32>(),
+                    positions.as_ptr() as *const u8,
+                    3 * positions.len() * size_of::<f32>(),
                 )
             }),
-            vertex_count: model.positions.len() / 3,
+            vertex_count: positions.len(),
             vertex_stride: 3 * size_of::<f32>(),
             position_offset: 0,
         };
 
-        meshopt::build_meshlets(&model.indices, &adapter, 64, 124, 0.5)
+        meshopt::build_meshlets(&indices, &adapter, 64, 124, 0.5)
             .iter()
             .map(|meshlet| {
-                let bounds = meshopt::compute_meshlet_bounds(meshlet, &adapter);
+                let bounds = meshopt::compute_meshlet_bounds_decoder(meshlet, &positions);
                 println!("{:?} vs {:?}", bounds.center, bounds.cone_apex);
                 Meshlet {
                     center: bounds.cone_apex,
@@ -198,7 +211,7 @@ fn main() {
                     positions: meshlet
                         .vertices
                         .iter()
-                        .flat_map(|&i: &u32| &model.positions[3 * i as usize..][0..3])
+                        .flat_map(|&i: &u32| &positions[i as usize])
                         .copied()
                         .collect(),
                     texcoords: Box::new([]),
@@ -1167,11 +1180,11 @@ fn main() {
                 ];
 
                 // Upload global descriptor data & object data.
-                let projection = Mat4::perspective_rh_gl(
+                let projection = Mat4::perspective_infinite_rh(
                     std::f32::consts::FRAC_PI_4,
                     viewport_w as f32 / viewport_h as f32,
-                    0.01,
-                    10.0,
+                    0.1,
+                    //2.0,
                 );
                 let view = Mat4::from_rotation_translation(
                     Quat::from_euler(EulerRot::XYZ, -std::f32::consts::FRAC_PI_8, cam_hr, 0.),
@@ -1179,23 +1192,11 @@ fn main() {
                 ) * Mat4::from_translation(Vec3::new(cam_x, cam_y, cam_z));
 
                 // Frustum plane data.
-                let mut frustum_left = [0f32; 4];
-                let mut frustum_right = [0f32; 4];
-                let mut frustum_top = [0f32; 4];
-                let mut frustum_bottom = [0f32; 4];
-                let mut frustum_near = [0f32; 4];
-                let mut frustum_far = [0f32; 4];
-                let pv = projection * view;
-                let mat = pv.to_cols_array_2d();
-                for i in 0..4 {
-                    let row = mat[i];
-                    frustum_left[i] = row[3] + row[0];
-                    frustum_right[i] = row[3] - row[0];
-                    frustum_bottom[i] = row[3] + row[1];
-                    frustum_top[i] = row[3] - row[1];
-                    frustum_near[i] = row[3] + row[2];
-                    frustum_far[i] = row[3] - row[2];
-                }
+                let normalize_plane = |p: Vec4| p / p.xyz().length();
+                let temp = projection.transpose();
+                let frustum_x = normalize_plane(temp.w_axis + temp.x_axis);
+                let frustum_y = normalize_plane(temp.w_axis + temp.y_axis);
+                let frustum = [frustum_x.x, frustum_x.z, frustum_y.y, frustum_y.z];
 
                 staging_buffer
                     .begin_transfer(&renderer.device, command_buffer)
@@ -1223,14 +1224,10 @@ fn main() {
                         meshlet_cull_global_buffer.vk_handle(),
                         0,
                         [MeshletCullGlobal {
+                            view: view.to_cols_array(),
                             camera_position: [-cam_x, cam_y, -cam_z],
                             instances,
-                            frustum_left,
-                            frustum_right,
-                            frustum_top,
-                            frustum_bottom,
-                            frustum_near,
-                            frustum_far,
+                            frustum,
                             draw_count_buffer: renderer.device.get_buffer_device_address(
                                 &vk::BufferDeviceAddressInfo::default()
                                     .buffer(comp_buffer.vk_handle()),
