@@ -4,8 +4,74 @@ use ash::{khr, vk};
 use glam::*;
 use std::collections::HashMap;
 use std::ffi::CStr;
+use std::path::Path;
 use vk_mem::Alloc;
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+
+#[repr(C, align(16))]
+#[derive(Copy, Clone, Debug)]
+struct MeshletRenderGlobal {
+    pv: Mat4,
+    vertex_buffer: vk::DeviceAddress,
+    instance_buffer: vk::DeviceAddress,
+    object_buffer: vk::DeviceAddress,
+}
+
+#[repr(C, align(16))]
+#[derive(Copy, Clone, Debug)]
+struct MeshletCullGlobal {
+    view: [f32; 4 * 4],
+    camera_position: [f32; 3],
+    instances: u32,
+
+    frustum: [f32; 4],
+
+    draw_count_buffer: vk::DeviceAddress,
+    meshlet_buffer: vk::DeviceAddress,
+    draw_cmd_buffer: vk::DeviceAddress,
+    instance_buffer: vk::DeviceAddress,
+    object_buffer: vk::DeviceAddress,
+}
+
+#[derive(Clone)]
+#[repr(C, align(16))]
+struct Object {
+    model: Mat4,
+    texture_id: u32,
+}
+
+#[derive(Clone)]
+#[repr(C, align(16))]
+struct Instance {
+    object_id: u32,
+}
+
+#[derive(Clone)]
+#[repr(C, align(16))]
+struct MeshletData {
+    // Culling.
+    center: [f32; 3],
+    radius: f32,
+    cone_apex: [f32; 3],
+    pad0: f32,
+    cone_axis: [f32; 3],
+    cone_cutoff: f32,
+
+    // Draw cmd.
+    object_id: u32,
+    index_count: u32,
+    first_index: u32,
+}
+
+#[repr(C, align(16))]
+#[derive(Clone, Debug, Default)]
+struct Vertex {
+    position: Vec3,
+    u: f32,
+    normal: Vec3,
+    v: f32,
+    color: Vec4,
+}
 
 #[derive(Debug)]
 pub struct Shader(vk::ShaderModule);
@@ -47,12 +113,36 @@ impl<T> Drop for Buffer<T> {
     }
 }
 
-pub struct BufferHandle(u16);
-pub struct ImageHandle(u16);
-pub struct PipelineLayoutHandle(u16);
-pub struct PipelineHandle(u16);
+struct Meshlet {
+    center: [f32; 3],
+    radius: f32,
+    cone_apex: [f32; 3],
+    cone_axis: [f32; 3],
+    cone_cutoff: f32,
+    indices: Box<[u8]>,
+    positions: Box<[f32]>,
+    texcoords: Box<[f32]>,
+}
+
+struct ObjectInstance {
+    mesh: MeshHandle,
+    position: Vec3,
+    orientation: Quat,
+    scale: Vec3,
+}
+
+#[derive(Copy, Clone, Hash, Eq, PartialEq)]
+struct MeshHandle(u32);
+#[derive(Copy, Clone, Hash, Eq, PartialEq)]
+struct ObjectHandle(u32);
 
 pub struct Renderer {
+    // Generic resource containers.
+    //pub resource_counter: u32,
+    //pub meshes: HashMap<MeshHandle, Box<[Meshlet]>>,
+    //pub objects: HashMap<ObjectHandle, ObjectInstance>,
+
+    // Various Vulkan state data.
     pub entry: ash::Entry,
     pub instance: ash::Instance,
     pub physical_device: vk::PhysicalDevice,
@@ -66,15 +156,19 @@ pub struct Renderer {
     pub queue_family_index: u32,
     pub graphics_queue: vk::Queue,
     pub present_queue: vk::Queue,
+    //pub transfer_queue: vk::Queue,
 
+    // Generic memory allocator.
     pub allocator: vk_mem::Allocator,
 
+    // Swapchain data.
     pub swapchain_device: khr::swapchain::Device,
     pub swapchain: vk::SwapchainKHR,
     pub depth_image: (vk::Image, vk_mem::Allocation),
     pub swapchain_images: Box<[vk::Image]>,
     pub swapchain_color_views: Box<[vk::ImageView]>,
     pub swapchain_depth_views: Box<[vk::ImageView]>,
+
     //pub pipeline_layouts: Map2<u16, vk::PipelineLayout>,
     //pub pipelines: Map2<u16, vk::Pipeline>,
     //pub buffers: Map2<u16, vk::Buffer>,
@@ -82,28 +176,91 @@ pub struct Renderer {
 }
 
 impl Renderer {
-    /*pub fn create_pipeline_layout(
+    /*pub fn create_object(
         &mut self,
-        pipeline_layout: vk::PipelineLayoutCreateInfo,
-    ) -> PipelineLayoutHandle {
-        let pipeline_layout = unsafe {
-            self.device
-                .create_pipeline_layout(&pipeline_layout, None)
-                .unwrap()
-        };
-
-        self.pipeline_layouts.insert(pipeline_layout)
+        mesh: MeshHandle,
+        position: Vec3,
+        orientation: Quat,
+        scale: Vec3,
+    ) -> Option<ObjectHandle> {
+        let handle = ObjectHandle(self.resource_counter);
+        self.resource_counter += 1;
+        self.objects.insert(
+            handle,
+            ObjectInstance {
+                mesh,
+                position,
+                orientation,
+                scale,
+            },
+        );
+        Some(handle)
     }
 
-    pub fn create_pipeline(&mut self, pipeline: vk::GraphicsPipelineCreateInfo) -> PipelineHandle {
-        unsafe {
-            let pipeline = self
-                .device
-                .create_graphics_pipelines(vk::PipelineCache::null(), pipeline, None)
-                .unwrap();
+    pub fn load_mesh(&mut self, filename: impl AsRef<Path>) -> Option<MeshHandle> {
+        let model = {
+            use std::io::BufReader;
+            let data = std::fs::read(filename).ok()?;
+            let (models, _) =
+                tobj::load_obj_buf(&mut BufReader::new(&data[..]), |_| unreachable!()).unwrap();
+            models.into_iter().next()?.mesh
+        };
 
-            self.pipelines.insert(pipeline)
-        }
+        let mut indices: Box<[u32]> = model.indices.into_boxed_slice();
+        let mut positions: Box<[[f32; 3]]> = model
+            .positions
+            .chunks_exact(3)
+            .map(|v| [v[0], v[1], v[2]])
+            .collect();
+
+        // Optimize index count.
+        meshopt::optimize_vertex_cache_in_place(&mut indices, positions.len());
+
+        // Optimize overdraw.
+        meshopt::optimize_overdraw_in_place_decoder(&mut indices, &positions, 1.05);
+
+        // Optimize vertex fetch.
+        meshopt::optimize_vertex_fetch_in_place(&mut indices, &mut positions);
+
+        let adapter = meshopt::VertexDataAdapter {
+            reader: std::io::Cursor::new(unsafe {
+                std::slice::from_raw_parts(
+                    positions.as_ptr() as *const u8,
+                    3 * positions.len() * size_of::<f32>(),
+                )
+            }),
+            vertex_count: positions.len(),
+            vertex_stride: 3 * size_of::<f32>(),
+            position_offset: 0,
+        };
+
+        let meshlets = meshopt::build_meshlets(&indices, &adapter, 64, 124, 0.5)
+            .iter()
+            .map(|meshlet| {
+                let bounds = meshopt::compute_meshlet_bounds_decoder(meshlet, &positions);
+                println!("{:?} vs {:?}", bounds.center, bounds.cone_apex);
+                Meshlet {
+                    center: bounds.cone_apex,
+                    radius: bounds.radius,
+                    cone_apex: bounds.cone_apex,
+                    cone_axis: bounds.cone_axis,
+                    cone_cutoff: bounds.cone_cutoff,
+                    indices: meshlet.triangles.to_owned().into_boxed_slice(),
+                    positions: meshlet
+                        .vertices
+                        .iter()
+                        .flat_map(|&i: &u32| &positions[i as usize])
+                        .copied()
+                        .collect(),
+                    texcoords: Box::new([]),
+                }
+            })
+            .collect();
+
+        let handle = MeshHandle(self.resource_counter);
+        self.resource_counter += 1;
+        self.meshes.insert(handle, meshlets);
+        return Some(handle);
     }*/
 
     pub fn new(
@@ -194,6 +351,20 @@ impl Renderer {
                     (graphics && present).then_some(index as u32)
                 })
                 .expect("Could not find a suitable graphics queue.");
+
+            // Find a queue family that is capable of just transfer commands.
+            /*let queue_family_index = instance
+            .get_physical_device_queue_family_properties(physical_device)
+            .into_iter()
+            .enumerate()
+            .find_map(|(index, properties)| {
+                println!("{:?}", properties.queue_flags);
+                properties
+                    .queue_flags
+                    .eq(&vk::QueueFlags::TRANSFER)
+                    .then_some(index as u32)
+            })
+            .expect("Could not find a suitable graphics queue.");*/
 
             // Create logical device and its associated queues.
             let (device, graphics_queue, present_queue) = {
@@ -351,6 +522,321 @@ impl Renderer {
                 }
                 (color_views, depth_views)
             };
+
+            /*
+            // Desciptor set layout for the rendering program.
+            let render_set_layout = device
+                .create_descriptor_set_layout(
+                    &vk::DescriptorSetLayoutCreateInfo::default()
+                        .push_next(
+                            &mut vk::DescriptorSetLayoutBindingFlagsCreateInfo::default()
+                                .binding_flags(&[
+                                    vk::DescriptorBindingFlags::PARTIALLY_BOUND
+                                        | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
+                                    vk::DescriptorBindingFlags::PARTIALLY_BOUND
+                                        | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
+                                    vk::DescriptorBindingFlags::PARTIALLY_BOUND
+                                        | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
+                                ]),
+                        )
+                        .bindings(&[
+                            vk::DescriptorSetLayoutBinding::default()
+                                .binding(0)
+                                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                                .descriptor_count(1)
+                                .stage_flags(vk::ShaderStageFlags::ALL),
+                            vk::DescriptorSetLayoutBinding::default()
+                                .binding(1)
+                                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                                .descriptor_count(1024)
+                                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+                            vk::DescriptorSetLayoutBinding::default()
+                                .binding(2)
+                                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                                .descriptor_count(1)
+                                .stage_flags(vk::ShaderStageFlags::VERTEX),
+                        ])
+                        .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL),
+                    None,
+                )
+                .unwrap();
+
+            // Descriptor set layout for cull compute program.
+            let cull_set_layout = device
+                .create_descriptor_set_layout(
+                    &vk::DescriptorSetLayoutCreateInfo::default()
+                        .push_next(
+                            &mut vk::DescriptorSetLayoutBindingFlagsCreateInfo::default()
+                                .binding_flags(&[vk::DescriptorBindingFlags::PARTIALLY_BOUND
+                                    | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND]),
+                        )
+                        .bindings(&[vk::DescriptorSetLayoutBinding::default()
+                            .binding(0)
+                            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                            .descriptor_count(1)
+                            .stage_flags(vk::ShaderStageFlags::COMPUTE)])
+                        .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL),
+                    None,
+                )
+                .unwrap();
+
+            // Create rendering pipeline.
+            let (render_pipeline, render_pipeline_layout) = {
+                let pipeline_layout = device
+                    .create_pipeline_layout(
+                        &vk::PipelineLayoutCreateInfo::default().set_layouts(&[render_set_layout]),
+                        None,
+                    )
+                    .unwrap();
+
+                let vert_shader = create_shader_module(include_bytes!("shader.vert.spirv"));
+                let frag_shader = create_shader_module(include_bytes!("shader.frag.spirv"));
+
+                let pipeline = device
+                    .create_graphics_pipelines(
+                        vk::PipelineCache::null(),
+                        &[vk::GraphicsPipelineCreateInfo::default()
+                            .push_next(
+                                &mut vk::PipelineRenderingCreateInfo::default()
+                                    .color_attachment_formats(&[surface_format.format])
+                                    .depth_attachment_format(vk::Format::D32_SFLOAT),
+                            )
+                            .stages(&[
+                                vk::PipelineShaderStageCreateInfo::default()
+                                    .module(vert_shader)
+                                    .stage(vk::ShaderStageFlags::VERTEX)
+                                    .name(c"main"),
+                                vk::PipelineShaderStageCreateInfo::default()
+                                    .module(frag_shader)
+                                    .stage(vk::ShaderStageFlags::FRAGMENT)
+                                    .name(c"main"),
+                            ])
+                            .vertex_input_state(&vk::PipelineVertexInputStateCreateInfo::default())
+                            .input_assembly_state(
+                                &vk::PipelineInputAssemblyStateCreateInfo::default()
+                                    .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
+                                    .primitive_restart_enable(false),
+                            )
+                            .viewport_state(
+                                &vk::PipelineViewportStateCreateInfo::default()
+                                    .viewports(&[vk::Viewport {
+                                        x: 0.,
+                                        y: 0.,
+                                        width: viewport_w as f32,
+                                        height: viewport_h as f32,
+                                        min_depth: 0.0,
+                                        max_depth: 1.0,
+                                    }])
+                                    .scissors(&[vk::Rect2D {
+                                        offset: vk::Offset2D { x: 0, y: 0 },
+                                        extent: vk::Extent2D {
+                                            width: viewport_w,
+                                            height: viewport_h,
+                                        },
+                                    }]),
+                            )
+                            .rasterization_state(
+                                &vk::PipelineRasterizationStateCreateInfo::default()
+                                    .depth_clamp_enable(false)
+                                    .rasterizer_discard_enable(false)
+                                    .polygon_mode(vk::PolygonMode::FILL)
+                                    .line_width(1.0)
+                                    .cull_mode(vk::CullModeFlags::BACK)
+                                    .front_face(vk::FrontFace::CLOCKWISE)
+                                    .depth_bias_enable(false),
+                            )
+                            .multisample_state(
+                                &vk::PipelineMultisampleStateCreateInfo::default()
+                                    .sample_shading_enable(false)
+                                    .rasterization_samples(vk::SampleCountFlags::TYPE_1),
+                            )
+                            .color_blend_state(
+                                &vk::PipelineColorBlendStateCreateInfo::default()
+                                    .logic_op_enable(false)
+                                    .attachments(&[
+                                        vk::PipelineColorBlendAttachmentState::default()
+                                            .color_write_mask(vk::ColorComponentFlags::RGBA)
+                                            .blend_enable(false),
+                                    ]),
+                            )
+                            .depth_stencil_state(
+                                &vk::PipelineDepthStencilStateCreateInfo::default()
+                                    .depth_test_enable(true)
+                                    .depth_write_enable(true)
+                                    .depth_compare_op(vk::CompareOp::LESS),
+                            )
+                            .layout(pipeline_layout)],
+                        None,
+                    )
+                    .unwrap()
+                    .into_iter()
+                    .next()
+                    .unwrap();
+
+                device.destroy_shader_module(vert_shader, None);
+                device.destroy_shader_module(frag_shader, None);
+
+                (pipeline, pipeline_layout)
+            };
+
+            // Create cull compute pipeline.
+            let (cull_pipeline, cull_pipeline_layout) = {
+                let comp_shader = create_shader_module(include_bytes!("shader.comp.spirv"));
+
+                let pipeline_layout = device
+                    .create_pipeline_layout(
+                        &vk::PipelineLayoutCreateInfo::default().set_layouts(&[cull_set_layout]),
+                        None,
+                    )
+                    .unwrap();
+
+                let pipeline = device
+                    .create_compute_pipelines(
+                        vk::PipelineCache::default(),
+                        &[vk::ComputePipelineCreateInfo::default()
+                            .layout(pipeline_layout)
+                            .stage(
+                                vk::PipelineShaderStageCreateInfo::default()
+                                    .stage(vk::ShaderStageFlags::COMPUTE)
+                                    .name(c"main")
+                                    .module(comp_shader),
+                            )],
+                        None,
+                    )
+                    .unwrap()
+                    .into_iter()
+                    .next()
+                    .unwrap();
+
+                device.destroy_shader_module(comp_shader, None);
+
+                (pipeline, pipeline_layout)
+            };
+
+            // Generic command pool.
+            let command_pool = device
+                .create_command_pool(
+                    &vk::CommandPoolCreateInfo::default()
+                        .queue_family_index(queue_family_index)
+                        .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
+                    None,
+                )
+                .unwrap();
+
+            //
+            let [staging] = device
+                .allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default()
+                        .command_pool(command_pool)
+                        .level(vk::CommandBufferLevel::PRIMARY)
+                        .command_buffer_count(1),
+                )
+                .unwrap()[..];
+
+            // Create 3 sub command buffers for each swapchain image.
+            let scene_cmd_buffers = device
+                .allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default()
+                        .command_pool(command_pool)
+                        .level(vk::CommandBufferLevel::SECONDARY)
+                        .command_buffer_count(3),
+                )
+                .unwrap();
+
+            // Synchronization primitives for each frame.
+            let max_frames_in_flight = 2;
+            let image_available: Box<[vk::Semaphore]> = (0..max_frames_in_flight)
+                .map(|_| device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None))
+                .collect::<Result<_, _>>()
+                .unwrap();
+            let render_finished: Box<[vk::Semaphore]> = (0..max_frames_in_flight)
+                .map(|_| device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None))
+                .collect::<Result<_, _>>()
+                .unwrap();
+            let frame_in_flight: Box<[vk::Fence]> = (0..max_frames_in_flight)
+                .map(|_| {
+                    device.create_fence(
+                        &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+                        None,
+                    )
+                })
+                .collect::<Result<_, _>>()
+                .unwrap();
+
+            // Various buffers.
+            let mut staging_buffer = StagingBuffer::new(10000000, &renderer.allocator);
+
+            /*let index_count = bunny_meshlets
+                .iter()
+                .fold(0, |acc, meshlet| acc + meshlet.indices.len());
+            let index_buffer: Buffer<u32> = renderer.create_buffer(
+                index_count as u32,
+                vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+                vk_mem::MemoryUsage::AutoPreferDevice,
+            );*/
+
+            let object_buffer: Buffer<Object> = renderer.create_buffer(
+                3,
+                vk::BufferUsageFlags::STORAGE_BUFFER
+                    | vk::BufferUsageFlags::TRANSFER_DST
+                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                vk_mem::MemoryUsage::AutoPreferDevice,
+            );
+
+            let instance_buffer: Buffer<Instance> = renderer.create_buffer(
+                3 * bunny_meshlets.len() as u32,
+                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                vk_mem::MemoryUsage::AutoPreferDevice,
+            );
+
+            let meshlet_data_buffer: Buffer<MeshletData> = renderer.create_buffer(
+                3 * bunny_meshlets.len() as u32,
+                vk::BufferUsageFlags::STORAGE_BUFFER
+                    | vk::BufferUsageFlags::TRANSFER_DST
+                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                vk_mem::MemoryUsage::AutoPreferDevice,
+            );
+
+            let meshlet_cull_global_buffer: Buffer<MeshletCullGlobal> = renderer.create_buffer(
+                1,
+                vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+                vk_mem::MemoryUsage::AutoPreferDevice,
+            );
+
+            let indirect_cmd_buffer: Buffer<vk::DrawIndexedIndirectCommand> = renderer
+                .create_buffer(
+                    3 * bunny_meshlets.len() as u32,
+                    vk::BufferUsageFlags::STORAGE_BUFFER
+                        | vk::BufferUsageFlags::INDIRECT_BUFFER
+                        | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                    vk_mem::MemoryUsage::AutoPreferDevice,
+                );
+
+            let comp_buffer: Buffer<u32> = renderer.create_buffer(
+                1,
+                vk::BufferUsageFlags::STORAGE_BUFFER
+                    | vk::BufferUsageFlags::INDIRECT_BUFFER
+                    | vk::BufferUsageFlags::TRANSFER_DST
+                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                vk_mem::MemoryUsage::AutoPreferDevice,
+            );
+
+            let vertex_count = bunny_meshlets
+                .iter()
+                .fold(0, |acc, meshlet| acc + meshlet.positions.len() / 3);
+            let vertex_buffer: Buffer<Vertex> = renderer.create_buffer(
+                vertex_count as u32,
+                vk::BufferUsageFlags::VERTEX_BUFFER
+                    | vk::BufferUsageFlags::TRANSFER_DST
+                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                vk_mem::MemoryUsage::AutoPreferDevice,
+            );
+
+            let global_buffer: Buffer<MeshletRenderGlobal> = renderer.create_buffer(
+                1,
+                vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+                vk_mem::MemoryUsage::AutoPreferDevice,
+            );*/
 
             Self {
                 entry,

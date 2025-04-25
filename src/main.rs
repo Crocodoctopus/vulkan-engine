@@ -160,6 +160,7 @@ fn main() {
             .collect()
     };*/
 
+    // Temp bunny.
     let bunny_meshlets: Box<[Meshlet]> = {
         let model = {
             let data = include_bytes!("../resources/models/bunny.obj");
@@ -235,20 +236,8 @@ fn main() {
     let mut renderer = Renderer::new(viewport_w, viewport_h, &window);
 
     unsafe {
-        let create_shader_module = |src: &[u8]| {
-            let shader_module_cinfo = vk::ShaderModuleCreateInfo {
-                p_code: src.as_ptr() as _,
-                code_size: src.len(),
-                ..Default::default()
-            };
-            renderer
-                .device
-                .create_shader_module(&shader_module_cinfo, None)
-                .unwrap()
-        };
-
-        // Global descriptor set.
-        let global_set_layout = renderer
+        // Desciptor set layout for the rendering program.
+        let render_set_layout = renderer
             .device
             .create_descriptor_set_layout(
                 &vk::DescriptorSetLayoutCreateInfo::default()
@@ -285,11 +274,47 @@ fn main() {
             )
             .unwrap();
 
-        let (pipeline, pipeline_layout) = {
+        // Descriptor set layout for cull compute program.
+        let cull_set_layout = renderer
+            .device
+            .create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default()
+                    .push_next(
+                        &mut vk::DescriptorSetLayoutBindingFlagsCreateInfo::default()
+                            .binding_flags(&[vk::DescriptorBindingFlags::PARTIALLY_BOUND
+                                | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND]),
+                    )
+                    .bindings(&[vk::DescriptorSetLayoutBinding::default()
+                        .binding(0)
+                        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                        .descriptor_count(1)
+                        .stage_flags(vk::ShaderStageFlags::COMPUTE)])
+                    .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL),
+                None,
+            )
+            .unwrap();
+
+        // Shader creation util function.
+        let create_shader_module = |src: &[u8]| {
+            renderer
+                .device
+                .create_shader_module(
+                    &vk::ShaderModuleCreateInfo {
+                        p_code: src.as_ptr() as _,
+                        code_size: src.len(),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .unwrap()
+        };
+
+        // Create rendering pipeline.
+        let (render_pipeline, render_pipeline_layout) = {
             let pipeline_layout = renderer
                 .device
                 .create_pipeline_layout(
-                    &vk::PipelineLayoutCreateInfo::default().set_layouts(&[global_set_layout]),
+                    &vk::PipelineLayoutCreateInfo::default().set_layouts(&[render_set_layout]),
                     None,
                 )
                 .unwrap();
@@ -383,33 +408,14 @@ fn main() {
             (pipeline, pipeline_layout)
         };
 
-        //
-        let comp_set_layout = renderer
-            .device
-            .create_descriptor_set_layout(
-                &vk::DescriptorSetLayoutCreateInfo::default()
-                    .push_next(
-                        &mut vk::DescriptorSetLayoutBindingFlagsCreateInfo::default()
-                            .binding_flags(&[vk::DescriptorBindingFlags::PARTIALLY_BOUND
-                                | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND]),
-                    )
-                    .bindings(&[vk::DescriptorSetLayoutBinding::default()
-                        .binding(0)
-                        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                        .descriptor_count(1)
-                        .stage_flags(vk::ShaderStageFlags::COMPUTE)])
-                    .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL),
-                None,
-            )
-            .unwrap();
-
-        let (comp_pipeline, comp_pipeline_layout) = {
+        // Create cull compute pipeline.
+        let (cull_pipeline, cull_pipeline_layout) = {
             let comp_shader = create_shader_module(include_bytes!("shader.comp.spirv"));
 
             let pipeline_layout = renderer
                 .device
                 .create_pipeline_layout(
-                    &vk::PipelineLayoutCreateInfo::default().set_layouts(&[comp_set_layout]),
+                    &vk::PipelineLayoutCreateInfo::default().set_layouts(&[cull_set_layout]),
                     None,
                 )
                 .unwrap();
@@ -438,6 +444,7 @@ fn main() {
             (pipeline, pipeline_layout)
         };
 
+        // Generic command pool.
         let command_pool = renderer
             .device
             .create_command_pool(
@@ -479,7 +486,8 @@ fn main() {
         drop(secondary_cmd_buffers);
 
         // Synchronization primitives for each frame.
-        let image_available: Box<[vk::Semaphore]> = (0..3)
+        let max_frames_in_flight = 2;
+        let image_available: Box<[vk::Semaphore]> = (0..max_frames_in_flight)
             .map(|_| {
                 renderer
                     .device
@@ -487,7 +495,7 @@ fn main() {
             })
             .collect::<Result<_, _>>()
             .unwrap();
-        let render_finished: Box<[vk::Semaphore]> = (0..3)
+        let render_finished: Box<[vk::Semaphore]> = (0..max_frames_in_flight)
             .map(|_| {
                 renderer
                     .device
@@ -495,7 +503,7 @@ fn main() {
             })
             .collect::<Result<_, _>>()
             .unwrap();
-        let frame_in_flight: Box<[vk::Fence]> = (0..3)
+        let frame_in_flight: Box<[vk::Fence]> = (0..max_frames_in_flight)
             .map(|_| {
                 renderer.device.create_fence(
                     &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
@@ -762,13 +770,13 @@ fn main() {
             )
             .unwrap();
 
-        let (global_set, comp_set) = {
+        let (render_set, cull_set) = {
             let sets = renderer
                 .device
                 .allocate_descriptor_sets(
                     &vk::DescriptorSetAllocateInfo::default()
                         .descriptor_pool(descriptor_pool)
-                        .set_layouts(&[global_set_layout, comp_set_layout]),
+                        .set_layouts(&[render_set_layout, cull_set_layout]),
                 )
                 .unwrap();
             (sets[0], sets[1])
@@ -777,7 +785,7 @@ fn main() {
         renderer.device.update_descriptor_sets(
             &[
                 vk::WriteDescriptorSet::default()
-                    .dst_set(comp_set)
+                    .dst_set(cull_set)
                     .dst_binding(0)
                     .dst_array_element(0)
                     .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
@@ -788,7 +796,7 @@ fn main() {
                         .range(vk::WHOLE_SIZE)]),
                 //
                 vk::WriteDescriptorSet::default()
-                    .dst_set(global_set)
+                    .dst_set(render_set)
                     .dst_binding(0)
                     .dst_array_element(0)
                     .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
@@ -808,7 +816,7 @@ fn main() {
                     .image_view(viking_room_view)
                     .sampler(viking_room_sampler)]),*/
                 vk::WriteDescriptorSet::default()
-                    .dst_set(global_set)
+                    .dst_set(render_set)
                     .dst_binding(2)
                     .dst_array_element(0)
                     .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
@@ -824,7 +832,7 @@ fn main() {
         println!("{}", instances);
 
         // Pre-record scene command buffers.
-        for i in 0..3 {
+        for i in 0..renderer.swapchain_images.len() {
             let command_buffer = scene_command_buffers[i];
             let image = renderer.swapchain_images[i];
             let color_view = renderer.swapchain_color_views[i];
@@ -845,16 +853,16 @@ fn main() {
                 renderer.device.cmd_bind_descriptor_sets(
                     command_buffer,
                     vk::PipelineBindPoint::COMPUTE,
-                    comp_pipeline_layout,
+                    cull_pipeline_layout,
                     0,
-                    &[comp_set],
+                    &[cull_set],
                     &[],
                 );
 
                 renderer.device.cmd_bind_pipeline(
                     command_buffer,
                     vk::PipelineBindPoint::COMPUTE,
-                    comp_pipeline,
+                    cull_pipeline,
                 );
 
                 renderer
@@ -941,16 +949,16 @@ fn main() {
                 renderer.device.cmd_bind_descriptor_sets(
                     command_buffer,
                     vk::PipelineBindPoint::GRAPHICS,
-                    pipeline_layout,
+                    render_pipeline_layout,
                     0,
-                    &[global_set],
+                    &[render_set],
                     &[],
                 );
 
                 renderer.device.cmd_bind_pipeline(
                     command_buffer,
                     vk::PipelineBindPoint::GRAPHICS,
-                    pipeline,
+                    render_pipeline,
                 );
 
                 renderer.device.cmd_bind_index_buffer(
@@ -1031,7 +1039,7 @@ fn main() {
         let mut d_down = false;
         let mut q_down = false;
         let mut e_down = false;
-        for frame in (0..3).cycle() {
+        for frame in (0..max_frames_in_flight).cycle() {
             // Input.
             let mut exit = false;
             use winit::platform::pump_events::EventLoopExtPumpEvents;
@@ -1225,7 +1233,7 @@ fn main() {
                         0,
                         [MeshletCullGlobal {
                             view: view.to_cols_array(),
-                            camera_position: [-cam_x, cam_y, -cam_z],
+                            camera_position: [cam_x, cam_y, cam_z],
                             instances,
                             frustum,
                             draw_count_buffer: renderer.device.get_buffer_device_address(
