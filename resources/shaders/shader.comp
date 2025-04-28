@@ -98,13 +98,6 @@ void main() {
     bool visible_z = true;//center.z + radius > znear && center.z - radius < zfar;
     if (!(visible_x && visible_y && visible_z)) return;
     
-    /*
-    vec4 center = object.model * vec4(meshlet.center, 1.0);
-    float d0 = min(dot(center, frustum_left), dot(center, frustum_right));
-    float d1 = min(dot(center, frustum_bottom), dot(center, frustum_top));
-    //float d2 = min(dot(center, frustum_near), dot(center, frustum_far));
-    if (min(d0, d1) + meshlet.radius < 0) return;
-    */
         
     // Backface cull.
 	vec3 cone_apex = (object.model * vec4(
@@ -116,14 +109,7 @@ void main() {
 	float cone_cutoff = meshlet.cone_cutoff;
 	
     //if (dot(normalize(cone_apex - camera_position), cone_axis) >= cone_cutoff) return;
-//	bool bConeCulled = dot(normalize(coneApex - cameraPosition), center) >= coneCutoff;
-///   `dot(normalize(cone_apex - camera_position), cone_axis) >= cone_cutoff`
-		
-
-    
-    //vec4 axis = object.model * vec4(meshlet.cone_axis, 0.0);
-    //vec4 apex = object.model * vec4(meshlet.cone_apex, 1.0);
-    //if (gl_GlobalInvocationID.x % 2 == 0) return;
+    // `dot(normalize(cone_apex - camera_position), cone_axis) >= cone_cutoff`
 
     // Append draw command.
     const uint i = atomicAdd(draw_count_buffer.counter, 1);
@@ -134,3 +120,12 @@ void main() {
     draw_cmd_buffer.data[i].first_instance = 0;
     instance_buffer.data[i].object_id = meshlet.object_id;
 }
+
+
+    /*
+    vec4 center = object.model * vec4(meshlet.center, 1.0);
+    float d0 = min(dot(center, frustum_left), dot(center, frustum_right));
+    float d1 = min(dot(center, frustum_bottom), dot(center, frustum_top));
+    //float d2 = min(dot(center, frustum_near), dot(center, frustum_far));
+    if (min(d0, d1) + meshlet.radius < 0) return;
+    */

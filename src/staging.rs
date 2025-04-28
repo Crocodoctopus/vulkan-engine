@@ -1,10 +1,13 @@
 use ash::vk;
 use std::borrow::Borrow;
 
+use crate::Buffer;
+
 pub struct StagingBuffer {
     buffer: vk::Buffer,
     alloc: vk_mem::Allocation,
-    map: *mut u8,
+    base: *mut u8, // Base.
+    head: *mut u8,
 }
 
 impl StagingBuffer {
@@ -29,26 +32,47 @@ impl StagingBuffer {
 
         let map = allocator.map_memory(&mut alloc).unwrap();
 
-        Self { buffer, alloc, map }
-    }
-
-    pub unsafe fn begin_transfer<'a>(
-        &'a mut self,
-        device: &'a ash::Device,
-        command_buffer: vk::CommandBuffer,
-    ) -> Staging<'a> {
-        Staging {
-            device,
-            ptr: self.map,
-            command_buffer,
-            buffer: self,
+        Self {
+            buffer,
+            alloc,
+            base: map,
+            head: map,
         }
     }
 
-    pub unsafe fn destroy(mut self, alloc: &vk_mem::Allocator) {
-        alloc.unmap_memory(&mut self.alloc);
-        alloc.destroy_buffer(self.buffer, &mut self.alloc);
-        std::mem::forget(self)
+    pub unsafe fn reset(&mut self) {
+        self.head = self.base;
+    }
+
+    pub unsafe fn stage_buffer<T: Clone>(
+        &mut self,
+        device: &ash::Device,
+        cmd_buffer: vk::CommandBuffer,
+        dst: &Buffer<T>,
+        offset: u64,
+        data: impl IntoIterator<Item = impl Borrow<T>>,
+    ) {
+        // Correct alignment.
+        let alignment = std::mem::align_of::<T>();
+        self.head = (self.head as usize / alignment * alignment + alignment) as *mut u8;
+
+        // Push data to staging buffer.
+        let start = self.head;
+        for t in data {
+            *(self.head as *mut T) = t.borrow().clone();
+            self.head = self.head.wrapping_add(std::mem::size_of::<T>());
+        }
+
+        // Record transfer from staging to dst.
+        device.cmd_copy_buffer(
+            cmd_buffer,
+            self.buffer,
+            dst.vk_handle(),
+            &[vk::BufferCopy::default()
+                .src_offset(start.byte_offset_from(self.base) as u64)
+                .dst_offset(offset)
+                .size((self.head).byte_offset_from(start) as u64)],
+        );
     }
 }
 
@@ -69,13 +93,14 @@ pub struct Staging<'a> {
     buffer: &'a mut StagingBuffer,
 }
 
+/*
 impl Staging<'_> {
     pub unsafe fn stage_buffer<T: Clone>(
-        mut self,
+        &mut self,
         dst: vk::Buffer,
         offset: u64,
         data: impl IntoIterator<Item = impl Borrow<T>>,
-    ) -> Self {
+    ) {
         // Correct alignment.
         let alignment = std::mem::align_of::<T>();
         self.ptr = (self.ptr as usize / alignment * alignment + alignment) as *mut u8;
@@ -97,17 +122,15 @@ impl Staging<'_> {
                 .dst_offset(offset)
                 .size((self.ptr).byte_offset_from(start) as u64)],
         );
-
-        self
     }
 
     pub unsafe fn stage_image(
-        mut self,
+        &mut self,
         image: vk::Image,
         width: u32,
         height: u32,
         data: impl IntoIterator<Item = u8>,
-    ) -> Self {
+    ) {
         let start = self.ptr;
         for t in data {
             *self.ptr = t;
@@ -185,9 +208,6 @@ impl Staging<'_> {
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
                 .dst_access_mask(vk::AccessFlags::SHADER_READ)],
         );
-
-        self
     }
-
-    pub unsafe fn finish(self) {}
 }
+*/

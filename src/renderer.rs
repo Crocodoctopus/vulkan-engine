@@ -1,12 +1,17 @@
 //use crate::util::Map2;
-use ash::vk::{Extent2D, ImageUsageFlags};
+use ash::vk::{Extent2D, Handle, ImageUsageFlags};
 use ash::{khr, vk};
 use glam::*;
+use itertools::Itertools;
+use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::path::Path;
+use std::path::PathBuf;
 use vk_mem::Alloc;
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+
+use crate::staging::{Staging, StagingBuffer};
 
 #[repr(C, align(16))]
 #[derive(Copy, Clone, Debug)]
@@ -33,20 +38,20 @@ struct MeshletCullGlobal {
     object_buffer: vk::DeviceAddress,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 #[repr(C, align(16))]
 struct Object {
     model: Mat4,
     texture_id: u32,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 #[repr(C, align(16))]
 struct Instance {
     object_id: u32,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 #[repr(C, align(16))]
 struct MeshletData {
     // Culling.
@@ -74,22 +79,50 @@ struct Vertex {
 }
 
 #[derive(Debug)]
-pub struct Shader(vk::ShaderModule);
-
-impl Drop for Shader {
-    fn drop(&mut self) {
-        panic!("This type must be dropped via Renderer::delete_buffer!");
-    }
-}
-
-#[derive(Debug)]
 pub struct Buffer<T> {
     phantom: std::marker::PhantomData<T>,
     buffer: vk::Buffer,
+    alloc: Option<vk_mem::Allocation>,
     len: u32,
 }
 
+pub fn create_buffer<T>(
+    allocator: &vk_mem::Allocator,
+    len: u32,
+    vk_usage: vk::BufferUsageFlags,
+    vma_usage: vk_mem::MemoryUsage,
+) -> Buffer<T> {
+    unsafe {
+        let (buffer, alloc) = allocator
+            .create_buffer(
+                &vk::BufferCreateInfo::default()
+                    .size(len as u64 * size_of::<T>() as u64)
+                    .usage(vk_usage),
+                &vk_mem::AllocationCreateInfo {
+                    usage: vma_usage,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        Buffer {
+            phantom: std::marker::PhantomData,
+            buffer,
+            alloc: Some(alloc),
+            len,
+        }
+    }
+}
+
 impl<T> Buffer<T> {
+    pub fn null() -> Self {
+        Self {
+            phantom: std::marker::PhantomData,
+            buffer: vk::Buffer::null(),
+            alloc: None,
+            len: 0,
+        }
+    }
     pub fn len(&self) -> u32 {
         self.len
     }
@@ -107,21 +140,15 @@ impl<T> Buffer<T> {
     }
 }
 
-impl<T> Drop for Buffer<T> {
-    fn drop(&mut self) {
-        panic!("This type must be dropped via Renderer::delete_buffer!");
-    }
-}
-
-struct Meshlet {
-    center: [f32; 3],
-    radius: f32,
-    cone_apex: [f32; 3],
-    cone_axis: [f32; 3],
-    cone_cutoff: f32,
-    indices: Box<[u8]>,
-    positions: Box<[f32]>,
-    texcoords: Box<[f32]>,
+pub struct Meshlet {
+    pub center: [f32; 3],
+    pub radius: f32,
+    pub cone_apex: [f32; 3],
+    pub cone_axis: [f32; 3],
+    pub cone_cutoff: f32,
+    pub indices: Box<[u8]>,
+    pub positions: Box<[f32]>,
+    pub texcoords: Box<[f32]>,
 }
 
 struct ObjectInstance {
@@ -132,16 +159,18 @@ struct ObjectInstance {
 }
 
 #[derive(Copy, Clone, Hash, Eq, PartialEq)]
-struct MeshHandle(u32);
+pub struct MeshHandle(u32);
 #[derive(Copy, Clone, Hash, Eq, PartialEq)]
-struct ObjectHandle(u32);
+pub struct ObjectHandle(u32);
+
+#[derive(Copy, Clone)]
+struct FrameSyncPrimitives {
+    image_available: vk::Semaphore,
+    render_finished: vk::Semaphore,
+    frame_in_flight: vk::Fence,
+}
 
 pub struct Renderer {
-    // Generic resource containers.
-    //pub resource_counter: u32,
-    //pub meshes: HashMap<MeshHandle, Box<[Meshlet]>>,
-    //pub objects: HashMap<ObjectHandle, ObjectInstance>,
-
     // Various Vulkan state data.
     pub entry: ash::Entry,
     pub instance: ash::Instance,
@@ -151,6 +180,7 @@ pub struct Renderer {
     pub surface: vk::SurfaceKHR,
     pub surface_format: vk::SurfaceFormatKHR,
     pub surface_capabilities: vk::SurfaceCapabilitiesKHR,
+    pub surface_extent: vk::Extent2D,
 
     pub device: ash::Device,
     pub queue_family_index: u32,
@@ -169,14 +199,731 @@ pub struct Renderer {
     pub swapchain_color_views: Box<[vk::ImageView]>,
     pub swapchain_depth_views: Box<[vk::ImageView]>,
 
-    //pub pipeline_layouts: Map2<u16, vk::PipelineLayout>,
-    //pub pipelines: Map2<u16, vk::Pipeline>,
-    //pub buffers: Map2<u16, vk::Buffer>,
-    buffer_allocs: HashMap<vk::Buffer, vk_mem::Allocation>,
+    // Synchronization primitives.
+    frame_sync_primitives: Box<[FrameSyncPrimitives]>,
+
+    // Command.
+    cmd_pool: vk::CommandPool,
+    render_cmd_buffers: Box<[vk::CommandBuffer]>,
+    scene_cmd_buffers: Box<[vk::CommandBuffer]>,
+
+    // Desciptor sets.
+    render_set_layout: vk::DescriptorSetLayout,
+    render_set: vk::DescriptorSet,
+    cull_set_layout: vk::DescriptorSetLayout,
+    cull_set: vk::DescriptorSet,
+
+    // Pipelines.
+    render_pipeline_layout: vk::PipelineLayout,
+    render_pipeline: vk::Pipeline,
+    cull_pipeline_layout: vk::PipelineLayout,
+    cull_pipeline: vk::Pipeline,
+
+    // Generic resource containers.
+    cwd: PathBuf,
+    resource_counter: u32,
+    meshes: HashMap<MeshHandle, Box<[Meshlet]>>,
+    objects: HashMap<ObjectHandle, ObjectInstance>,
+
+    // Buffers.
+    staging_buffer: StagingBuffer,
+
+    index_buffer: Buffer<u32>,
+    vertex_buffer: Buffer<Vertex>,
+    object_buffer: Buffer<Object>,
+    instance_buffer: Buffer<Instance>,
+    meshlet_data_buffer: Buffer<MeshletData>,
+    indirect_cmd_buffer: Buffer<vk::DrawIndexedIndirectCommand>,
+
+    indirect_count_buffer: Buffer<u32>,
+    meshlet_cull_global_buffer: Buffer<MeshletCullGlobal>,
+    meshlet_render_global_buffer: Buffer<MeshletRenderGlobal>,
+
+    // Various render state data.
+    frame: usize,
+    pub cam_pos: Vec3,
+    pub cam_rot: Vec2, // YX
+                       //last_timestamp: f32,
 }
 
 impl Renderer {
-    /*pub fn create_object(
+    pub fn render(&mut self, timestamp: f32) {
+        unsafe {
+            // A dirty hack. When a rebuild occurs, wait for transfer to fully complete.
+            if self.frame == 0 {
+                // Sync primitives associated with this frame.
+                let FrameSyncPrimitives {
+                    frame_in_flight, ..
+                } = self.frame_sync_primitives[0];
+
+                // Command buffer associated with this frame.
+                let command_buffer = self.render_cmd_buffers[0];
+
+                // Rebuild scene elements.
+                let (indices, vertices, meshlet_data) = self.rebuild_scene();
+
+                // Use current command buffer.
+                self.device
+                    .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
+                    .unwrap();
+                self.device
+                    .begin_command_buffer(command_buffer, &vk::CommandBufferBeginInfo::default())
+                    .unwrap();
+
+                // Push data.
+                self.staging_buffer.reset();
+                self.staging_buffer.stage_buffer(
+                    &self.device,
+                    command_buffer,
+                    &self.index_buffer,
+                    0,
+                    indices,
+                );
+                self.staging_buffer.stage_buffer(
+                    &self.device,
+                    command_buffer,
+                    &self.vertex_buffer,
+                    0,
+                    vertices,
+                );
+                self.staging_buffer.stage_buffer(
+                    &self.device,
+                    command_buffer,
+                    &self.meshlet_data_buffer,
+                    0,
+                    meshlet_data,
+                );
+
+                // Execute command buffer.
+                self.device.end_command_buffer(command_buffer).unwrap();
+                self.device.reset_fences(&[frame_in_flight]).unwrap();
+                self.device
+                    .queue_submit(
+                        self.graphics_queue,
+                        &[vk::SubmitInfo::default().command_buffers(&[command_buffer])],
+                        frame_in_flight,
+                    )
+                    .unwrap();
+
+                // Wait.
+                self.device
+                    .wait_for_fences(&[frame_in_flight], true, u64::MAX)
+                    .unwrap();
+            }
+        }
+
+        let frame = self.frame % self.frame_sync_primitives.len();
+        self.frame += 1;
+
+        // Sync primitives associated with this frame.
+        let FrameSyncPrimitives {
+            image_available,
+            render_finished,
+            frame_in_flight,
+        } = self.frame_sync_primitives[frame];
+
+        // Command buffer associated with this frame.
+        let command_buffer = self.render_cmd_buffers[frame];
+
+        unsafe {
+            // Wait for next image to become available.
+            self.device
+                .wait_for_fences(&[frame_in_flight], true, u64::MAX)
+                .unwrap();
+            self.device.reset_fences(&[frame_in_flight]).unwrap();
+
+            let (image_index, _) = self
+                .swapchain_device
+                .acquire_next_image(self.swapchain, u64::MAX, image_available, vk::Fence::null())
+                .unwrap();
+            let scene_command_buffer = self.scene_cmd_buffers[image_index as usize];
+
+            // Reset and record.
+            self.device
+                .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
+                .unwrap();
+            self.device
+                .begin_command_buffer(command_buffer, &vk::CommandBufferBeginInfo::default())
+                .unwrap();
+
+            // Transfer some global state data.
+            {
+                /*let model0 = Mat4::IDENTITY;
+                let model1 = model0;
+                let model2 = model1;
+                let mult = model0;*/
+                /*let model0 = Mat4::from_translation(Vec3::new(0., 0.8, 0.));
+                let model1 = Mat4::from_translation(Vec3::new(1., 0.8, 0.));
+                let model2 = Mat4::from_translation(Vec3::new(2., 0.8, 0.));
+                let mult = Mat4::from_scale(Vec3::splat(2.0))
+                    * Mat4::from_rotation_y(time * std::f32::consts::FRAC_PI_2)
+                    * Mat4::from_rotation_x(std::f32::consts::PI);
+                let object_data = [
+                    Object {
+                        model: model0 * mult,
+                        texture_id: 0,
+                    },
+                    Object {
+                        model: model1 * mult,
+                        texture_id: 0,
+                    },
+                    Object {
+                        model: model2 * mult,
+                        texture_id: 0,
+                    },
+                ];*/
+                let object_data = self.objects.values().map(|obj| Object {
+                    model: Mat4::from_translation(obj.position)
+                        * Mat4::from_scale(obj.scale)
+                        * Mat4::from_quat(obj.orientation),
+                    texture_id: 0,
+                });
+
+                // Upload global descriptor data & object data.
+                let projection = Mat4::perspective_infinite_rh(
+                    std::f32::consts::FRAC_PI_4,
+                    self.surface_extent.width as f32 / self.surface_extent.height as f32,
+                    0.1,
+                    //2.0,
+                );
+                let view = Mat4::from_rotation_translation(
+                    Quat::from_euler(
+                        EulerRot::XYZ,
+                        -std::f32::consts::FRAC_PI_8,
+                        self.cam_rot[0],
+                        0.,
+                    ),
+                    Vec3::new(0., 0., 0.),
+                ) * Mat4::from_translation(Vec3::new(
+                    self.cam_pos[0],
+                    self.cam_pos[1],
+                    self.cam_pos[2],
+                ));
+
+                // Frustum plane data.
+                let normalize_plane = |p: Vec4| p / p.xyz().length();
+                let temp = projection.transpose();
+                let frustum_x = normalize_plane(temp.w_axis + temp.x_axis);
+                let frustum_y = normalize_plane(temp.w_axis + temp.y_axis);
+                let frustum = [frustum_x.x, frustum_x.z, frustum_y.y, frustum_y.z];
+
+                // Upload data.
+                {
+                    self.staging_buffer.reset();
+
+                    self.staging_buffer.stage_buffer(
+                        &self.device,
+                        command_buffer,
+                        &self.object_buffer,
+                        0,
+                        object_data,
+                    );
+
+                    self.staging_buffer.stage_buffer(
+                        &self.device,
+                        command_buffer,
+                        &self.meshlet_render_global_buffer,
+                        0,
+                        [MeshletRenderGlobal {
+                            pv: projection * view,
+                            vertex_buffer: self.device.get_buffer_device_address(
+                                &vk::BufferDeviceAddressInfo::default()
+                                    .buffer(self.vertex_buffer.vk_handle()),
+                            ),
+                            instance_buffer: self.device.get_buffer_device_address(
+                                &vk::BufferDeviceAddressInfo::default()
+                                    .buffer(self.instance_buffer.vk_handle()),
+                            ),
+                            object_buffer: self.device.get_buffer_device_address(
+                                &vk::BufferDeviceAddressInfo::default()
+                                    .buffer(self.object_buffer.vk_handle()),
+                            ),
+                        }],
+                    );
+                    self.staging_buffer.stage_buffer(
+                        &self.device,
+                        command_buffer,
+                        &self.indirect_count_buffer,
+                        0,
+                        [0u32],
+                    );
+                    self.staging_buffer.stage_buffer(
+                        &self.device,
+                        command_buffer,
+                        &self.meshlet_cull_global_buffer,
+                        0,
+                        [MeshletCullGlobal {
+                            view: view.to_cols_array(),
+                            camera_position: self.cam_pos.to_array(),
+                            instances: self.indirect_cmd_buffer.len,
+                            frustum,
+                            draw_count_buffer: self.device.get_buffer_device_address(
+                                &vk::BufferDeviceAddressInfo::default()
+                                    .buffer(self.indirect_count_buffer.vk_handle()),
+                            ),
+                            meshlet_buffer: self.device.get_buffer_device_address(
+                                &vk::BufferDeviceAddressInfo::default()
+                                    .buffer(self.meshlet_data_buffer.vk_handle()),
+                            ),
+                            draw_cmd_buffer: self.device.get_buffer_device_address(
+                                &vk::BufferDeviceAddressInfo::default()
+                                    .buffer(self.indirect_cmd_buffer.vk_handle()),
+                            ),
+                            instance_buffer: self.device.get_buffer_device_address(
+                                &vk::BufferDeviceAddressInfo::default()
+                                    .buffer(self.instance_buffer.vk_handle()),
+                            ),
+                            object_buffer: self.device.get_buffer_device_address(
+                                &vk::BufferDeviceAddressInfo::default()
+                                    .buffer(self.object_buffer.vk_handle()),
+                            ),
+                        }],
+                    );
+                }
+            }
+
+            self.device
+                .cmd_execute_commands(command_buffer, &[scene_command_buffer]);
+
+            self.device.end_command_buffer(command_buffer).unwrap();
+
+            // Execute command buffer.
+            self.device
+                .queue_submit(
+                    self.graphics_queue,
+                    &[vk::SubmitInfo::default()
+                        .wait_semaphores(&[image_available])
+                        .signal_semaphores(&[render_finished])
+                        .wait_dst_stage_mask(&[vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT])
+                        .command_buffers(&[command_buffer])],
+                    frame_in_flight,
+                )
+                .unwrap();
+
+            // Swap backbuffer.
+            self.swapchain_device
+                .queue_present(
+                    self.present_queue,
+                    &vk::PresentInfoKHR::default()
+                        .wait_semaphores(&[render_finished])
+                        .swapchains(&[self.swapchain])
+                        .image_indices(&[image_index]),
+                )
+                .unwrap();
+        }
+    }
+
+    fn rebuild_scene(&mut self) -> (Vec<u32>, Vec<Vertex>, Vec<MeshletData>) {
+        // Create a single gigabuffer.
+        let mut vertices = vec![];
+        let mut indices = vec![];
+        let mut offset_map = HashMap::<MeshHandle, u32>::new();
+        for (id, mesh) in self.meshes.iter() {
+            // Push the base index offset for this mesh.
+            offset_map.insert(*id, indices.len() as u32);
+
+            // Extend index and vertex buffers.
+            for meshlet in mesh {
+                let offset = vertices.len();
+                indices.extend(
+                    meshlet
+                        .indices
+                        .iter()
+                        .map(|&index| index as u32 + offset as u32),
+                );
+
+                vertices.extend((0..meshlet.positions.len() / 3).map(|i| Vertex {
+                    position: Vec3::new(
+                        meshlet.positions[3 * i],
+                        meshlet.positions[3 * i + 1],
+                        meshlet.positions[3 * i + 2],
+                    ),
+                    u: 0., //meshlet.texcoords[2 * i],
+                    normal: Vec3::splat(0.0),
+                    /*normals: Vec3::new(
+                        meshlet.normals[3 * i],
+                        meshlet.normals[3 * i + 1],
+                        meshlet.normals[3 * i + 2],
+                    )*/
+                    v: 0., //meshlet.texcoords[2 * i + 1],
+                    color: Vec4::splat(1.0),
+                }));
+            }
+        }
+
+        let mut meshlet_data = vec![];
+        for (i, object) in self.objects.values().enumerate() {
+            // Get associated mesh and index offset.
+            let mesh = self.meshes.get(&object.mesh).unwrap();
+            let mut first_index = *offset_map.get(&object.mesh).unwrap();
+
+            // Generate meshlet data.
+            for meshlet in mesh {
+                meshlet_data.push(MeshletData {
+                    center: meshlet.center,
+                    radius: meshlet.radius,
+                    cone_apex: meshlet.cone_apex,
+                    pad0: 0.,
+                    cone_axis: meshlet.cone_axis,
+                    cone_cutoff: meshlet.cone_cutoff,
+                    object_id: i as u32,
+                    index_count: meshlet.indices.len() as u32,
+                    first_index,
+                });
+                first_index += meshlet.indices.len() as u32;
+            }
+        }
+        let instances = meshlet_data.len() as u32;
+
+        println!(
+            "Rebuilding scene with: {} object(s), {} mesh(es), {} meshlet(s), {} indices, {} vertices.",
+            self.objects.len(),
+            self.meshes.len(),
+            meshlet_data.len(),
+            indices.len(),
+            vertices.len(),
+        );
+
+        // Recreate buffers.
+        let object_buffer: Buffer<Object> = create_buffer(
+            &self.allocator,
+            self.objects.len() as u32,
+            vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::TRANSFER_DST
+                | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+            vk_mem::MemoryUsage::AutoPreferDevice,
+        );
+
+        let instance_buffer: Buffer<Instance> = create_buffer(
+            &self.allocator,
+            instances,
+            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+            vk_mem::MemoryUsage::AutoPreferDevice,
+        );
+
+        let meshlet_data_buffer: Buffer<MeshletData> = create_buffer(
+            &self.allocator,
+            instances,
+            vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::TRANSFER_DST
+                | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+            vk_mem::MemoryUsage::AutoPreferDevice,
+        );
+
+        let indirect_cmd_buffer: Buffer<vk::DrawIndexedIndirectCommand> = create_buffer(
+            &self.allocator,
+            instances,
+            vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::INDIRECT_BUFFER
+                | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+            vk_mem::MemoryUsage::AutoPreferDevice,
+        );
+
+        let index_buffer: Buffer<u32> = create_buffer(
+            &self.allocator,
+            indices.len() as u32,
+            vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            vk_mem::MemoryUsage::AutoPreferDevice,
+        );
+
+        let vertex_buffer: Buffer<Vertex> = create_buffer(
+            &self.allocator,
+            vertices.len() as u32,
+            vk::BufferUsageFlags::VERTEX_BUFFER
+                | vk::BufferUsageFlags::TRANSFER_DST
+                | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+            vk_mem::MemoryUsage::AutoPreferDevice,
+        );
+
+        // Wait for all frames to be completed before proceeding.
+        unsafe {
+            self.device
+                .wait_for_fences(
+                    &self
+                        .frame_sync_primitives
+                        .iter()
+                        .map(|p| p.frame_in_flight)
+                        .collect::<Vec<_>>(),
+                    true,
+                    u64::MAX,
+                )
+                .unwrap();
+        }
+
+        // Swap buffers.
+        unsafe {
+            let temp = std::mem::replace(&mut self.object_buffer, object_buffer);
+            if let Some(mut alloc) = temp.alloc {
+                self.allocator.destroy_buffer(temp.buffer, &mut alloc);
+            }
+            let temp = std::mem::replace(&mut self.instance_buffer, instance_buffer);
+            if let Some(mut alloc) = temp.alloc {
+                self.allocator.destroy_buffer(temp.buffer, &mut alloc);
+            }
+            let temp = std::mem::replace(&mut self.meshlet_data_buffer, meshlet_data_buffer);
+            if let Some(mut alloc) = temp.alloc {
+                self.allocator.destroy_buffer(temp.buffer, &mut alloc);
+            }
+            let temp = std::mem::replace(&mut self.indirect_cmd_buffer, indirect_cmd_buffer);
+            if let Some(mut alloc) = temp.alloc {
+                self.allocator.destroy_buffer(temp.buffer, &mut alloc);
+            }
+            let temp = std::mem::replace(&mut self.index_buffer, index_buffer);
+            if let Some(mut alloc) = temp.alloc {
+                self.allocator.destroy_buffer(temp.buffer, &mut alloc);
+            }
+            let temp = std::mem::replace(&mut self.vertex_buffer, vertex_buffer);
+            if let Some(mut alloc) = temp.alloc {
+                self.allocator.destroy_buffer(temp.buffer, &mut alloc);
+            }
+        }
+
+        // Rerecord scene command buffers.
+        for i in 0..self.swapchain_images.len() {
+            let command_buffer = self.scene_cmd_buffers[i];
+            let image = self.swapchain_images[i];
+            let color_view = self.swapchain_color_views[i];
+            let depth_view = self.swapchain_depth_views[i];
+
+            unsafe {
+                // Begin recording.
+                self.device
+                    .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
+                    .unwrap();
+                self.device
+                    .begin_command_buffer(
+                        command_buffer,
+                        &vk::CommandBufferBeginInfo::default()
+                            .inheritance_info(&vk::CommandBufferInheritanceInfo::default()),
+                    )
+                    .unwrap();
+
+                // Compute prepass.
+                {
+                    self.device.cmd_bind_descriptor_sets(
+                        command_buffer,
+                        vk::PipelineBindPoint::COMPUTE,
+                        self.cull_pipeline_layout,
+                        0,
+                        &[self.cull_set],
+                        &[],
+                    );
+
+                    self.device.cmd_bind_pipeline(
+                        command_buffer,
+                        vk::PipelineBindPoint::COMPUTE,
+                        self.cull_pipeline,
+                    );
+
+                    self.device
+                        .cmd_dispatch(command_buffer, instances.div_ceil(64), 1, 1);
+                }
+
+                // Convert VK_IMAGE_LAYOUT_UNDEFINED -> VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL.
+                self.device.cmd_pipeline_barrier(
+                    command_buffer,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[
+                        vk::ImageMemoryBarrier::default()
+                            .image(image)
+                            .subresource_range(
+                                vk::ImageSubresourceRange::default()
+                                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                    .base_mip_level(0)
+                                    .level_count(1)
+                                    .base_array_layer(0)
+                                    .layer_count(1),
+                            )
+                            .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                            .old_layout(vk::ImageLayout::UNDEFINED)
+                            .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
+                        vk::ImageMemoryBarrier::default()
+                            .image(self.depth_image.0)
+                            .subresource_range(
+                                vk::ImageSubresourceRange::default()
+                                    .aspect_mask(vk::ImageAspectFlags::DEPTH)
+                                    .base_mip_level(0)
+                                    .level_count(1)
+                                    .base_array_layer(0)
+                                    .layer_count(1),
+                            )
+                            .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                            .old_layout(vk::ImageLayout::UNDEFINED)
+                            .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL),
+                    ],
+                );
+
+                // Begin rendering.
+                self.device.cmd_begin_rendering(
+                    command_buffer,
+                    &vk::RenderingInfo::default()
+                        .render_area(vk::Rect2D {
+                            offset: vk::Offset2D { x: 0, y: 0 },
+                            extent: vk::Extent2D {
+                                width: self.surface_extent.width,
+                                height: self.surface_extent.height,
+                            },
+                        })
+                        .layer_count(1)
+                        .depth_attachment(
+                            &vk::RenderingAttachmentInfo::default()
+                                .image_view(depth_view)
+                                .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                                .load_op(vk::AttachmentLoadOp::CLEAR)
+                                .store_op(vk::AttachmentStoreOp::STORE)
+                                .clear_value(vk::ClearValue {
+                                    depth_stencil: vk::ClearDepthStencilValue {
+                                        depth: 1.0,
+                                        stencil: 0,
+                                    },
+                                }),
+                        )
+                        .color_attachments(&[vk::RenderingAttachmentInfo::default()
+                            .image_view(color_view)
+                            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                            .load_op(vk::AttachmentLoadOp::CLEAR)
+                            .store_op(vk::AttachmentStoreOp::STORE)
+                            .clear_value(vk::ClearValue {
+                                color: vk::ClearColorValue {
+                                    float32: [0.0, 0.0, 0.0, 1.0],
+                                },
+                            })]),
+                );
+
+                // Begin draw calls.
+                self.device.cmd_bind_descriptor_sets(
+                    command_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.render_pipeline_layout,
+                    0,
+                    &[self.render_set],
+                    &[],
+                );
+
+                self.device.cmd_bind_pipeline(
+                    command_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.render_pipeline,
+                );
+
+                self.device.cmd_bind_index_buffer(
+                    command_buffer,
+                    self.index_buffer.vk_handle(),
+                    0,
+                    vk::IndexType::UINT32,
+                );
+
+                self.device.cmd_draw_indexed_indirect_count(
+                    command_buffer,
+                    self.indirect_cmd_buffer.vk_handle(),
+                    0,
+                    self.indirect_count_buffer.vk_handle(),
+                    0,
+                    instances,
+                    size_of::<vk::DrawIndexedIndirectCommand>() as u32,
+                );
+
+                self.device.cmd_end_rendering(command_buffer);
+
+                // Convert VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL -> VK_IMAGE_LAYOUT_PRESENT_SRC_KHR.
+                self.device.cmd_pipeline_barrier(
+                    command_buffer,
+                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &[
+                        vk::ImageMemoryBarrier::default()
+                            .image(image)
+                            .subresource_range(
+                                vk::ImageSubresourceRange::default()
+                                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                    .base_mip_level(0)
+                                    .level_count(1)
+                                    .base_array_layer(0)
+                                    .layer_count(1),
+                            )
+                            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                            .new_layout(vk::ImageLayout::PRESENT_SRC_KHR),
+                        vk::ImageMemoryBarrier::default()
+                            .image(self.depth_image.0)
+                            .subresource_range(
+                                vk::ImageSubresourceRange::default()
+                                    .aspect_mask(vk::ImageAspectFlags::DEPTH)
+                                    .base_mip_level(0)
+                                    .level_count(1)
+                                    .base_array_layer(0)
+                                    .layer_count(1),
+                            )
+                            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                            .old_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                            .new_layout(vk::ImageLayout::PRESENT_SRC_KHR),
+                    ],
+                );
+
+                // End recording.
+                self.device.end_command_buffer(command_buffer).unwrap();
+
+                //
+                self.device.update_descriptor_sets(
+                    &[
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(self.cull_set)
+                            .dst_binding(0)
+                            .dst_array_element(0)
+                            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                            .descriptor_count(1)
+                            .buffer_info(&[vk::DescriptorBufferInfo::default()
+                                .buffer(self.meshlet_cull_global_buffer.vk_handle())
+                                .offset(0)
+                                .range(vk::WHOLE_SIZE)]),
+                        //
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(self.render_set)
+                            .dst_binding(0)
+                            .dst_array_element(0)
+                            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                            .descriptor_count(1)
+                            .buffer_info(&[vk::DescriptorBufferInfo::default()
+                                .buffer(self.meshlet_render_global_buffer.vk_handle())
+                                .offset(0)
+                                .range(vk::WHOLE_SIZE)]),
+                        /*vk::WriteDescriptorSet::default()
+                        .dst_set(global_set)
+                        .dst_binding(1)
+                        .dst_array_element(0)
+                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .descriptor_count(1)
+                        .image_info(&[vk::DescriptorImageInfo::default()
+                            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                            .image_view(viking_room_view)
+                            .sampler(viking_room_sampler)]),*/
+                        vk::WriteDescriptorSet::default()
+                            .dst_set(self.render_set)
+                            .dst_binding(2)
+                            .dst_array_element(0)
+                            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+                            .descriptor_count(1)
+                            .buffer_info(&[vk::DescriptorBufferInfo::default()
+                                .buffer(self.object_buffer.vk_handle())
+                                .offset(0)
+                                .range(vk::WHOLE_SIZE)]),
+                    ],
+                    &[],
+                );
+            }
+        }
+
+        (indices, vertices, meshlet_data)
+    }
+
+    pub fn create_object(
         &mut self,
         mesh: MeshHandle,
         position: Vec3,
@@ -198,72 +945,15 @@ impl Renderer {
     }
 
     pub fn load_mesh(&mut self, filename: impl AsRef<Path>) -> Option<MeshHandle> {
-        let model = {
-            use std::io::BufReader;
-            let data = std::fs::read(filename).ok()?;
-            let (models, _) =
-                tobj::load_obj_buf(&mut BufReader::new(&data[..]), |_| unreachable!()).unwrap();
-            models.into_iter().next()?.mesh
-        };
-
-        let mut indices: Box<[u32]> = model.indices.into_boxed_slice();
-        let mut positions: Box<[[f32; 3]]> = model
-            .positions
-            .chunks_exact(3)
-            .map(|v| [v[0], v[1], v[2]])
-            .collect();
-
-        // Optimize index count.
-        meshopt::optimize_vertex_cache_in_place(&mut indices, positions.len());
-
-        // Optimize overdraw.
-        meshopt::optimize_overdraw_in_place_decoder(&mut indices, &positions, 1.05);
-
-        // Optimize vertex fetch.
-        meshopt::optimize_vertex_fetch_in_place(&mut indices, &mut positions);
-
-        let adapter = meshopt::VertexDataAdapter {
-            reader: std::io::Cursor::new(unsafe {
-                std::slice::from_raw_parts(
-                    positions.as_ptr() as *const u8,
-                    3 * positions.len() * size_of::<f32>(),
-                )
-            }),
-            vertex_count: positions.len(),
-            vertex_stride: 3 * size_of::<f32>(),
-            position_offset: 0,
-        };
-
-        let meshlets = meshopt::build_meshlets(&indices, &adapter, 64, 124, 0.5)
-            .iter()
-            .map(|meshlet| {
-                let bounds = meshopt::compute_meshlet_bounds_decoder(meshlet, &positions);
-                println!("{:?} vs {:?}", bounds.center, bounds.cone_apex);
-                Meshlet {
-                    center: bounds.cone_apex,
-                    radius: bounds.radius,
-                    cone_apex: bounds.cone_apex,
-                    cone_axis: bounds.cone_axis,
-                    cone_cutoff: bounds.cone_cutoff,
-                    indices: meshlet.triangles.to_owned().into_boxed_slice(),
-                    positions: meshlet
-                        .vertices
-                        .iter()
-                        .flat_map(|&i: &u32| &positions[i as usize])
-                        .copied()
-                        .collect(),
-                    texcoords: Box::new([]),
-                }
-            })
-            .collect();
-
+        let mesh = load_mesh(self.cwd.join(filename))?;
         let handle = MeshHandle(self.resource_counter);
         self.resource_counter += 1;
-        self.meshes.insert(handle, meshlets);
+        self.meshes.insert(handle, mesh);
         return Some(handle);
-    }*/
+    }
 
     pub fn new(
+        cwd: impl AsRef<Path>,
         viewport_w: u32,
         viewport_h: u32,
         display: impl HasDisplayHandle + HasWindowHandle,
@@ -523,7 +1213,6 @@ impl Renderer {
                 (color_views, depth_views)
             };
 
-            /*
             // Desciptor set layout for the rendering program.
             let render_set_layout = device
                 .create_descriptor_set_layout(
@@ -579,6 +1268,42 @@ impl Renderer {
                     None,
                 )
                 .unwrap();
+
+            // Generic descriptor pool
+            let descriptor_pool = device
+                .create_descriptor_pool(
+                    &vk::DescriptorPoolCreateInfo::default()
+                        .pool_sizes(&[vk::DescriptorPoolSize::default().descriptor_count(3)])
+                        .max_sets(3)
+                        .flags(vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND),
+                    None,
+                )
+                .unwrap();
+
+            // Create a render and cull set from previous layouts.
+            let (render_set, cull_set) = device
+                .allocate_descriptor_sets(
+                    &vk::DescriptorSetAllocateInfo::default()
+                        .descriptor_pool(descriptor_pool)
+                        .set_layouts(&[render_set_layout, cull_set_layout]),
+                )
+                .ok()
+                .and_then(|v| v.into_iter().tuples().next())
+                .unwrap();
+
+            // Shader creation util function.
+            let create_shader_module = |src: &[u8]| {
+                device
+                    .create_shader_module(
+                        &vk::ShaderModuleCreateInfo {
+                            p_code: src.as_ptr() as _,
+                            code_size: src.len(),
+                            ..Default::default()
+                        },
+                        None,
+                    )
+                    .unwrap()
+            };
 
             // Create rendering pipeline.
             let (render_pipeline, render_pipeline_layout) = {
@@ -714,7 +1439,7 @@ impl Renderer {
             };
 
             // Generic command pool.
-            let command_pool = device
+            let cmd_pool = device
                 .create_command_pool(
                     &vk::CommandPoolCreateInfo::default()
                         .queue_family_index(queue_family_index)
@@ -723,96 +1448,52 @@ impl Renderer {
                 )
                 .unwrap();
 
-            //
-            let [staging] = device
+            // Single primary buffer.
+            let render_cmd_buffers = device
                 .allocate_command_buffers(
                     &vk::CommandBufferAllocateInfo::default()
-                        .command_pool(command_pool)
+                        .command_pool(cmd_pool)
                         .level(vk::CommandBufferLevel::PRIMARY)
-                        .command_buffer_count(1),
+                        .command_buffer_count(2),
                 )
-                .unwrap()[..];
+                .unwrap()
+                .into_boxed_slice();
 
-            // Create 3 sub command buffers for each swapchain image.
+            // Create scene buffer for each swapchain image.
             let scene_cmd_buffers = device
                 .allocate_command_buffers(
                     &vk::CommandBufferAllocateInfo::default()
-                        .command_pool(command_pool)
+                        .command_pool(cmd_pool)
                         .level(vk::CommandBufferLevel::SECONDARY)
-                        .command_buffer_count(3),
+                        .command_buffer_count(swapchain_images.len() as u32),
                 )
-                .unwrap();
+                .unwrap()
+                .into_boxed_slice();
 
             // Synchronization primitives for each frame.
-            let max_frames_in_flight = 2;
-            let image_available: Box<[vk::Semaphore]> = (0..max_frames_in_flight)
-                .map(|_| device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None))
-                .collect::<Result<_, _>>()
-                .unwrap();
-            let render_finished: Box<[vk::Semaphore]> = (0..max_frames_in_flight)
-                .map(|_| device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None))
-                .collect::<Result<_, _>>()
-                .unwrap();
-            let frame_in_flight: Box<[vk::Fence]> = (0..max_frames_in_flight)
-                .map(|_| {
-                    device.create_fence(
-                        &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
-                        None,
-                    )
+            let max_frames_in_flight = 1;
+            let frame_sync_primitives = (0..max_frames_in_flight)
+                .map(|_| FrameSyncPrimitives {
+                    image_available: device
+                        .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+                        .unwrap(),
+                    render_finished: device
+                        .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+                        .unwrap(),
+                    frame_in_flight: device
+                        .create_fence(
+                            &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+                            None,
+                        )
+                        .unwrap(),
                 })
-                .collect::<Result<_, _>>()
-                .unwrap();
+                .collect();
 
             // Various buffers.
-            let mut staging_buffer = StagingBuffer::new(10000000, &renderer.allocator);
+            let staging_buffer = StagingBuffer::new(10000000, &allocator);
 
-            /*let index_count = bunny_meshlets
-                .iter()
-                .fold(0, |acc, meshlet| acc + meshlet.indices.len());
-            let index_buffer: Buffer<u32> = renderer.create_buffer(
-                index_count as u32,
-                vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-                vk_mem::MemoryUsage::AutoPreferDevice,
-            );*/
-
-            let object_buffer: Buffer<Object> = renderer.create_buffer(
-                3,
-                vk::BufferUsageFlags::STORAGE_BUFFER
-                    | vk::BufferUsageFlags::TRANSFER_DST
-                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-                vk_mem::MemoryUsage::AutoPreferDevice,
-            );
-
-            let instance_buffer: Buffer<Instance> = renderer.create_buffer(
-                3 * bunny_meshlets.len() as u32,
-                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-                vk_mem::MemoryUsage::AutoPreferDevice,
-            );
-
-            let meshlet_data_buffer: Buffer<MeshletData> = renderer.create_buffer(
-                3 * bunny_meshlets.len() as u32,
-                vk::BufferUsageFlags::STORAGE_BUFFER
-                    | vk::BufferUsageFlags::TRANSFER_DST
-                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-                vk_mem::MemoryUsage::AutoPreferDevice,
-            );
-
-            let meshlet_cull_global_buffer: Buffer<MeshletCullGlobal> = renderer.create_buffer(
-                1,
-                vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-                vk_mem::MemoryUsage::AutoPreferDevice,
-            );
-
-            let indirect_cmd_buffer: Buffer<vk::DrawIndexedIndirectCommand> = renderer
-                .create_buffer(
-                    3 * bunny_meshlets.len() as u32,
-                    vk::BufferUsageFlags::STORAGE_BUFFER
-                        | vk::BufferUsageFlags::INDIRECT_BUFFER
-                        | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-                    vk_mem::MemoryUsage::AutoPreferDevice,
-                );
-
-            let comp_buffer: Buffer<u32> = renderer.create_buffer(
+            let indirect_count_buffer: Buffer<u32> = create_buffer(
+                &allocator,
                 1,
                 vk::BufferUsageFlags::STORAGE_BUFFER
                     | vk::BufferUsageFlags::INDIRECT_BUFFER
@@ -821,23 +1502,21 @@ impl Renderer {
                 vk_mem::MemoryUsage::AutoPreferDevice,
             );
 
-            let vertex_count = bunny_meshlets
-                .iter()
-                .fold(0, |acc, meshlet| acc + meshlet.positions.len() / 3);
-            let vertex_buffer: Buffer<Vertex> = renderer.create_buffer(
-                vertex_count as u32,
-                vk::BufferUsageFlags::VERTEX_BUFFER
-                    | vk::BufferUsageFlags::TRANSFER_DST
-                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-                vk_mem::MemoryUsage::AutoPreferDevice,
-            );
-
-            let global_buffer: Buffer<MeshletRenderGlobal> = renderer.create_buffer(
+            let meshlet_cull_global_buffer: Buffer<MeshletCullGlobal> = create_buffer(
+                &allocator,
                 1,
                 vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
                 vk_mem::MemoryUsage::AutoPreferDevice,
-            );*/
+            );
 
+            let meshlet_render_global_buffer: Buffer<MeshletRenderGlobal> = create_buffer(
+                &allocator,
+                1,
+                vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+                vk_mem::MemoryUsage::AutoPreferDevice,
+            );
+
+            //
             Self {
                 entry,
                 instance,
@@ -847,6 +1526,10 @@ impl Renderer {
                 surface,
                 surface_format,
                 surface_capabilities,
+                surface_extent: vk::Extent2D {
+                    width: viewport_w,
+                    height: viewport_h,
+                },
 
                 device,
                 queue_family_index,
@@ -862,76 +1545,49 @@ impl Renderer {
                 swapchain_color_views,
                 swapchain_depth_views,
 
-                buffer_allocs: HashMap::new(),
+                frame_sync_primitives,
+
+                cmd_pool,
+                render_cmd_buffers,
+                scene_cmd_buffers,
+
+                render_set,
+                render_set_layout,
+                cull_set,
+                cull_set_layout,
+
+                render_pipeline_layout,
+                render_pipeline,
+                cull_pipeline_layout,
+                cull_pipeline,
+
+                cwd: cwd.as_ref().to_owned(),
+                resource_counter: 0,
+                meshes: HashMap::new(),
+                objects: HashMap::new(),
+
+                staging_buffer,
+                index_buffer: Buffer::null(),
+                object_buffer: Buffer::null(),
+                instance_buffer: Buffer::null(),
+                meshlet_data_buffer: Buffer::null(),
+                meshlet_cull_global_buffer,
+                meshlet_render_global_buffer,
+                indirect_cmd_buffer: Buffer::null(),
+                indirect_count_buffer,
+                vertex_buffer: Buffer::null(),
+
+                frame: 0,
+                cam_pos: <_>::default(),
+                cam_rot: <_>::default(),
             }
-        }
-    }
-
-    pub fn create_shader_from_bytes(&self, src: &[u8]) -> Shader {
-        Shader(unsafe {
-            self.device
-                .create_shader_module(
-                    &vk::ShaderModuleCreateInfo {
-                        p_code: src.as_ptr() as _,
-                        code_size: src.len(),
-                        ..Default::default()
-                    },
-                    None,
-                )
-                .unwrap()
-        })
-    }
-
-    pub fn delete_shader(&self, shader: Shader) {
-        unsafe { self.device.destroy_shader_module(shader.0, None) };
-        std::mem::forget(shader);
-    }
-
-    pub fn create_buffer<T>(
-        &mut self,
-        len: u32,
-        vk_usage: vk::BufferUsageFlags,
-        vma_usage: vk_mem::MemoryUsage,
-    ) -> Buffer<T> {
-        unsafe {
-            let (buffer, alloc) = self
-                .allocator
-                .create_buffer(
-                    &vk::BufferCreateInfo::default()
-                        .size(len as u64 * size_of::<T>() as u64)
-                        .usage(vk_usage),
-                    &vk_mem::AllocationCreateInfo {
-                        usage: vma_usage,
-                        ..Default::default()
-                    },
-                )
-                .unwrap();
-
-            self.buffer_allocs.insert(buffer, alloc);
-
-            Buffer {
-                phantom: std::marker::PhantomData,
-                buffer,
-                len,
-            }
-        }
-    }
-
-    pub fn delete_buffer<T>(&mut self, buffer: Buffer<T>) {
-        let alloc = self.buffer_allocs.remove(&buffer.buffer).unwrap();
-        self.vk_delete_buffer(buffer.buffer, alloc);
-        std::mem::forget(buffer);
-    }
-
-    fn vk_delete_buffer(&mut self, buffer: vk::Buffer, mut alloc: vk_mem::Allocation) {
-        unsafe {
-            self.allocator.destroy_buffer(buffer, &mut alloc);
         }
     }
 }
 
 impl Drop for Renderer {
     fn drop(&mut self) {
+        /*
         unsafe {
             // Free buffers.
             for (buffer, alloc) in std::mem::take(&mut self.buffer_allocs).into_iter() {
@@ -957,5 +1613,68 @@ impl Drop for Renderer {
             self.surface_instance.destroy_surface(self.surface, None);
             self.instance.destroy_instance(None);
         }
+        */
     }
+}
+
+pub fn load_mesh(filename: impl AsRef<Path>) -> Option<Box<[Meshlet]>> {
+    let model = {
+        use std::io::BufReader;
+        let data = std::fs::read(filename).ok()?;
+        let (models, _) =
+            tobj::load_obj_buf(&mut BufReader::new(&data[..]), |_| unreachable!()).unwrap();
+        models.into_iter().next()?.mesh
+    };
+
+    let mut indices: Box<[u32]> = model.indices.into_boxed_slice();
+    let mut positions: Box<[[f32; 3]]> = model
+        .positions
+        .chunks_exact(3)
+        .map(|v| [v[0], v[1], v[2]])
+        .collect();
+
+    // Optimize index count.
+    meshopt::optimize_vertex_cache_in_place(&mut indices, positions.len());
+
+    // Optimize overdraw.
+    meshopt::optimize_overdraw_in_place_decoder(&mut indices, &positions, 1.05);
+
+    // Optimize vertex fetch.
+    meshopt::optimize_vertex_fetch_in_place(&mut indices, &mut positions);
+
+    let adapter = meshopt::VertexDataAdapter {
+        reader: std::io::Cursor::new(unsafe {
+            std::slice::from_raw_parts(
+                positions.as_ptr() as *const u8,
+                3 * positions.len() * size_of::<f32>(),
+            )
+        }),
+        vertex_count: positions.len(),
+        vertex_stride: 3 * size_of::<f32>(),
+        position_offset: 0,
+    };
+
+    let meshlets = meshopt::build_meshlets(&indices, &adapter, 64, 124, 0.5)
+        .iter()
+        .map(|meshlet| {
+            let bounds = meshopt::compute_meshlet_bounds_decoder(meshlet, &positions);
+            Meshlet {
+                center: bounds.cone_apex,
+                radius: bounds.radius,
+                cone_apex: bounds.cone_apex,
+                cone_axis: bounds.cone_axis,
+                cone_cutoff: bounds.cone_cutoff,
+                indices: meshlet.triangles.to_owned().into_boxed_slice(),
+                positions: meshlet
+                    .vertices
+                    .iter()
+                    .flat_map(|&i: &u32| &positions[i as usize])
+                    .copied()
+                    .collect(),
+                texcoords: Box::new([]),
+            }
+        })
+        .collect();
+
+    Some(meshlets)
 }
