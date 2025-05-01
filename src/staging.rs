@@ -86,13 +86,6 @@ impl Drop for StagingBuffer {
     }
 }
 
-pub struct Staging<'a> {
-    device: &'a ash::Device,
-    command_buffer: vk::CommandBuffer,
-    ptr: *mut u8,
-    buffer: &'a mut StagingBuffer,
-}
-
 /*
 impl Staging<'_> {
     pub unsafe fn stage_buffer<T: Clone>(

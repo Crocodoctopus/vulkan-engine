@@ -1,9 +1,8 @@
 //use crate::util::Map2;
-use ash::vk::{Extent2D, Handle, ImageUsageFlags};
+use ash::vk::{Extent2D, ImageUsageFlags};
 use ash::{khr, vk};
 use glam::*;
 use itertools::Itertools;
-use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::ffi::CStr;
 use std::path::Path;
@@ -11,7 +10,7 @@ use std::path::PathBuf;
 use vk_mem::Alloc;
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
-use crate::staging::{Staging, StagingBuffer};
+use crate::staging::StagingBuffer;
 
 #[repr(C, align(16))]
 #[derive(Copy, Clone, Debug)]
@@ -86,7 +85,7 @@ pub struct Buffer<T> {
     len: u32,
 }
 
-pub fn create_buffer<T>(
+fn create_buffer<T>(
     allocator: &vk_mem::Allocator,
     len: u32,
     vk_usage: vk::BufferUsageFlags,
@@ -111,6 +110,12 @@ pub fn create_buffer<T>(
             alloc: Some(alloc),
             len,
         }
+    }
+}
+
+unsafe fn destroy_buffer<T>(allocator: &vk_mem::Allocator, mut buffer: Buffer<T>) {
+    if let Some(mut alloc) = buffer.alloc {
+        allocator.destroy_buffer(buffer.buffer, &mut alloc);
     }
 }
 
@@ -170,6 +175,43 @@ struct FrameSyncPrimitives {
     frame_in_flight: vk::Fence,
 }
 
+struct Frame {
+    //
+    sync_primitives: Box<[FrameSyncPrimitives]>,
+
+    //
+    scene_cmd_buffers: Box<[vk::CommandBuffer]>,
+
+    // Various buffers.
+    index_buffer: Buffer<u32>,
+    vertex_buffer: Buffer<Vertex>,
+    object_buffer: Buffer<Object>,
+    instance_buffer: Buffer<Instance>,
+    meshlet_data_buffer: Buffer<MeshletData>,
+    indirect_cmd_buffer: Buffer<vk::DrawIndexedIndirectCommand>,
+    indirect_count_buffer: Buffer<u32>,
+    meshlet_cull_global_buffer: Buffer<MeshletCullGlobal>,
+    meshlet_render_global_buffer: Buffer<MeshletRenderGlobal>,
+}
+
+impl Frame {
+    fn null() -> Self {
+        Self {
+            sync_primitives: Box::new([]),
+            scene_cmd_buffers: Box::new([]),
+            index_buffer: Buffer::null(),
+            vertex_buffer: Buffer::null(),
+            object_buffer: Buffer::null(),
+            instance_buffer: Buffer::null(),
+            meshlet_data_buffer: Buffer::null(),
+            indirect_cmd_buffer: Buffer::null(),
+            indirect_count_buffer: Buffer::null(),
+            meshlet_cull_global_buffer: Buffer::null(),
+            meshlet_render_global_buffer: Buffer::null(),
+        }
+    }
+}
+
 pub struct Renderer {
     // Various Vulkan state data.
     pub entry: ash::Entry,
@@ -199,13 +241,8 @@ pub struct Renderer {
     pub swapchain_color_views: Box<[vk::ImageView]>,
     pub swapchain_depth_views: Box<[vk::ImageView]>,
 
-    // Synchronization primitives.
-    frame_sync_primitives: Box<[FrameSyncPrimitives]>,
-
-    // Command.
+    // Command pool.
     cmd_pool: vk::CommandPool,
-    render_cmd_buffers: Box<[vk::CommandBuffer]>,
-    scene_cmd_buffers: Box<[vk::CommandBuffer]>,
 
     // Desciptor sets.
     render_set_layout: vk::DescriptorSetLayout,
@@ -225,19 +262,15 @@ pub struct Renderer {
     meshes: HashMap<MeshHandle, Box<[Meshlet]>>,
     objects: HashMap<ObjectHandle, ObjectInstance>,
 
-    // Buffers.
+    // Staging.
     staging_buffer: StagingBuffer,
+    staging_cmd_buffer: vk::CommandBuffer,
+    staging_fence: vk::Fence,
 
-    index_buffer: Buffer<u32>,
-    vertex_buffer: Buffer<Vertex>,
-    object_buffer: Buffer<Object>,
-    instance_buffer: Buffer<Instance>,
-    meshlet_data_buffer: Buffer<MeshletData>,
-    indirect_cmd_buffer: Buffer<vk::DrawIndexedIndirectCommand>,
-
-    indirect_count_buffer: Buffer<u32>,
-    meshlet_cull_global_buffer: Buffer<MeshletCullGlobal>,
-    meshlet_render_global_buffer: Buffer<MeshletRenderGlobal>,
+    // Frame.
+    render_cmd_buffers: Box<[vk::CommandBuffer]>,
+    current_frame: Frame,
+    next_frame: Option<Frame>,
 
     // Various render state data.
     frame: usize,
@@ -251,68 +284,61 @@ impl Renderer {
         unsafe {
             // A dirty hack. When a rebuild occurs, wait for transfer to fully complete.
             if self.frame == 0 {
-                // Sync primitives associated with this frame.
-                let FrameSyncPrimitives {
-                    frame_in_flight, ..
-                } = self.frame_sync_primitives[0];
-
-                // Command buffer associated with this frame.
-                let command_buffer = self.render_cmd_buffers[0];
-
                 // Rebuild scene elements.
-                let (indices, vertices, meshlet_data) = self.rebuild_scene();
-
-                // Use current command buffer.
-                self.device
-                    .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
-                    .unwrap();
-                self.device
-                    .begin_command_buffer(command_buffer, &vk::CommandBufferBeginInfo::default())
-                    .unwrap();
-
-                // Push data.
-                self.staging_buffer.reset();
-                self.staging_buffer.stage_buffer(
-                    &self.device,
-                    command_buffer,
-                    &self.index_buffer,
-                    0,
-                    indices,
-                );
-                self.staging_buffer.stage_buffer(
-                    &self.device,
-                    command_buffer,
-                    &self.vertex_buffer,
-                    0,
-                    vertices,
-                );
-                self.staging_buffer.stage_buffer(
-                    &self.device,
-                    command_buffer,
-                    &self.meshlet_data_buffer,
-                    0,
-                    meshlet_data,
-                );
-
-                // Execute command buffer.
-                self.device.end_command_buffer(command_buffer).unwrap();
-                self.device.reset_fences(&[frame_in_flight]).unwrap();
-                self.device
-                    .queue_submit(
-                        self.graphics_queue,
-                        &[vk::SubmitInfo::default().command_buffers(&[command_buffer])],
-                        frame_in_flight,
-                    )
-                    .unwrap();
-
-                // Wait.
-                self.device
-                    .wait_for_fences(&[frame_in_flight], true, u64::MAX)
-                    .unwrap();
+                self.next_frame = Some(self.rebuild_scene());
             }
         }
 
-        let frame = self.frame % self.frame_sync_primitives.len();
+        // Attempt to clean up current_frame if there is a next.
+        if self.next_frame.is_some() {
+            // All frames are signalled.
+            let signalled =
+                self.current_frame
+                    .sync_primitives
+                    .iter()
+                    .fold(true, |acc, syncs| unsafe {
+                        acc & self.device.get_fence_status(syncs.frame_in_flight).unwrap()
+                    });
+
+            if signalled {
+                let frame =
+                    std::mem::replace(&mut self.current_frame, self.next_frame.take().unwrap());
+
+                // TODO: free self.current_frame.
+                unsafe {
+                    for sync in &frame.sync_primitives {
+                        self.device.destroy_semaphore(sync.image_available, None);
+                        self.device.destroy_semaphore(sync.render_finished, None);
+                        self.device.destroy_fence(sync.frame_in_flight, None);
+                    }
+                    if frame.scene_cmd_buffers.len() > 0 {
+                        self.device
+                            .free_command_buffers(self.cmd_pool, &frame.scene_cmd_buffers);
+                    }
+                    destroy_buffer(&self.allocator, frame.index_buffer);
+                    destroy_buffer(&self.allocator, frame.vertex_buffer);
+                    destroy_buffer(&self.allocator, frame.object_buffer);
+                    destroy_buffer(&self.allocator, frame.instance_buffer);
+                    destroy_buffer(&self.allocator, frame.meshlet_data_buffer);
+                    destroy_buffer(&self.allocator, frame.indirect_cmd_buffer);
+                    destroy_buffer(&self.allocator, frame.indirect_count_buffer);
+                    destroy_buffer(&self.allocator, frame.meshlet_cull_global_buffer);
+                    destroy_buffer(&self.allocator, frame.meshlet_render_global_buffer);
+                    println!("Old frame cleared.");
+                }
+
+                //
+            }
+        }
+
+        // Get current working frame.
+        let frame = match &self.next_frame {
+            Some(frame) => frame,
+            None => &self.current_frame,
+        };
+
+        println!("Starting on {}.", self.frame);
+        let frame_index = self.frame % frame.sync_primitives.len();
         self.frame += 1;
 
         // Sync primitives associated with this frame.
@@ -320,10 +346,10 @@ impl Renderer {
             image_available,
             render_finished,
             frame_in_flight,
-        } = self.frame_sync_primitives[frame];
+        } = frame.sync_primitives[frame_index];
 
         // Command buffer associated with this frame.
-        let command_buffer = self.render_cmd_buffers[frame];
+        let command_buffer = self.render_cmd_buffers[frame_index];
 
         unsafe {
             // Wait for next image to become available.
@@ -336,7 +362,7 @@ impl Renderer {
                 .swapchain_device
                 .acquire_next_image(self.swapchain, u64::MAX, image_available, vk::Fence::null())
                 .unwrap();
-            let scene_command_buffer = self.scene_cmd_buffers[image_index as usize];
+            let scene_command_buffer = frame.scene_cmd_buffers[image_index as usize];
 
             // Reset and record.
             self.device
@@ -348,30 +374,6 @@ impl Renderer {
 
             // Transfer some global state data.
             {
-                /*let model0 = Mat4::IDENTITY;
-                let model1 = model0;
-                let model2 = model1;
-                let mult = model0;*/
-                /*let model0 = Mat4::from_translation(Vec3::new(0., 0.8, 0.));
-                let model1 = Mat4::from_translation(Vec3::new(1., 0.8, 0.));
-                let model2 = Mat4::from_translation(Vec3::new(2., 0.8, 0.));
-                let mult = Mat4::from_scale(Vec3::splat(2.0))
-                    * Mat4::from_rotation_y(time * std::f32::consts::FRAC_PI_2)
-                    * Mat4::from_rotation_x(std::f32::consts::PI);
-                let object_data = [
-                    Object {
-                        model: model0 * mult,
-                        texture_id: 0,
-                    },
-                    Object {
-                        model: model1 * mult,
-                        texture_id: 0,
-                    },
-                    Object {
-                        model: model2 * mult,
-                        texture_id: 0,
-                    },
-                ];*/
                 let object_data = self.objects.values().map(|obj| Object {
                     model: Mat4::from_translation(obj.position)
                         * Mat4::from_scale(obj.scale)
@@ -414,7 +416,7 @@ impl Renderer {
                     self.staging_buffer.stage_buffer(
                         &self.device,
                         command_buffer,
-                        &self.object_buffer,
+                        &frame.object_buffer,
                         0,
                         object_data,
                     );
@@ -422,60 +424,60 @@ impl Renderer {
                     self.staging_buffer.stage_buffer(
                         &self.device,
                         command_buffer,
-                        &self.meshlet_render_global_buffer,
+                        &frame.meshlet_render_global_buffer,
                         0,
                         [MeshletRenderGlobal {
                             pv: projection * view,
                             vertex_buffer: self.device.get_buffer_device_address(
                                 &vk::BufferDeviceAddressInfo::default()
-                                    .buffer(self.vertex_buffer.vk_handle()),
+                                    .buffer(frame.vertex_buffer.vk_handle()),
                             ),
                             instance_buffer: self.device.get_buffer_device_address(
                                 &vk::BufferDeviceAddressInfo::default()
-                                    .buffer(self.instance_buffer.vk_handle()),
+                                    .buffer(frame.instance_buffer.vk_handle()),
                             ),
                             object_buffer: self.device.get_buffer_device_address(
                                 &vk::BufferDeviceAddressInfo::default()
-                                    .buffer(self.object_buffer.vk_handle()),
+                                    .buffer(frame.object_buffer.vk_handle()),
                             ),
                         }],
                     );
                     self.staging_buffer.stage_buffer(
                         &self.device,
                         command_buffer,
-                        &self.indirect_count_buffer,
+                        &frame.indirect_count_buffer,
                         0,
                         [0u32],
                     );
                     self.staging_buffer.stage_buffer(
                         &self.device,
                         command_buffer,
-                        &self.meshlet_cull_global_buffer,
+                        &frame.meshlet_cull_global_buffer,
                         0,
                         [MeshletCullGlobal {
                             view: view.to_cols_array(),
                             camera_position: self.cam_pos.to_array(),
-                            instances: self.indirect_cmd_buffer.len,
+                            instances: frame.indirect_cmd_buffer.len,
                             frustum,
                             draw_count_buffer: self.device.get_buffer_device_address(
                                 &vk::BufferDeviceAddressInfo::default()
-                                    .buffer(self.indirect_count_buffer.vk_handle()),
+                                    .buffer(frame.indirect_count_buffer.vk_handle()),
                             ),
                             meshlet_buffer: self.device.get_buffer_device_address(
                                 &vk::BufferDeviceAddressInfo::default()
-                                    .buffer(self.meshlet_data_buffer.vk_handle()),
+                                    .buffer(frame.meshlet_data_buffer.vk_handle()),
                             ),
                             draw_cmd_buffer: self.device.get_buffer_device_address(
                                 &vk::BufferDeviceAddressInfo::default()
-                                    .buffer(self.indirect_cmd_buffer.vk_handle()),
+                                    .buffer(frame.indirect_cmd_buffer.vk_handle()),
                             ),
                             instance_buffer: self.device.get_buffer_device_address(
                                 &vk::BufferDeviceAddressInfo::default()
-                                    .buffer(self.instance_buffer.vk_handle()),
+                                    .buffer(frame.instance_buffer.vk_handle()),
                             ),
                             object_buffer: self.device.get_buffer_device_address(
                                 &vk::BufferDeviceAddressInfo::default()
-                                    .buffer(self.object_buffer.vk_handle()),
+                                    .buffer(frame.object_buffer.vk_handle()),
                             ),
                         }],
                     );
@@ -513,174 +515,232 @@ impl Renderer {
         }
     }
 
-    fn rebuild_scene(&mut self) -> (Vec<u32>, Vec<Vertex>, Vec<MeshletData>) {
-        // Create a single gigabuffer.
-        let mut vertices = vec![];
-        let mut indices = vec![];
-        let mut offset_map = HashMap::<MeshHandle, u32>::new();
-        for (id, mesh) in self.meshes.iter() {
-            // Push the base index offset for this mesh.
-            offset_map.insert(*id, indices.len() as u32);
+    unsafe fn rebuild_scene(&mut self) -> Frame {
+        // Build scene buffer data.
+        let (indices, vertices, meshlet_data) = {
+            // Create a single gigabuffer.
+            let mut vertices = vec![];
+            let mut indices = vec![];
+            let mut offset_map = HashMap::<MeshHandle, u32>::new();
+            for (id, mesh) in self.meshes.iter() {
+                // Push the base index offset for this mesh.
+                offset_map.insert(*id, indices.len() as u32);
 
-            // Extend index and vertex buffers.
-            for meshlet in mesh {
-                let offset = vertices.len();
-                indices.extend(
-                    meshlet
-                        .indices
-                        .iter()
-                        .map(|&index| index as u32 + offset as u32),
-                );
+                // Extend index and vertex buffers.
+                for meshlet in mesh {
+                    let offset = vertices.len();
+                    indices.extend(
+                        meshlet
+                            .indices
+                            .iter()
+                            .map(|&index| index as u32 + offset as u32),
+                    );
 
-                vertices.extend((0..meshlet.positions.len() / 3).map(|i| Vertex {
-                    position: Vec3::new(
-                        meshlet.positions[3 * i],
-                        meshlet.positions[3 * i + 1],
-                        meshlet.positions[3 * i + 2],
-                    ),
-                    u: 0., //meshlet.texcoords[2 * i],
-                    normal: Vec3::splat(0.0),
-                    /*normals: Vec3::new(
-                        meshlet.normals[3 * i],
-                        meshlet.normals[3 * i + 1],
-                        meshlet.normals[3 * i + 2],
-                    )*/
-                    v: 0., //meshlet.texcoords[2 * i + 1],
-                    color: Vec4::splat(1.0),
-                }));
+                    vertices.extend((0..meshlet.positions.len() / 3).map(|i| Vertex {
+                        position: Vec3::new(
+                            meshlet.positions[3 * i],
+                            meshlet.positions[3 * i + 1],
+                            meshlet.positions[3 * i + 2],
+                        ),
+                        u: 0., //meshlet.texcoords[2 * i],
+                        normal: Vec3::splat(0.0),
+                        /*normals: Vec3::new(
+                            meshlet.normals[3 * i],
+                            meshlet.normals[3 * i + 1],
+                            meshlet.normals[3 * i + 2],
+                        )*/
+                        v: 0., //meshlet.texcoords[2 * i + 1],
+                        color: Vec4::splat(1.0),
+                    }));
+                }
             }
-        }
 
-        let mut meshlet_data = vec![];
-        for (i, object) in self.objects.values().enumerate() {
-            // Get associated mesh and index offset.
-            let mesh = self.meshes.get(&object.mesh).unwrap();
-            let mut first_index = *offset_map.get(&object.mesh).unwrap();
+            let mut meshlet_data = vec![];
+            for (i, object) in self.objects.values().enumerate() {
+                // Get associated mesh and index offset.
+                let mesh = self.meshes.get(&object.mesh).unwrap();
+                let mut first_index = *offset_map.get(&object.mesh).unwrap();
 
-            // Generate meshlet data.
-            for meshlet in mesh {
-                meshlet_data.push(MeshletData {
-                    center: meshlet.center,
-                    radius: meshlet.radius,
-                    cone_apex: meshlet.cone_apex,
-                    pad0: 0.,
-                    cone_axis: meshlet.cone_axis,
-                    cone_cutoff: meshlet.cone_cutoff,
-                    object_id: i as u32,
-                    index_count: meshlet.indices.len() as u32,
-                    first_index,
-                });
-                first_index += meshlet.indices.len() as u32;
+                // Generate meshlet data.
+                for meshlet in mesh {
+                    meshlet_data.push(MeshletData {
+                        center: meshlet.center,
+                        radius: meshlet.radius,
+                        cone_apex: meshlet.cone_apex,
+                        pad0: 0.,
+                        cone_axis: meshlet.cone_axis,
+                        cone_cutoff: meshlet.cone_cutoff,
+                        object_id: i as u32,
+                        index_count: meshlet.indices.len() as u32,
+                        first_index,
+                    });
+                    first_index += meshlet.indices.len() as u32;
+                }
             }
-        }
+
+            (indices, vertices, meshlet_data)
+        };
         let instances = meshlet_data.len() as u32;
 
-        println!(
-            "Rebuilding scene with: {} object(s), {} mesh(es), {} meshlet(s), {} indices, {} vertices.",
-            self.objects.len(),
-            self.meshes.len(),
-            meshlet_data.len(),
-            indices.len(),
-            vertices.len(),
-        );
+        let max_frames_in_flight = 2;
+        let frame = Frame {
+            sync_primitives: (0..max_frames_in_flight)
+                .map(|_| FrameSyncPrimitives {
+                    image_available: self
+                        .device
+                        .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+                        .unwrap(),
+                    render_finished: self
+                        .device
+                        .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+                        .unwrap(),
+                    frame_in_flight: self
+                        .device
+                        .create_fence(
+                            &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+                            None,
+                        )
+                        .unwrap(),
+                })
+                .collect(),
 
-        // Recreate buffers.
-        let object_buffer: Buffer<Object> = create_buffer(
-            &self.allocator,
-            self.objects.len() as u32,
-            vk::BufferUsageFlags::STORAGE_BUFFER
-                | vk::BufferUsageFlags::TRANSFER_DST
-                | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-            vk_mem::MemoryUsage::AutoPreferDevice,
-        );
-
-        let instance_buffer: Buffer<Instance> = create_buffer(
-            &self.allocator,
-            instances,
-            vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-            vk_mem::MemoryUsage::AutoPreferDevice,
-        );
-
-        let meshlet_data_buffer: Buffer<MeshletData> = create_buffer(
-            &self.allocator,
-            instances,
-            vk::BufferUsageFlags::STORAGE_BUFFER
-                | vk::BufferUsageFlags::TRANSFER_DST
-                | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-            vk_mem::MemoryUsage::AutoPreferDevice,
-        );
-
-        let indirect_cmd_buffer: Buffer<vk::DrawIndexedIndirectCommand> = create_buffer(
-            &self.allocator,
-            instances,
-            vk::BufferUsageFlags::STORAGE_BUFFER
-                | vk::BufferUsageFlags::INDIRECT_BUFFER
-                | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-            vk_mem::MemoryUsage::AutoPreferDevice,
-        );
-
-        let index_buffer: Buffer<u32> = create_buffer(
-            &self.allocator,
-            indices.len() as u32,
-            vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-            vk_mem::MemoryUsage::AutoPreferDevice,
-        );
-
-        let vertex_buffer: Buffer<Vertex> = create_buffer(
-            &self.allocator,
-            vertices.len() as u32,
-            vk::BufferUsageFlags::VERTEX_BUFFER
-                | vk::BufferUsageFlags::TRANSFER_DST
-                | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-            vk_mem::MemoryUsage::AutoPreferDevice,
-        );
-
-        // Wait for all frames to be completed before proceeding.
-        unsafe {
-            self.device
-                .wait_for_fences(
-                    &self
-                        .frame_sync_primitives
-                        .iter()
-                        .map(|p| p.frame_in_flight)
-                        .collect::<Vec<_>>(),
-                    true,
-                    u64::MAX,
+            scene_cmd_buffers: self
+                .device
+                .allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default()
+                        .command_pool(self.cmd_pool)
+                        .level(vk::CommandBufferLevel::SECONDARY)
+                        .command_buffer_count(self.swapchain_images.len() as u32),
                 )
-                .unwrap();
-        }
+                .unwrap()
+                .into_boxed_slice(),
 
-        // Swap buffers.
-        unsafe {
-            let temp = std::mem::replace(&mut self.object_buffer, object_buffer);
-            if let Some(mut alloc) = temp.alloc {
-                self.allocator.destroy_buffer(temp.buffer, &mut alloc);
-            }
-            let temp = std::mem::replace(&mut self.instance_buffer, instance_buffer);
-            if let Some(mut alloc) = temp.alloc {
-                self.allocator.destroy_buffer(temp.buffer, &mut alloc);
-            }
-            let temp = std::mem::replace(&mut self.meshlet_data_buffer, meshlet_data_buffer);
-            if let Some(mut alloc) = temp.alloc {
-                self.allocator.destroy_buffer(temp.buffer, &mut alloc);
-            }
-            let temp = std::mem::replace(&mut self.indirect_cmd_buffer, indirect_cmd_buffer);
-            if let Some(mut alloc) = temp.alloc {
-                self.allocator.destroy_buffer(temp.buffer, &mut alloc);
-            }
-            let temp = std::mem::replace(&mut self.index_buffer, index_buffer);
-            if let Some(mut alloc) = temp.alloc {
-                self.allocator.destroy_buffer(temp.buffer, &mut alloc);
-            }
-            let temp = std::mem::replace(&mut self.vertex_buffer, vertex_buffer);
-            if let Some(mut alloc) = temp.alloc {
-                self.allocator.destroy_buffer(temp.buffer, &mut alloc);
-            }
-        }
+            index_buffer: create_buffer(
+                &self.allocator,
+                indices.len() as u32,
+                vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+                vk_mem::MemoryUsage::AutoPreferDevice,
+            ),
+            vertex_buffer: create_buffer(
+                &self.allocator,
+                vertices.len() as u32,
+                vk::BufferUsageFlags::VERTEX_BUFFER
+                    | vk::BufferUsageFlags::TRANSFER_DST
+                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                vk_mem::MemoryUsage::AutoPreferDevice,
+            ),
+            object_buffer: create_buffer(
+                &self.allocator,
+                self.objects.len() as u32,
+                vk::BufferUsageFlags::STORAGE_BUFFER
+                    | vk::BufferUsageFlags::TRANSFER_DST
+                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                vk_mem::MemoryUsage::AutoPreferDevice,
+            ),
+
+            instance_buffer: create_buffer(
+                &self.allocator,
+                instances,
+                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                vk_mem::MemoryUsage::AutoPreferDevice,
+            ),
+
+            meshlet_data_buffer: create_buffer(
+                &self.allocator,
+                instances,
+                vk::BufferUsageFlags::STORAGE_BUFFER
+                    | vk::BufferUsageFlags::TRANSFER_DST
+                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                vk_mem::MemoryUsage::AutoPreferDevice,
+            ),
+
+            indirect_cmd_buffer: create_buffer(
+                &self.allocator,
+                instances,
+                vk::BufferUsageFlags::STORAGE_BUFFER
+                    | vk::BufferUsageFlags::INDIRECT_BUFFER
+                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                vk_mem::MemoryUsage::AutoPreferDevice,
+            ),
+
+            indirect_count_buffer: create_buffer(
+                &self.allocator,
+                1,
+                vk::BufferUsageFlags::STORAGE_BUFFER
+                    | vk::BufferUsageFlags::INDIRECT_BUFFER
+                    | vk::BufferUsageFlags::TRANSFER_DST
+                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                vk_mem::MemoryUsage::AutoPreferDevice,
+            ),
+
+            meshlet_cull_global_buffer: create_buffer(
+                &self.allocator,
+                1,
+                vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+                vk_mem::MemoryUsage::AutoPreferDevice,
+            ),
+
+            meshlet_render_global_buffer: create_buffer(
+                &self.allocator,
+                1,
+                vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+                vk_mem::MemoryUsage::AutoPreferDevice,
+            ),
+        };
+
+        self.device
+            .reset_command_buffer(
+                self.staging_cmd_buffer,
+                vk::CommandBufferResetFlags::empty(),
+            )
+            .unwrap();
+        self.device
+            .begin_command_buffer(
+                self.staging_cmd_buffer,
+                &vk::CommandBufferBeginInfo::default(),
+            )
+            .unwrap();
+
+        // Upload.
+        self.staging_buffer.reset();
+        self.staging_buffer.stage_buffer(
+            &self.device,
+            self.staging_cmd_buffer,
+            &frame.index_buffer,
+            0,
+            indices,
+        );
+        self.staging_buffer.stage_buffer(
+            &self.device,
+            self.staging_cmd_buffer,
+            &frame.vertex_buffer,
+            0,
+            vertices,
+        );
+        self.staging_buffer.stage_buffer(
+            &self.device,
+            self.staging_cmd_buffer,
+            &frame.meshlet_data_buffer,
+            0,
+            meshlet_data,
+        );
+
+        // Submit & wait.
+        self.device
+            .end_command_buffer(self.staging_cmd_buffer)
+            .unwrap();
+        self.device.reset_fences(&[self.staging_fence]).unwrap();
+        self.device
+            .queue_submit(
+                self.graphics_queue,
+                &[vk::SubmitInfo::default().command_buffers(&[self.staging_cmd_buffer])],
+                self.staging_fence,
+            )
+            .unwrap();
 
         // Rerecord scene command buffers.
         for i in 0..self.swapchain_images.len() {
-            let command_buffer = self.scene_cmd_buffers[i];
+            let command_buffer = frame.scene_cmd_buffers[i];
             let image = self.swapchain_images[i];
             let color_view = self.swapchain_color_views[i];
             let depth_view = self.swapchain_depth_views[i];
@@ -812,16 +872,16 @@ impl Renderer {
 
                 self.device.cmd_bind_index_buffer(
                     command_buffer,
-                    self.index_buffer.vk_handle(),
+                    frame.index_buffer.vk_handle(),
                     0,
                     vk::IndexType::UINT32,
                 );
 
                 self.device.cmd_draw_indexed_indirect_count(
                     command_buffer,
-                    self.indirect_cmd_buffer.vk_handle(),
+                    frame.indirect_cmd_buffer.vk_handle(),
                     0,
-                    self.indirect_count_buffer.vk_handle(),
+                    frame.indirect_count_buffer.vk_handle(),
                     0,
                     instances,
                     size_of::<vk::DrawIndexedIndirectCommand>() as u32,
@@ -880,7 +940,7 @@ impl Renderer {
                             .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                             .descriptor_count(1)
                             .buffer_info(&[vk::DescriptorBufferInfo::default()
-                                .buffer(self.meshlet_cull_global_buffer.vk_handle())
+                                .buffer(frame.meshlet_cull_global_buffer.vk_handle())
                                 .offset(0)
                                 .range(vk::WHOLE_SIZE)]),
                         //
@@ -891,7 +951,7 @@ impl Renderer {
                             .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                             .descriptor_count(1)
                             .buffer_info(&[vk::DescriptorBufferInfo::default()
-                                .buffer(self.meshlet_render_global_buffer.vk_handle())
+                                .buffer(frame.meshlet_render_global_buffer.vk_handle())
                                 .offset(0)
                                 .range(vk::WHOLE_SIZE)]),
                         /*vk::WriteDescriptorSet::default()
@@ -911,7 +971,7 @@ impl Renderer {
                             .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
                             .descriptor_count(1)
                             .buffer_info(&[vk::DescriptorBufferInfo::default()
-                                .buffer(self.object_buffer.vk_handle())
+                                .buffer(frame.object_buffer.vk_handle())
                                 .offset(0)
                                 .range(vk::WHOLE_SIZE)]),
                     ],
@@ -920,7 +980,12 @@ impl Renderer {
             }
         }
 
-        (indices, vertices, meshlet_data)
+        // Wait for transfer to complete before returning.
+        self.device
+            .wait_for_fences(&[self.staging_fence], true, u64::MAX)
+            .unwrap();
+
+        frame
     }
 
     pub fn create_object(
@@ -1448,7 +1513,7 @@ impl Renderer {
                 )
                 .unwrap();
 
-            // Single primary buffer.
+            // Per-frame recorded render buffers.
             let render_cmd_buffers = device
                 .allocate_command_buffers(
                     &vk::CommandBufferAllocateInfo::default()
@@ -1459,62 +1524,24 @@ impl Renderer {
                 .unwrap()
                 .into_boxed_slice();
 
-            // Create scene buffer for each swapchain image.
-            let scene_cmd_buffers = device
+            // Staging data.
+            let staging_buffer = StagingBuffer::new(10000000, &allocator);
+
+            let staging_cmd_buffer = device
                 .allocate_command_buffers(
                     &vk::CommandBufferAllocateInfo::default()
                         .command_pool(cmd_pool)
-                        .level(vk::CommandBufferLevel::SECONDARY)
-                        .command_buffer_count(swapchain_images.len() as u32),
+                        .level(vk::CommandBufferLevel::PRIMARY)
+                        .command_buffer_count(1),
                 )
-                .unwrap()
-                .into_boxed_slice();
+                .unwrap()[0];
 
-            // Synchronization primitives for each frame.
-            let max_frames_in_flight = 1;
-            let frame_sync_primitives = (0..max_frames_in_flight)
-                .map(|_| FrameSyncPrimitives {
-                    image_available: device
-                        .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
-                        .unwrap(),
-                    render_finished: device
-                        .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
-                        .unwrap(),
-                    frame_in_flight: device
-                        .create_fence(
-                            &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
-                            None,
-                        )
-                        .unwrap(),
-                })
-                .collect();
-
-            // Various buffers.
-            let staging_buffer = StagingBuffer::new(10000000, &allocator);
-
-            let indirect_count_buffer: Buffer<u32> = create_buffer(
-                &allocator,
-                1,
-                vk::BufferUsageFlags::STORAGE_BUFFER
-                    | vk::BufferUsageFlags::INDIRECT_BUFFER
-                    | vk::BufferUsageFlags::TRANSFER_DST
-                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-                vk_mem::MemoryUsage::AutoPreferDevice,
-            );
-
-            let meshlet_cull_global_buffer: Buffer<MeshletCullGlobal> = create_buffer(
-                &allocator,
-                1,
-                vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-                vk_mem::MemoryUsage::AutoPreferDevice,
-            );
-
-            let meshlet_render_global_buffer: Buffer<MeshletRenderGlobal> = create_buffer(
-                &allocator,
-                1,
-                vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-                vk_mem::MemoryUsage::AutoPreferDevice,
-            );
+            let staging_fence = device
+                .create_fence(
+                    &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+                    None,
+                )
+                .unwrap();
 
             //
             Self {
@@ -1545,11 +1572,8 @@ impl Renderer {
                 swapchain_color_views,
                 swapchain_depth_views,
 
-                frame_sync_primitives,
-
                 cmd_pool,
                 render_cmd_buffers,
-                scene_cmd_buffers,
 
                 render_set,
                 render_set_layout,
@@ -1567,15 +1591,11 @@ impl Renderer {
                 objects: HashMap::new(),
 
                 staging_buffer,
-                index_buffer: Buffer::null(),
-                object_buffer: Buffer::null(),
-                instance_buffer: Buffer::null(),
-                meshlet_data_buffer: Buffer::null(),
-                meshlet_cull_global_buffer,
-                meshlet_render_global_buffer,
-                indirect_cmd_buffer: Buffer::null(),
-                indirect_count_buffer,
-                vertex_buffer: Buffer::null(),
+                staging_cmd_buffer,
+                staging_fence,
+
+                current_frame: Frame::null(),
+                next_frame: None,
 
                 frame: 0,
                 cam_pos: <_>::default(),
