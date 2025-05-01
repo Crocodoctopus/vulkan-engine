@@ -16,7 +16,6 @@ use crate::staging::StagingBuffer;
 #[derive(Copy, Clone, Debug)]
 struct MeshletRenderGlobal {
     pv: Mat4,
-    vertex_buffer: vk::DeviceAddress,
     instance_buffer: vk::DeviceAddress,
     object_buffer: vk::DeviceAddress,
 }
@@ -41,6 +40,7 @@ struct MeshletCullGlobal {
 #[repr(C, align(16))]
 struct Object {
     model: Mat4,
+    vertex_buffer: vk::DeviceAddress,
     texture_id: u32,
 }
 
@@ -163,9 +163,9 @@ struct ObjectInstance {
     scale: Vec3,
 }
 
-#[derive(Copy, Clone, Hash, Eq, PartialEq)]
+#[derive(Copy, Clone, Hash, Eq, PartialEq, Debug)]
 pub struct MeshHandle(u32);
-#[derive(Copy, Clone, Hash, Eq, PartialEq)]
+#[derive(Copy, Clone, Hash, Eq, PartialEq, Debug)]
 pub struct ObjectHandle(u32);
 
 #[derive(Copy, Clone)]
@@ -184,7 +184,6 @@ struct Frame {
 
     // Various buffers.
     index_buffer: Buffer<u32>,
-    vertex_buffer: Buffer<Vertex>,
     object_buffer: Buffer<Object>,
     instance_buffer: Buffer<Instance>,
     meshlet_data_buffer: Buffer<MeshletData>,
@@ -200,7 +199,6 @@ impl Frame {
             sync_primitives: Box::new([]),
             scene_cmd_buffers: Box::new([]),
             index_buffer: Buffer::null(),
-            vertex_buffer: Buffer::null(),
             object_buffer: Buffer::null(),
             instance_buffer: Buffer::null(),
             meshlet_data_buffer: Buffer::null(),
@@ -214,32 +212,32 @@ impl Frame {
 
 pub struct Renderer {
     // Various Vulkan state data.
-    pub entry: ash::Entry,
-    pub instance: ash::Instance,
-    pub physical_device: vk::PhysicalDevice,
+    entry: ash::Entry,
+    instance: ash::Instance,
+    physical_device: vk::PhysicalDevice,
 
-    pub surface_instance: khr::surface::Instance,
-    pub surface: vk::SurfaceKHR,
-    pub surface_format: vk::SurfaceFormatKHR,
-    pub surface_capabilities: vk::SurfaceCapabilitiesKHR,
-    pub surface_extent: vk::Extent2D,
+    surface_instance: khr::surface::Instance,
+    surface: vk::SurfaceKHR,
+    surface_format: vk::SurfaceFormatKHR,
+    surface_capabilities: vk::SurfaceCapabilitiesKHR,
+    surface_extent: vk::Extent2D,
 
-    pub device: ash::Device,
-    pub queue_family_index: u32,
-    pub graphics_queue: vk::Queue,
-    pub present_queue: vk::Queue,
-    //pub transfer_queue: vk::Queue,
+    device: ash::Device,
+    queue_family_index: u32,
+    graphics_queue: vk::Queue,
+    present_queue: vk::Queue,
+    //transfer_queue: vk::Queue,
 
     // Generic memory allocator.
-    pub allocator: vk_mem::Allocator,
+    allocator: vk_mem::Allocator,
 
     // Swapchain data.
-    pub swapchain_device: khr::swapchain::Device,
-    pub swapchain: vk::SwapchainKHR,
-    pub depth_image: (vk::Image, vk_mem::Allocation),
-    pub swapchain_images: Box<[vk::Image]>,
-    pub swapchain_color_views: Box<[vk::ImageView]>,
-    pub swapchain_depth_views: Box<[vk::ImageView]>,
+    swapchain_device: khr::swapchain::Device,
+    swapchain: vk::SwapchainKHR,
+    depth_image: (vk::Image, vk_mem::Allocation),
+    swapchain_images: Box<[vk::Image]>,
+    swapchain_color_views: Box<[vk::ImageView]>,
+    swapchain_depth_views: Box<[vk::ImageView]>,
 
     // Command pool.
     cmd_pool: vk::CommandPool,
@@ -261,6 +259,7 @@ pub struct Renderer {
     resource_counter: u32,
     meshes: HashMap<MeshHandle, Box<[Meshlet]>>,
     objects: HashMap<ObjectHandle, ObjectInstance>,
+    vertex_buffers: HashMap<MeshHandle, Buffer<Vertex>>,
 
     // Staging.
     staging_buffer: StagingBuffer,
@@ -316,7 +315,6 @@ impl Renderer {
                             .free_command_buffers(self.cmd_pool, &frame.scene_cmd_buffers);
                     }
                     destroy_buffer(&self.allocator, frame.index_buffer);
-                    destroy_buffer(&self.allocator, frame.vertex_buffer);
                     destroy_buffer(&self.allocator, frame.object_buffer);
                     destroy_buffer(&self.allocator, frame.instance_buffer);
                     destroy_buffer(&self.allocator, frame.meshlet_data_buffer);
@@ -337,7 +335,6 @@ impl Renderer {
             None => &self.current_frame,
         };
 
-        println!("Starting on {}.", self.frame);
         let frame_index = self.frame % frame.sync_primitives.len();
         self.frame += 1;
 
@@ -378,6 +375,10 @@ impl Renderer {
                     model: Mat4::from_translation(obj.position)
                         * Mat4::from_scale(obj.scale)
                         * Mat4::from_quat(obj.orientation),
+                    vertex_buffer: self.device.get_buffer_device_address(
+                        &vk::BufferDeviceAddressInfo::default()
+                            .buffer(self.vertex_buffers.get(&obj.mesh).unwrap().vk_handle()),
+                    ),
                     texture_id: 0,
                 });
 
@@ -428,10 +429,6 @@ impl Renderer {
                         0,
                         [MeshletRenderGlobal {
                             pv: projection * view,
-                            vertex_buffer: self.device.get_buffer_device_address(
-                                &vk::BufferDeviceAddressInfo::default()
-                                    .buffer(frame.vertex_buffer.vk_handle()),
-                            ),
                             instance_buffer: self.device.get_buffer_device_address(
                                 &vk::BufferDeviceAddressInfo::default()
                                     .buffer(frame.instance_buffer.vk_handle()),
@@ -516,72 +513,89 @@ impl Renderer {
     }
 
     unsafe fn rebuild_scene(&mut self) -> Frame {
-        // Build scene buffer data.
-        let (indices, vertices, meshlet_data) = {
-            // Create a single gigabuffer.
-            let mut vertices = vec![];
-            let mut indices = vec![];
-            let mut offset_map = HashMap::<MeshHandle, u32>::new();
-            for (id, mesh) in self.meshes.iter() {
-                // Push the base index offset for this mesh.
-                offset_map.insert(*id, indices.len() as u32);
+        // Generate vertex data for newly added meshes.
+        let new_meshes: HashMap<MeshHandle, Box<[Vertex]>> = self
+            .meshes
+            .iter()
+            .filter(|(k, v)| !self.vertex_buffers.contains_key(k))
+            .map(|(id, mesh)| {
+                (
+                    *id,
+                    mesh.iter()
+                        .flat_map(|meshlet| {
+                            (0..meshlet.positions.len() / 3).map(|i| Vertex {
+                                position: Vec3::new(
+                                    meshlet.positions[3 * i],
+                                    meshlet.positions[3 * i + 1],
+                                    meshlet.positions[3 * i + 2],
+                                ),
+                                u: 0., //meshlet.texcoords[2 * i],
+                                normal: Vec3::splat(0.0),
+                                /*normals: Vec3::new(
+                                    meshlet.normals[3 * i],
+                                    meshlet.normals[3 * i + 1],
+                                    meshlet.normals[3 * i + 2],
+                                )*/
+                                v: 0., //meshlet.texcoords[2 * i + 1],
+                                color: Vec4::splat(1.0),
+                            })
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
 
-                // Extend index and vertex buffers.
-                for meshlet in mesh {
-                    let offset = vertices.len();
-                    indices.extend(
-                        meshlet
-                            .indices
-                            .iter()
-                            .map(|&index| index as u32 + offset as u32),
-                    );
+        // Create new buffers for newly added meshes.
+        for (id, vertices) in &new_meshes {
+            self.vertex_buffers.insert(
+                *id,
+                create_buffer(
+                    &self.allocator,
+                    vertices.len() as u32,
+                    vk::BufferUsageFlags::VERTEX_BUFFER
+                        | vk::BufferUsageFlags::TRANSFER_DST
+                        | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                    vk_mem::MemoryUsage::AutoPreferDevice,
+                ),
+            );
+        }
 
-                    vertices.extend((0..meshlet.positions.len() / 3).map(|i| Vertex {
-                        position: Vec3::new(
-                            meshlet.positions[3 * i],
-                            meshlet.positions[3 * i + 1],
-                            meshlet.positions[3 * i + 2],
-                        ),
-                        u: 0., //meshlet.texcoords[2 * i],
-                        normal: Vec3::splat(0.0),
-                        /*normals: Vec3::new(
-                            meshlet.normals[3 * i],
-                            meshlet.normals[3 * i + 1],
-                            meshlet.normals[3 * i + 2],
-                        )*/
-                        v: 0., //meshlet.texcoords[2 * i + 1],
-                        color: Vec4::splat(1.0),
-                    }));
-                }
+        // Generate index and meshlet data for object set.
+        let mut indices = vec![];
+        let mut meshlet_data = vec![];
+        let mut instances = 0u32;
+        for (i, object) in self.objects.values().enumerate() {
+            // Get associated mesh and index offset.
+            let mesh = self.meshes.get(&object.mesh).unwrap();
+
+            // Indices.
+            let mut offset = 0u32;
+            for meshlet in mesh {
+                indices.extend(meshlet.indices.iter().map(|&index| index as u32 + offset));
+                offset += meshlet.positions.len() as u32 / 3;
             }
 
-            let mut meshlet_data = vec![];
-            for (i, object) in self.objects.values().enumerate() {
-                // Get associated mesh and index offset.
-                let mesh = self.meshes.get(&object.mesh).unwrap();
-                let mut first_index = *offset_map.get(&object.mesh).unwrap();
-
-                // Generate meshlet data.
-                for meshlet in mesh {
-                    meshlet_data.push(MeshletData {
-                        center: meshlet.center,
-                        radius: meshlet.radius,
-                        cone_apex: meshlet.cone_apex,
-                        pad0: 0.,
-                        cone_axis: meshlet.cone_axis,
-                        cone_cutoff: meshlet.cone_cutoff,
-                        object_id: i as u32,
-                        index_count: meshlet.indices.len() as u32,
-                        first_index,
-                    });
-                    first_index += meshlet.indices.len() as u32;
-                }
+            // Mesh data.
+            let mut first_index = 0;
+            for meshlet in mesh {
+                meshlet_data.push(MeshletData {
+                    center: meshlet.center,
+                    radius: meshlet.radius,
+                    cone_apex: meshlet.cone_apex,
+                    pad0: 0.,
+                    cone_axis: meshlet.cone_axis,
+                    cone_cutoff: meshlet.cone_cutoff,
+                    object_id: i as u32,
+                    index_count: meshlet.indices.len() as u32,
+                    first_index,
+                });
+                first_index += meshlet.indices.len() as u32;
+                instances += 1;
             }
+        }
+        println!("{instances}");
 
-            (indices, vertices, meshlet_data)
-        };
-        let instances = meshlet_data.len() as u32;
-
+        // TODO: split this up.
         let max_frames_in_flight = 2;
         let frame = Frame {
             sync_primitives: (0..max_frames_in_flight)
@@ -619,14 +633,6 @@ impl Renderer {
                 &self.allocator,
                 indices.len() as u32,
                 vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-                vk_mem::MemoryUsage::AutoPreferDevice,
-            ),
-            vertex_buffer: create_buffer(
-                &self.allocator,
-                vertices.len() as u32,
-                vk::BufferUsageFlags::VERTEX_BUFFER
-                    | vk::BufferUsageFlags::TRANSFER_DST
-                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
                 vk_mem::MemoryUsage::AutoPreferDevice,
             ),
             object_buffer: create_buffer(
@@ -710,13 +716,15 @@ impl Renderer {
             0,
             indices,
         );
-        self.staging_buffer.stage_buffer(
-            &self.device,
-            self.staging_cmd_buffer,
-            &frame.vertex_buffer,
-            0,
-            vertices,
-        );
+        for (id, vertices) in &new_meshes {
+            self.staging_buffer.stage_buffer(
+                &self.device,
+                self.staging_cmd_buffer,
+                self.vertex_buffers.get(id).unwrap(),
+                0,
+                vertices,
+            );
+        }
         self.staging_buffer.stage_buffer(
             &self.device,
             self.staging_cmd_buffer,
@@ -725,7 +733,7 @@ impl Renderer {
             meshlet_data,
         );
 
-        // Submit & wait.
+        // Submit (& wait at end of function).
         self.device
             .end_command_buffer(self.staging_cmd_buffer)
             .unwrap();
@@ -1589,6 +1597,7 @@ impl Renderer {
                 resource_counter: 0,
                 meshes: HashMap::new(),
                 objects: HashMap::new(),
+                vertex_buffers: HashMap::new(),
 
                 staging_buffer,
                 staging_cmd_buffer,

@@ -9,18 +9,20 @@ struct Vertex {
     vec4 color;
 };
 
+layout (buffer_reference, std430) readonly buffer VertexBuffer {
+    Vertex data[];
+};
+
 struct Instance {
     uint object_id;   
 };
 
 struct Object {
     mat4 model;
+    VertexBuffer vertex_buffer;
     uint tex_id;
 };
 
-layout (buffer_reference, std430) readonly buffer VertexBuffer {
-    Vertex data[];
-};
 
 layout (buffer_reference, std430) readonly buffer InstanceBuffer {
     Instance data[];
@@ -33,7 +35,6 @@ layout (buffer_reference, std430) readonly buffer ObjectBuffer {
 
 layout (set = 0, binding = 0) uniform Global {
     mat4 pv;
-    VertexBuffer vertex_buffer;
     InstanceBuffer instance_buffer;
     ObjectBuffer object_buffer;
 };
@@ -62,14 +63,13 @@ vec4 colors[14] = {
 };
 
 void main() {
-    // Currently only one object.
     Instance instance = instance_buffer.data[gl_DrawID];
     Object object = object_buffer.data[instance.object_id];
-    Vertex vert = vertex_buffer.data[gl_VertexIndex];
+    Vertex vert = object.vertex_buffer.data[gl_VertexIndex];
 
     //
     gl_Position = pv * object.model * vec4(vert.position, 1.0);
     frag_uv = vec2(vert.u, vert.v);
     frag_tex_id = object.tex_id;
-    frag_color = colors[gl_DrawID % 14];
+    frag_color = colors[6];//gl_DrawID % 14];
 }
