@@ -88,6 +88,7 @@ void main() {
     Object object = object_buffer.data[meshlet.object_id];
 
     // Frustum cull.
+    /*
     vec4 center = view * object.model * vec4(meshlet.center, 1.0);
     float radius = meshlet.radius;
 
@@ -107,13 +108,15 @@ void main() {
 		meshlet.cone_axis, 0.0)).xyz;
 
 	float cone_cutoff = meshlet.cone_cutoff;
-	
+*/	
     //if (dot(normalize(cone_apex - camera_position), cone_axis) >= cone_cutoff) return;
     // `dot(normalize(cone_apex - camera_position), cone_axis) >= cone_cutoff`
 
     // Append draw command.
     const uint i = atomicAdd(draw_count_buffer.counter, 1);
+    //memoryBarrierBuffer();
     //uint i = gl_GlobalInvocationID.x;
+    //draw_count_buffer.counter = 156;
     draw_cmd_buffer.data[i].index_count = meshlet.index_count;
     draw_cmd_buffer.data[i].first_index = meshlet.first_index;
     draw_cmd_buffer.data[i].instance_count = 1;

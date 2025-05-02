@@ -593,7 +593,6 @@ impl Renderer {
                 instances += 1;
             }
         }
-        println!("{instances}");
 
         // TODO: split this up.
         let max_frames_in_flight = 2;
@@ -787,126 +786,134 @@ impl Renderer {
                         .cmd_dispatch(command_buffer, instances.div_ceil(64), 1, 1);
                 }
 
-                // Convert VK_IMAGE_LAYOUT_UNDEFINED -> VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL.
-                self.device.cmd_pipeline_barrier(
+                self.device.cmd_pipeline_barrier2(
                     command_buffer,
-                    vk::PipelineStageFlags::TOP_OF_PIPE,
-                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    &[
-                        vk::ImageMemoryBarrier::default()
-                            .image(image)
-                            .subresource_range(
-                                vk::ImageSubresourceRange::default()
-                                    .aspect_mask(vk::ImageAspectFlags::COLOR)
-                                    .base_mip_level(0)
-                                    .level_count(1)
-                                    .base_array_layer(0)
-                                    .layer_count(1),
-                            )
-                            .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-                            .old_layout(vk::ImageLayout::UNDEFINED)
-                            .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
-                        vk::ImageMemoryBarrier::default()
-                            .image(self.depth_image.0)
-                            .subresource_range(
-                                vk::ImageSubresourceRange::default()
-                                    .aspect_mask(vk::ImageAspectFlags::DEPTH)
-                                    .base_mip_level(0)
-                                    .level_count(1)
-                                    .base_array_layer(0)
-                                    .layer_count(1),
-                            )
-                            .dst_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
-                            .old_layout(vk::ImageLayout::UNDEFINED)
-                            .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL),
-                    ],
+                    &vk::DependencyInfo::default()
+                        .memory_barriers(&[
+                            //
+                            vk::MemoryBarrier2::default()
+                                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                                .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
+                                .dst_stage_mask(vk::PipelineStageFlags2::INDEX_INPUT)
+                                .dst_access_mask(vk::AccessFlags2::MEMORY_READ),
+                        ])
+                        .image_memory_barriers(&[
+                            // Convert VK_IMAGE_LAYOUT_UNDEFINED -> VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL.
+                            vk::ImageMemoryBarrier2::default()
+                                .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
+                                .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                                .image(image)
+                                .subresource_range(
+                                    vk::ImageSubresourceRange::default()
+                                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                        .base_mip_level(0)
+                                        .level_count(1)
+                                        .base_array_layer(0)
+                                        .layer_count(1),
+                                )
+                                .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                                .old_layout(vk::ImageLayout::UNDEFINED)
+                                .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
+                            //
+                            vk::ImageMemoryBarrier2::default()
+                                .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
+                                .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                                .image(self.depth_image.0)
+                                .subresource_range(
+                                    vk::ImageSubresourceRange::default()
+                                        .aspect_mask(vk::ImageAspectFlags::DEPTH)
+                                        .base_mip_level(0)
+                                        .level_count(1)
+                                        .base_array_layer(0)
+                                        .layer_count(1),
+                                )
+                                .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                                .old_layout(vk::ImageLayout::UNDEFINED)
+                                .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL),
+                        ]),
                 );
 
                 // Begin rendering.
-                self.device.cmd_begin_rendering(
-                    command_buffer,
-                    &vk::RenderingInfo::default()
-                        .render_area(vk::Rect2D {
-                            offset: vk::Offset2D { x: 0, y: 0 },
-                            extent: vk::Extent2D {
-                                width: self.surface_extent.width,
-                                height: self.surface_extent.height,
-                            },
-                        })
-                        .layer_count(1)
-                        .depth_attachment(
-                            &vk::RenderingAttachmentInfo::default()
-                                .image_view(depth_view)
-                                .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                {
+                    self.device.cmd_begin_rendering(
+                        command_buffer,
+                        &vk::RenderingInfo::default()
+                            .render_area(vk::Rect2D {
+                                offset: vk::Offset2D { x: 0, y: 0 },
+                                extent: vk::Extent2D {
+                                    width: self.surface_extent.width,
+                                    height: self.surface_extent.height,
+                                },
+                            })
+                            .layer_count(1)
+                            .depth_attachment(
+                                &vk::RenderingAttachmentInfo::default()
+                                    .image_view(depth_view)
+                                    .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                                    .load_op(vk::AttachmentLoadOp::CLEAR)
+                                    .store_op(vk::AttachmentStoreOp::STORE)
+                                    .clear_value(vk::ClearValue {
+                                        depth_stencil: vk::ClearDepthStencilValue {
+                                            depth: 1.0,
+                                            stencil: 0,
+                                        },
+                                    }),
+                            )
+                            .color_attachments(&[vk::RenderingAttachmentInfo::default()
+                                .image_view(color_view)
+                                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                                 .load_op(vk::AttachmentLoadOp::CLEAR)
                                 .store_op(vk::AttachmentStoreOp::STORE)
                                 .clear_value(vk::ClearValue {
-                                    depth_stencil: vk::ClearDepthStencilValue {
-                                        depth: 1.0,
-                                        stencil: 0,
+                                    color: vk::ClearColorValue {
+                                        float32: [0.0, 0.0, 0.0, 1.0],
                                     },
-                                }),
-                        )
-                        .color_attachments(&[vk::RenderingAttachmentInfo::default()
-                            .image_view(color_view)
-                            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                            .load_op(vk::AttachmentLoadOp::CLEAR)
-                            .store_op(vk::AttachmentStoreOp::STORE)
-                            .clear_value(vk::ClearValue {
-                                color: vk::ClearColorValue {
-                                    float32: [0.0, 0.0, 0.0, 1.0],
-                                },
-                            })]),
-                );
+                                })]),
+                    );
 
-                // Begin draw calls.
-                self.device.cmd_bind_descriptor_sets(
+                    // Begin draw calls.
+                    self.device.cmd_bind_descriptor_sets(
+                        command_buffer,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        self.render_pipeline_layout,
+                        0,
+                        &[self.render_set],
+                        &[],
+                    );
+
+                    self.device.cmd_bind_pipeline(
+                        command_buffer,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        self.render_pipeline,
+                    );
+
+                    self.device.cmd_bind_index_buffer(
+                        command_buffer,
+                        frame.index_buffer.vk_handle(),
+                        0,
+                        vk::IndexType::UINT32,
+                    );
+
+                    self.device.cmd_draw_indexed_indirect_count(
+                        command_buffer,
+                        frame.indirect_cmd_buffer.vk_handle(),
+                        0,
+                        frame.indirect_count_buffer.vk_handle(),
+                        0,
+                        instances,
+                        size_of::<vk::DrawIndexedIndirectCommand>() as u32,
+                    );
+
+                    self.device.cmd_end_rendering(command_buffer);
+                }
+
+                self.device.cmd_pipeline_barrier2(
                     command_buffer,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    self.render_pipeline_layout,
-                    0,
-                    &[self.render_set],
-                    &[],
-                );
-
-                self.device.cmd_bind_pipeline(
-                    command_buffer,
-                    vk::PipelineBindPoint::GRAPHICS,
-                    self.render_pipeline,
-                );
-
-                self.device.cmd_bind_index_buffer(
-                    command_buffer,
-                    frame.index_buffer.vk_handle(),
-                    0,
-                    vk::IndexType::UINT32,
-                );
-
-                self.device.cmd_draw_indexed_indirect_count(
-                    command_buffer,
-                    frame.indirect_cmd_buffer.vk_handle(),
-                    0,
-                    frame.indirect_count_buffer.vk_handle(),
-                    0,
-                    instances,
-                    size_of::<vk::DrawIndexedIndirectCommand>() as u32,
-                );
-
-                self.device.cmd_end_rendering(command_buffer);
-
-                // Convert VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL -> VK_IMAGE_LAYOUT_PRESENT_SRC_KHR.
-                self.device.cmd_pipeline_barrier(
-                    command_buffer,
-                    vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT,
-                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                    vk::DependencyFlags::empty(),
-                    &[],
-                    &[],
-                    &[
-                        vk::ImageMemoryBarrier::default()
+                    &vk::DependencyInfo::default().image_memory_barriers(&[
+                        // Convert VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL -> VK_IMAGE_LAYOUT_PRESENT_SRC_KHR.
+                        vk::ImageMemoryBarrier2::default()
+                            .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                            .dst_stage_mask(vk::PipelineStageFlags2::BOTTOM_OF_PIPE)
                             .image(image)
                             .subresource_range(
                                 vk::ImageSubresourceRange::default()
@@ -916,10 +923,13 @@ impl Renderer {
                                     .base_array_layer(0)
                                     .layer_count(1),
                             )
-                            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                            .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
                             .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
                             .new_layout(vk::ImageLayout::PRESENT_SRC_KHR),
-                        vk::ImageMemoryBarrier::default()
+                        //
+                        vk::ImageMemoryBarrier2::default()
+                            .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                            .dst_stage_mask(vk::PipelineStageFlags2::BOTTOM_OF_PIPE)
                             .image(self.depth_image.0)
                             .subresource_range(
                                 vk::ImageSubresourceRange::default()
@@ -929,10 +939,10 @@ impl Renderer {
                                     .base_array_layer(0)
                                     .layer_count(1),
                             )
-                            .src_access_mask(vk::AccessFlags::COLOR_ATTACHMENT_WRITE)
+                            .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
                             .old_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
                             .new_layout(vk::ImageLayout::PRESENT_SRC_KHR),
-                    ],
+                    ]),
                 );
 
                 // End recording.
@@ -960,26 +970,6 @@ impl Renderer {
                             .descriptor_count(1)
                             .buffer_info(&[vk::DescriptorBufferInfo::default()
                                 .buffer(frame.meshlet_render_global_buffer.vk_handle())
-                                .offset(0)
-                                .range(vk::WHOLE_SIZE)]),
-                        /*vk::WriteDescriptorSet::default()
-                        .dst_set(global_set)
-                        .dst_binding(1)
-                        .dst_array_element(0)
-                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                        .descriptor_count(1)
-                        .image_info(&[vk::DescriptorImageInfo::default()
-                            .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                            .image_view(viking_room_view)
-                            .sampler(viking_room_sampler)]),*/
-                        vk::WriteDescriptorSet::default()
-                            .dst_set(self.render_set)
-                            .dst_binding(2)
-                            .dst_array_element(0)
-                            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                            .descriptor_count(1)
-                            .buffer_info(&[vk::DescriptorBufferInfo::default()
-                                .buffer(frame.object_buffer.vk_handle())
                                 .offset(0)
                                 .range(vk::WHOLE_SIZE)]),
                     ],
@@ -1150,8 +1140,9 @@ impl Renderer {
                         .descriptor_indexing(true)
                         .runtime_descriptor_array(true);
 
-                    let mut vk13features =
-                        vk::PhysicalDeviceVulkan13Features::default().dynamic_rendering(true);
+                    let mut vk13features = vk::PhysicalDeviceVulkan13Features::default()
+                        .dynamic_rendering(true)
+                        .synchronization2(true);
 
                     let priority = [1.0];
 
@@ -1297,8 +1288,6 @@ impl Renderer {
                                         | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
                                     vk::DescriptorBindingFlags::PARTIALLY_BOUND
                                         | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
-                                    vk::DescriptorBindingFlags::PARTIALLY_BOUND
-                                        | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
                                 ]),
                         )
                         .bindings(&[
@@ -1312,11 +1301,6 @@ impl Renderer {
                                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                                 .descriptor_count(1024)
                                 .stage_flags(vk::ShaderStageFlags::FRAGMENT),
-                            vk::DescriptorSetLayoutBinding::default()
-                                .binding(2)
-                                .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
-                                .descriptor_count(1)
-                                .stage_flags(vk::ShaderStageFlags::VERTEX),
                         ])
                         .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL),
                     None,
@@ -1611,38 +1595,6 @@ impl Renderer {
                 cam_rot: <_>::default(),
             }
         }
-    }
-}
-
-impl Drop for Renderer {
-    fn drop(&mut self) {
-        /*
-        unsafe {
-            // Free buffers.
-            for (buffer, alloc) in std::mem::take(&mut self.buffer_allocs).into_iter() {
-                self.vk_delete_buffer(buffer, alloc);
-            }
-
-            // Free images.
-            self.allocator
-                .destroy_image(self.depth_image.0, &mut self.depth_image.1);
-
-            // Free images.
-            for i in 0..3 {
-                self.device
-                    .destroy_image_view(self.swapchain_depth_views[i], None);
-                self.device
-                    .destroy_image_view(self.swapchain_color_views[i], None);
-            }
-
-            // Free the rest.
-            self.swapchain_device
-                .destroy_swapchain(self.swapchain, None);
-            self.device.destroy_device(None);
-            self.surface_instance.destroy_surface(self.surface, None);
-            self.instance.destroy_instance(None);
-        }
-        */
     }
 }
 
