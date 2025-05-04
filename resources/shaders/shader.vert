@@ -43,6 +43,7 @@ layout (set = 0, binding = 0) uniform Global {
 layout (location = 0) out vec2 frag_uv;
 layout (location = 1) out uint frag_tex_id;
 layout (location = 2) out vec4 frag_color;
+layout (location = 3) out vec3 frag_normal;
 
 vec4 colors[14] = {
     vec4(0.0, 0.0, 1.0, 1.0),
@@ -71,5 +72,6 @@ void main() {
     gl_Position = pv * object.model * vec4(vert.position, 1.0);
     frag_uv = vec2(vert.u, vert.v);
     frag_tex_id = object.tex_id;
-    frag_color = colors[6];//gl_DrawID % 14];
+    frag_color = colors[gl_DrawID % 14];
+    frag_normal = vert.normal;
 }

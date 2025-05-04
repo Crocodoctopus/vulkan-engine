@@ -34,19 +34,21 @@ fn main() {
 
     let cwd = std::env::current_dir().unwrap();
     let mut renderer = Renderer::new(cwd, viewport_w, viewport_h, &window);
-    let bunny_mesh = renderer.load_mesh("resources/models/bunny.obj").unwrap();
+    let bunny_mesh = renderer
+        .load_mesh("resources/models/viking_room.obj")
+        .unwrap();
     let bunny_obj = renderer
         .create_object(
             bunny_mesh,
             Vec3::new(0.0, 0.8, 0.0),
-            Quat::from_euler(EulerRot::XYZ, std::f32::consts::PI, 0.0, 0.0),
-            Vec3::splat(2.0),
+            Quat::from_euler(EulerRot::XYZ, 3.14 / 2., 0.0, 0.0),
+            Vec3::splat(1.0),
         )
         .unwrap();
-    let bunny_obj2 = renderer
+    /*let bunny_obj2 = renderer
         .create_object(
             bunny_mesh,
-            Vec3::new(1.0, 0.8, 0.0),
+            Vec3::new(1.0, 0.4, 0.0),
             Quat::from_euler(EulerRot::XYZ, std::f32::consts::PI, 0.0, 0.0),
             Vec3::splat(2.0),
         )
@@ -54,11 +56,11 @@ fn main() {
     let bunny_obj3 = renderer
         .create_object(
             bunny_mesh,
-            Vec3::new(2.0, 0.8, 0.0),
+            Vec3::new(2.0, 0.4, 0.0),
             Quat::from_euler(EulerRot::XYZ, std::f32::consts::PI, 0.0, 0.0),
             Vec3::splat(2.0),
         )
-        .unwrap();
+        .unwrap();*/
 
     // "Gameloop"
     //let mut timestamp = 0_u64;

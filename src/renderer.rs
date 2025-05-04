@@ -145,6 +145,7 @@ impl<T> Buffer<T> {
     }
 }
 
+#[derive(Debug)]
 pub struct Meshlet {
     pub center: [f32; 3],
     pub radius: f32,
@@ -152,8 +153,9 @@ pub struct Meshlet {
     pub cone_axis: [f32; 3],
     pub cone_cutoff: f32,
     pub indices: Box<[u8]>,
-    pub positions: Box<[f32]>,
-    pub texcoords: Box<[f32]>,
+    pub positions: Box<[Vec3]>,
+    pub normals: Box<[Vec3]>,
+    pub texcoords: Box<[Vec2]>,
 }
 
 struct ObjectInstance {
@@ -523,19 +525,10 @@ impl Renderer {
                     *id,
                     mesh.iter()
                         .flat_map(|meshlet| {
-                            (0..meshlet.positions.len() / 3).map(|i| Vertex {
-                                position: Vec3::new(
-                                    meshlet.positions[3 * i],
-                                    meshlet.positions[3 * i + 1],
-                                    meshlet.positions[3 * i + 2],
-                                ),
+                            (0..meshlet.positions.len()).map(|i| Vertex {
+                                position: meshlet.positions[i],
+                                normal: meshlet.normals[i],
                                 u: 0., //meshlet.texcoords[2 * i],
-                                normal: Vec3::splat(0.0),
-                                /*normals: Vec3::new(
-                                    meshlet.normals[3 * i],
-                                    meshlet.normals[3 * i + 1],
-                                    meshlet.normals[3 * i + 2],
-                                )*/
                                 v: 0., //meshlet.texcoords[2 * i + 1],
                                 color: Vec4::splat(1.0),
                             })
@@ -572,7 +565,7 @@ impl Renderer {
             let mut offset = 0u32;
             for meshlet in mesh {
                 indices.extend(meshlet.indices.iter().map(|&index| index as u32 + offset));
-                offset += meshlet.positions.len() as u32 / 3;
+                offset += meshlet.positions.len() as u32;
             }
 
             // Mesh data.
@@ -1601,44 +1594,66 @@ impl Renderer {
 pub fn load_mesh(filename: impl AsRef<Path>) -> Option<Box<[Meshlet]>> {
     let model = {
         use std::io::BufReader;
-        let data = std::fs::read(filename).ok()?;
-        let (models, _) =
-            tobj::load_obj_buf(&mut BufReader::new(&data[..]), |_| unreachable!()).unwrap();
+        let data = std::fs::read(filename.as_ref()).ok()?;
+        let (models, _) = tobj::load_obj_buf(&mut BufReader::new(&data[..]), |_| {
+            Ok((Vec::new(), HashMap::new()))
+        })
+        .unwrap();
         models.into_iter().next()?.mesh
     };
+    println!("Model details ({:?}):", filename.as_ref());
+    println!("  Indices: {}", model.indices.len());
+    println!("  Positions: {}", model.positions.len());
+    println!("  Normals: {}", model.normals.len());
+
+    struct Vertex {
+        position: Vec3,
+        normal: Vec3,
+        uv: Vec2,
+        color: Vec3,
+    }
+
+    impl meshopt::DecodePosition for Vertex {
+        fn decode_position(&self) -> [f32; 3] {
+            self.position.to_array()
+        }
+    }
 
     let mut indices: Box<[u32]> = model.indices.into_boxed_slice();
-    let mut positions: Box<[[f32; 3]]> = model
-        .positions
-        .chunks_exact(3)
-        .map(|v| [v[0], v[1], v[2]])
+    let mut vertices: Box<[Vertex]> = (0..model.positions.len() / 3)
+        .map(|i| Vertex {
+            position: Vec3::from_slice(&model.positions[3 * i..]),
+            normal: Vec3::from_slice(&model.normals[3 * i..]),
+            uv: Vec2::from_slice(&model.texcoords[2 * i..]),
+            color: Vec3::splat(1.0),
+        })
         .collect();
 
     // Optimize index count.
-    meshopt::optimize_vertex_cache_in_place(&mut indices, positions.len());
+    meshopt::optimize_vertex_cache_in_place(&mut indices, vertices.len());
 
     // Optimize overdraw.
-    meshopt::optimize_overdraw_in_place_decoder(&mut indices, &positions, 1.05);
+    meshopt::optimize_overdraw_in_place_decoder(&mut indices, &vertices, 1.05);
 
     // Optimize vertex fetch.
-    meshopt::optimize_vertex_fetch_in_place(&mut indices, &mut positions);
+    meshopt::optimize_vertex_fetch_in_place(&mut indices, &mut vertices);
 
     let adapter = meshopt::VertexDataAdapter {
         reader: std::io::Cursor::new(unsafe {
             std::slice::from_raw_parts(
-                positions.as_ptr() as *const u8,
-                3 * positions.len() * size_of::<f32>(),
+                vertices.as_ptr() as *const u8,
+                size_of::<Vertex>() * vertices.len(),
             )
         }),
-        vertex_count: positions.len(),
-        vertex_stride: 3 * size_of::<f32>(),
+        vertex_count: vertices.len(),
+        vertex_stride: size_of::<Vertex>(),
         position_offset: 0,
     };
 
     let meshlets = meshopt::build_meshlets(&indices, &adapter, 64, 124, 0.5)
         .iter()
         .map(|meshlet| {
-            let bounds = meshopt::compute_meshlet_bounds_decoder(meshlet, &positions);
+            let bounds = meshopt::compute_meshlet_bounds_decoder(meshlet, &vertices);
             Meshlet {
                 center: bounds.cone_apex,
                 radius: bounds.radius,
@@ -1649,13 +1664,19 @@ pub fn load_mesh(filename: impl AsRef<Path>) -> Option<Box<[Meshlet]>> {
                 positions: meshlet
                     .vertices
                     .iter()
-                    .flat_map(|&i: &u32| &positions[i as usize])
-                    .copied()
+                    .map(|&i| vertices[i as usize].position)
+                    .collect(),
+                normals: meshlet
+                    .vertices
+                    .iter()
+                    .map(|&i| vertices[i as usize].normal)
                     .collect(),
                 texcoords: Box::new([]),
             }
         })
         .collect();
+
+    println!("{:?}", meshlets);
 
     Some(meshlets)
 }
