@@ -13,9 +13,27 @@ use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use crate::staging::StagingBuffer;
 
 #[repr(C, align(16))]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct Std430<T>(T);
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug)]
+struct SceneGlobal {
+    // Matrices.
+    pv: Mat4,
+    proj: Mat4,
+    view: Mat4,
+
+    // Misc.
+    camera_position: Std430<Vec3>,
+    camera_direction: Std430<Vec3>, // XYZ
+    light_position: Std430<Vec3>,
+    light_color: Std430<Vec4>,
+}
+
+#[repr(C, align(16))]
 #[derive(Copy, Clone, Debug)]
 struct MeshletRenderGlobal {
-    pv: Mat4,
     instance_buffer: vk::DeviceAddress,
     object_buffer: vk::DeviceAddress,
 }
@@ -23,10 +41,6 @@ struct MeshletRenderGlobal {
 #[repr(C, align(16))]
 #[derive(Copy, Clone, Debug)]
 struct MeshletCullGlobal {
-    view: [f32; 4 * 4],
-    camera_position: [f32; 3],
-    instances: u32,
-
     frustum: [f32; 4],
 
     draw_count_buffer: vk::DeviceAddress,
@@ -34,12 +48,16 @@ struct MeshletCullGlobal {
     draw_cmd_buffer: vk::DeviceAddress,
     instance_buffer: vk::DeviceAddress,
     object_buffer: vk::DeviceAddress,
+
+    instances: u32,
 }
 
 #[derive(Clone, Debug)]
 #[repr(C, align(16))]
 struct Object {
-    model: Mat4,
+    position: Vec3,
+    scale: f32,
+    orientation: Quat,
     vertex_buffer: vk::DeviceAddress,
     texture_id: u32,
 }
@@ -158,11 +176,12 @@ pub struct Meshlet {
     pub texcoords: Box<[Vec2]>,
 }
 
+#[derive(Debug)]
 struct ObjectInstance {
     mesh: MeshHandle,
     position: Vec3,
+    scale: f32,
     orientation: Quat,
-    scale: Vec3,
 }
 
 #[derive(Copy, Clone, Hash, Eq, PartialEq, Debug)]
@@ -191,6 +210,7 @@ struct Frame {
     meshlet_data_buffer: Buffer<MeshletData>,
     indirect_cmd_buffer: Buffer<vk::DrawIndexedIndirectCommand>,
     indirect_count_buffer: Buffer<u32>,
+    scene_global_buffer: Buffer<SceneGlobal>,
     meshlet_cull_global_buffer: Buffer<MeshletCullGlobal>,
     meshlet_render_global_buffer: Buffer<MeshletRenderGlobal>,
 }
@@ -206,6 +226,7 @@ impl Frame {
             meshlet_data_buffer: Buffer::null(),
             indirect_cmd_buffer: Buffer::null(),
             indirect_count_buffer: Buffer::null(),
+            scene_global_buffer: Buffer::null(),
             meshlet_cull_global_buffer: Buffer::null(),
             meshlet_render_global_buffer: Buffer::null(),
         }
@@ -245,6 +266,8 @@ pub struct Renderer {
     cmd_pool: vk::CommandPool,
 
     // Desciptor sets.
+    scene_set_layout: vk::DescriptorSetLayout,
+    scene_set: vk::DescriptorSet,
     render_set_layout: vk::DescriptorSetLayout,
     render_set: vk::DescriptorSet,
     cull_set_layout: vk::DescriptorSetLayout,
@@ -374,9 +397,9 @@ impl Renderer {
             // Transfer some global state data.
             {
                 let object_data = self.objects.values().map(|obj| Object {
-                    model: Mat4::from_translation(obj.position)
-                        * Mat4::from_scale(obj.scale)
-                        * Mat4::from_quat(obj.orientation),
+                    position: obj.position,
+                    scale: obj.scale,
+                    orientation: obj.orientation,
                     vertex_buffer: self.device.get_buffer_device_address(
                         &vk::BufferDeviceAddressInfo::default()
                             .buffer(self.vertex_buffers.get(&obj.mesh).unwrap().vk_handle()),
@@ -386,24 +409,23 @@ impl Renderer {
 
                 // Upload global descriptor data & object data.
                 let projection = Mat4::perspective_infinite_rh(
-                    std::f32::consts::FRAC_PI_4,
+                    std::f32::consts::FRAC_PI_6,
                     self.surface_extent.width as f32 / self.surface_extent.height as f32,
                     0.1,
                     //2.0,
                 );
-                let view = Mat4::from_rotation_translation(
+                /*let view = (Mat4::from_rotation_translation(
                     Quat::from_euler(
                         EulerRot::XYZ,
-                        -std::f32::consts::FRAC_PI_8,
+                        0., //-std::f32::consts::FRAC_PI_8,
                         self.cam_rot[0],
                         0.,
                     ),
-                    Vec3::new(0., 0., 0.),
-                ) * Mat4::from_translation(Vec3::new(
-                    self.cam_pos[0],
-                    self.cam_pos[1],
-                    self.cam_pos[2],
-                ));
+                    Vec3::splat(0.),
+                ) * Mat4::from_translation(-self.cam_pos));*/
+
+                let p = Vec3::new(self.cam_rot[0].sin(), 0., -self.cam_rot[0].cos());
+                let view = Mat4::look_to_rh(self.cam_pos, p, Vec3::new(0., 1., 0.));
 
                 // Frustum plane data.
                 let normalize_plane = |p: Vec4| p / p.xyz().length();
@@ -427,10 +449,27 @@ impl Renderer {
                     self.staging_buffer.stage_buffer(
                         &self.device,
                         command_buffer,
+                        &frame.scene_global_buffer,
+                        0,
+                        [SceneGlobal {
+                            pv: projection * view,
+                            proj: projection,
+                            view,
+                            camera_position: Std430(self.cam_pos),
+                            camera_direction: Std430(p),
+                            light_position: Std430(Vec3::new(1.0, 0.0, 0.0)),
+                            light_color: Std430(Vec4::new(1.0, 1.0, 1.0, 1.0)),
+                        }],
+                    );
+
+                    println!("{:?}", self.cam_pos);
+
+                    self.staging_buffer.stage_buffer(
+                        &self.device,
+                        command_buffer,
                         &frame.meshlet_render_global_buffer,
                         0,
                         [MeshletRenderGlobal {
-                            pv: projection * view,
                             instance_buffer: self.device.get_buffer_device_address(
                                 &vk::BufferDeviceAddressInfo::default()
                                     .buffer(frame.instance_buffer.vk_handle()),
@@ -454,8 +493,6 @@ impl Renderer {
                         &frame.meshlet_cull_global_buffer,
                         0,
                         [MeshletCullGlobal {
-                            view: view.to_cols_array(),
-                            camera_position: self.cam_pos.to_array(),
                             instances: frame.indirect_cmd_buffer.len,
                             frustum,
                             draw_count_buffer: self.device.get_buffer_device_address(
@@ -557,6 +594,7 @@ impl Renderer {
         let mut indices = vec![];
         let mut meshlet_data = vec![];
         let mut instances = 0u32;
+        let mut first_index = 0;
         for (i, object) in self.objects.values().enumerate() {
             // Get associated mesh and index offset.
             let mesh = self.meshes.get(&object.mesh).unwrap();
@@ -569,7 +607,6 @@ impl Renderer {
             }
 
             // Mesh data.
-            let mut first_index = 0;
             for meshlet in mesh {
                 meshlet_data.push(MeshletData {
                     center: meshlet.center,
@@ -671,6 +708,13 @@ impl Renderer {
                 vk_mem::MemoryUsage::AutoPreferDevice,
             ),
 
+            scene_global_buffer: create_buffer(
+                &self.allocator,
+                1,
+                vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+                vk_mem::MemoryUsage::AutoPreferDevice,
+            ),
+
             meshlet_cull_global_buffer: create_buffer(
                 &self.allocator,
                 1,
@@ -765,7 +809,7 @@ impl Renderer {
                         vk::PipelineBindPoint::COMPUTE,
                         self.cull_pipeline_layout,
                         0,
-                        &[self.cull_set],
+                        &[self.scene_set, self.cull_set],
                         &[],
                     );
 
@@ -870,7 +914,7 @@ impl Renderer {
                         vk::PipelineBindPoint::GRAPHICS,
                         self.render_pipeline_layout,
                         0,
-                        &[self.render_set],
+                        &[self.scene_set, self.render_set],
                         &[],
                     );
 
@@ -945,6 +989,16 @@ impl Renderer {
                 self.device.update_descriptor_sets(
                     &[
                         vk::WriteDescriptorSet::default()
+                            .dst_set(self.scene_set)
+                            .dst_binding(0)
+                            .dst_array_element(0)
+                            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                            .descriptor_count(1)
+                            .buffer_info(&[vk::DescriptorBufferInfo::default()
+                                .buffer(frame.scene_global_buffer.vk_handle())
+                                .offset(0)
+                                .range(vk::WHOLE_SIZE)]),
+                        vk::WriteDescriptorSet::default()
                             .dst_set(self.cull_set)
                             .dst_binding(0)
                             .dst_array_element(0)
@@ -983,8 +1037,8 @@ impl Renderer {
         &mut self,
         mesh: MeshHandle,
         position: Vec3,
+        scale: f32,
         orientation: Quat,
-        scale: Vec3,
     ) -> Option<ObjectHandle> {
         let handle = ObjectHandle(self.resource_counter);
         self.resource_counter += 1;
@@ -993,8 +1047,8 @@ impl Renderer {
             ObjectInstance {
                 mesh,
                 position,
-                orientation,
                 scale,
+                orientation,
             },
         );
         Some(handle)
@@ -1270,6 +1324,28 @@ impl Renderer {
                 (color_views, depth_views)
             };
 
+            // Descriptor set layout for all programs.
+            let scene_set_layout = device
+                .create_descriptor_set_layout(
+                    &vk::DescriptorSetLayoutCreateInfo::default()
+                        .push_next(
+                            &mut vk::DescriptorSetLayoutBindingFlagsCreateInfo::default()
+                                .binding_flags(&[vk::DescriptorBindingFlags::PARTIALLY_BOUND
+                                    | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND]),
+                        )
+                        .bindings(&[
+                            // SceneGlobal
+                            vk::DescriptorSetLayoutBinding::default()
+                                .binding(0)
+                                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                                .descriptor_count(1)
+                                .stage_flags(vk::ShaderStageFlags::ALL),
+                        ])
+                        .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL),
+                    None,
+                )
+                .unwrap();
+
             // Desciptor set layout for the rendering program.
             let render_set_layout = device
                 .create_descriptor_set_layout(
@@ -1331,11 +1407,11 @@ impl Renderer {
                 .unwrap();
 
             // Create a render and cull set from previous layouts.
-            let (render_set, cull_set) = device
+            let (scene_set, render_set, cull_set) = device
                 .allocate_descriptor_sets(
                     &vk::DescriptorSetAllocateInfo::default()
                         .descriptor_pool(descriptor_pool)
-                        .set_layouts(&[render_set_layout, cull_set_layout]),
+                        .set_layouts(&[scene_set_layout, render_set_layout, cull_set_layout]),
                 )
                 .ok()
                 .and_then(|v| v.into_iter().tuples().next())
@@ -1359,7 +1435,8 @@ impl Renderer {
             let (render_pipeline, render_pipeline_layout) = {
                 let pipeline_layout = device
                     .create_pipeline_layout(
-                        &vk::PipelineLayoutCreateInfo::default().set_layouts(&[render_set_layout]),
+                        &vk::PipelineLayoutCreateInfo::default()
+                            .set_layouts(&[scene_set_layout, render_set_layout]),
                         None,
                     )
                     .unwrap();
@@ -1460,7 +1537,8 @@ impl Renderer {
 
                 let pipeline_layout = device
                     .create_pipeline_layout(
-                        &vk::PipelineLayoutCreateInfo::default().set_layouts(&[cull_set_layout]),
+                        &vk::PipelineLayoutCreateInfo::default()
+                            .set_layouts(&[scene_set_layout, cull_set_layout]),
                         None,
                     )
                     .unwrap();
@@ -1560,6 +1638,8 @@ impl Renderer {
                 cmd_pool,
                 render_cmd_buffers,
 
+                scene_set,
+                scene_set_layout,
                 render_set,
                 render_set_layout,
                 cull_set,
@@ -1624,7 +1704,7 @@ pub fn load_mesh(filename: impl AsRef<Path>) -> Option<Box<[Meshlet]>> {
         .map(|i| Vertex {
             position: Vec3::from_slice(&model.positions[3 * i..]),
             normal: Vec3::from_slice(&model.normals[3 * i..]),
-            uv: Vec2::from_slice(&model.texcoords[2 * i..]),
+            uv: Vec2::splat(0.0), //Vec2::from_slice(&model.texcoords[2 * i..]),
             color: Vec3::splat(1.0),
         })
         .collect();
@@ -1675,8 +1755,6 @@ pub fn load_mesh(filename: impl AsRef<Path>) -> Option<Box<[Meshlet]>> {
             }
         })
         .collect();
-
-    println!("{:?}", meshlets);
 
     Some(meshlets)
 }

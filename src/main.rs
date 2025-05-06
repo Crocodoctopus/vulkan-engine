@@ -12,7 +12,7 @@ mod staging;
 //mod util;
 
 use crate::renderer::*;
-use glam::{EulerRot, Quat, Vec3};
+use glam::*;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, Event, KeyEvent, WindowEvent};
 use winit::event_loop::EventLoop;
@@ -34,15 +34,24 @@ fn main() {
 
     let cwd = std::env::current_dir().unwrap();
     let mut renderer = Renderer::new(cwd, viewport_w, viewport_h, &window);
-    let bunny_mesh = renderer
+    let viking_room = renderer
         .load_mesh("resources/models/viking_room.obj")
         .unwrap();
-    let bunny_obj = renderer
+    let sphere = renderer.load_mesh("resources/models/sphere.obj").unwrap();
+    let obj0 = renderer
         .create_object(
-            bunny_mesh,
-            Vec3::new(0.0, 0.8, 0.0),
-            Quat::from_euler(EulerRot::XYZ, 3.14 / 2., 0.0, 0.0),
-            Vec3::splat(1.0),
+            viking_room,
+            Vec3::new(0.0, 0.5, 0.0),
+            1.0,
+            Quat::from_euler(EulerRot::XYZ, std::f32::consts::FRAC_PI_2, 0.0, 0.0),
+        )
+        .unwrap();
+    let obj1 = renderer
+        .create_object(
+            sphere,
+            Vec3::new(0.0, 0.0, 0.0),
+            0.05,
+            Quat::from_euler(EulerRot::XYZ, 0.0, 0.0, 0.0),
         )
         .unwrap();
     /*let bunny_obj2 = renderer
@@ -128,12 +137,12 @@ fn main() {
         // Update.
 
         // Forward.
-        if w_down && !s_down {
+        if s_down && !w_down {
             renderer.cam_pos.z += dt * renderer.cam_rot[0].cos();
             renderer.cam_pos.x -= dt * renderer.cam_rot[0].sin();
         }
         // Backward.
-        if !w_down && s_down {
+        if !s_down && w_down {
             renderer.cam_pos.z -= dt * renderer.cam_rot[0].cos();
             renderer.cam_pos.x += dt * renderer.cam_rot[0].sin();
         }
@@ -148,12 +157,12 @@ fn main() {
         }
 
         // Strafe left.
-        if q_down && !e_down {
+        if e_down && !q_down {
             renderer.cam_pos.x += dt * renderer.cam_rot[0].cos();
             renderer.cam_pos.z += dt * renderer.cam_rot[0].sin();
         }
         // Strafe right.
-        if !q_down && e_down {
+        if !e_down && q_down {
             renderer.cam_pos.x -= dt * renderer.cam_rot[0].cos();
             renderer.cam_pos.z -= dt * renderer.cam_rot[0].sin();
         }
