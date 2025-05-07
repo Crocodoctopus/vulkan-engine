@@ -18,13 +18,13 @@ layout (set = 1, binding = 1) uniform sampler2D samplers[];
 layout (location = 0) in vec2 frag_uv;
 layout (location = 1) flat in uint frag_tex_id;
 layout (location = 2) in vec4 frag_color;
-layout (location = 3) flat in vec3 frag_normal;
+layout (location = 3) in vec3 frag_normal;
 layout (location = 4) in vec3 frag_position;
 
 layout (location = 0) out vec4 out_color;
 
 void main() {
-    vec3 normal = normalize(frag_normal);
+    vec3 normal = normalize(frag_normal); // Probably already normalized?
     vec3 incident_ray = normalize(light_position - frag_position);
     vec3 reflected_ray = normalize(reflect(-incident_ray, normal));
     vec3 to_camera_ray = normalize(camera_position - frag_position);

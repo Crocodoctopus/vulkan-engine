@@ -1,12 +1,13 @@
+#extension GL_EXT_shader_16bit_storage: require
+#extension GL_EXT_shader_8bit_storage: require
+
 struct Vertex {
-    vec3 position;
-    float u;
-    vec3 normal;
-    float v;
-    vec4 color;
+    int16_t x, y, z;
+    int16_t u, v;
+    int8_t nx, ny, nz;
 };
 
-layout (buffer_reference, std430) readonly buffer VertexBuffer {
+layout (buffer_reference, scalar) readonly buffer VertexBuffer {
     Vertex data[];
 };
 

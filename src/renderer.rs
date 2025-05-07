@@ -85,14 +85,12 @@ struct MeshletData {
     first_index: u32,
 }
 
-#[repr(C, align(16))]
+#[repr(C)]
 #[derive(Clone, Debug, Default)]
 struct Vertex {
-    position: Vec3,
-    u: f32,
-    normal: Vec3,
-    v: f32,
-    color: Vec4,
+    position: [i16; 3],
+    uv: [i16; 2],
+    normal: [i8; 3],
 }
 
 #[derive(Debug)]
@@ -171,9 +169,9 @@ pub struct Meshlet {
     pub cone_axis: [f32; 3],
     pub cone_cutoff: f32,
     pub indices: Box<[u8]>,
-    pub positions: Box<[Vec3]>,
-    pub normals: Box<[Vec3]>,
-    pub texcoords: Box<[Vec2]>,
+    pub positions: Box<[[i16; 3]]>,
+    pub normals: Box<[[i8; 3]]>,
+    pub texcoords: Box<[[i16; 2]]>,
 }
 
 #[derive(Debug)]
@@ -282,7 +280,7 @@ pub struct Renderer {
     // Generic resource containers.
     cwd: PathBuf,
     resource_counter: u32,
-    meshes: HashMap<MeshHandle, Box<[Meshlet]>>,
+    meshes: HashMap<MeshHandle, (f32, Box<[Meshlet]>)>,
     objects: HashMap<ObjectHandle, ObjectInstance>,
     vertex_buffers: HashMap<MeshHandle, Buffer<Vertex>>,
 
@@ -398,7 +396,7 @@ impl Renderer {
             {
                 let object_data = self.objects.values().map(|obj| Object {
                     position: obj.position,
-                    scale: obj.scale,
+                    scale: obj.scale * self.meshes.get(&obj.mesh).unwrap().0,
                     orientation: obj.orientation,
                     vertex_buffer: self.device.get_buffer_device_address(
                         &vk::BufferDeviceAddressInfo::default()
@@ -560,14 +558,13 @@ impl Renderer {
             .map(|(id, mesh)| {
                 (
                     *id,
-                    mesh.iter()
+                    mesh.1
+                        .iter()
                         .flat_map(|meshlet| {
                             (0..meshlet.positions.len()).map(|i| Vertex {
                                 position: meshlet.positions[i],
                                 normal: meshlet.normals[i],
-                                u: 0., //meshlet.texcoords[2 * i],
-                                v: 0., //meshlet.texcoords[2 * i + 1],
-                                color: Vec4::splat(1.0),
+                                uv: [0, 0],
                             })
                         })
                         .collect(),
@@ -597,7 +594,7 @@ impl Renderer {
         let mut first_index = 0;
         for (i, object) in self.objects.values().enumerate() {
             // Get associated mesh and index offset.
-            let mesh = self.meshes.get(&object.mesh).unwrap();
+            let mesh = &self.meshes.get(&object.mesh).unwrap().1;
 
             // Indices.
             let mut offset = 0u32;
@@ -1111,6 +1108,12 @@ impl Renderer {
                 .expect("Could not find any Vulkan compatible devices.")
                 .into_iter()
                 .find(|&physical_device| {
+                    println!(
+                        "{:?}",
+                        instance
+                            .get_physical_device_properties(physical_device)
+                            .device_type
+                    );
                     instance
                         .get_physical_device_properties(physical_device)
                         .device_type
@@ -1168,12 +1171,15 @@ impl Renderer {
 
             // Create logical device and its associated queues.
             let (device, graphics_queue, present_queue) = {
-                let features = vk::PhysicalDeviceFeatures::default().multi_draw_indirect(true);
+                let features = vk::PhysicalDeviceFeatures::default()
+                    .multi_draw_indirect(true)
+                    .shader_int16(true);
                 let extensions = device_extensions.map(|x: &CStr| x.as_ptr());
 
                 let device = {
-                    let mut vk11features =
-                        vk::PhysicalDeviceVulkan11Features::default().shader_draw_parameters(true);
+                    let mut vk11features = vk::PhysicalDeviceVulkan11Features::default()
+                        .shader_draw_parameters(true)
+                        .storage_buffer16_bit_access(true);
 
                     let mut vk12features = vk::PhysicalDeviceVulkan12Features::default()
                         .shader_int8(true)
@@ -1671,7 +1677,7 @@ impl Renderer {
     }
 }
 
-pub fn load_mesh(filename: impl AsRef<Path>) -> Option<Box<[Meshlet]>> {
+pub fn load_mesh(filename: impl AsRef<Path>) -> Option<(f32, Box<[Meshlet]>)> {
     let model = {
         use std::io::BufReader;
         let data = std::fs::read(filename.as_ref()).ok()?;
@@ -1685,6 +1691,15 @@ pub fn load_mesh(filename: impl AsRef<Path>) -> Option<Box<[Meshlet]>> {
     println!("  Indices: {}", model.indices.len());
     println!("  Positions: {}", model.positions.len());
     println!("  Normals: {}", model.normals.len());
+
+    // Calculate bounds.
+    let scale = model
+        .positions
+        .iter()
+        .tuples()
+        .fold(0f32, |scale, (x, y, z)| {
+            scale.max(x.abs()).max(y.abs()).max(z.abs())
+        });
 
     struct Vertex {
         position: Vec3,
@@ -1744,17 +1759,25 @@ pub fn load_mesh(filename: impl AsRef<Path>) -> Option<Box<[Meshlet]>> {
                 positions: meshlet
                     .vertices
                     .iter()
-                    .map(|&i| vertices[i as usize].position)
+                    .map(|&i| {
+                        (vertices[i as usize].position / scale * 32767.)
+                            .to_array()
+                            .map(|e| e as i16)
+                    })
                     .collect(),
                 normals: meshlet
                     .vertices
                     .iter()
-                    .map(|&i| vertices[i as usize].normal)
+                    .map(|&i| {
+                        (vertices[i as usize].normal * 127.)
+                            .to_array()
+                            .map(|e| e as i8)
+                    })
                     .collect(),
                 texcoords: Box::new([]),
             }
         })
         .collect();
 
-    Some(meshlets)
+    Some((scale, meshlets))
 }
