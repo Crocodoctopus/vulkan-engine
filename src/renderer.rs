@@ -1,5 +1,5 @@
 //use crate::util::Map2;
-use ash::vk::{Extent2D, ImageUsageFlags};
+use ash::vk::{DescriptorSet, Extent2D, ImageUsageFlags};
 use ash::{khr, vk};
 use glam::*;
 use itertools::Itertools;
@@ -144,6 +144,7 @@ impl<T> Buffer<T> {
             len: 0,
         }
     }
+
     pub fn len(&self) -> u32 {
         self.len
     }
@@ -194,12 +195,19 @@ struct FrameSyncPrimitives {
     frame_in_flight: vk::Fence,
 }
 
+const MAX_FRAMES_IN_FLIGHT: u32 = 2;
+
 struct Frame {
     //
     sync_primitives: Box<[FrameSyncPrimitives]>,
 
     //
     scene_cmd_buffers: Box<[vk::CommandBuffer]>,
+
+    // Descriptor sets.
+    scene_set: vk::DescriptorSet,
+    render_set: vk::DescriptorSet,
+    cull_set: vk::DescriptorSet,
 
     // Various buffers.
     index_buffer: Buffer<u32>,
@@ -218,6 +226,9 @@ impl Frame {
         Self {
             sync_primitives: Box::new([]),
             scene_cmd_buffers: Box::new([]),
+            scene_set: DescriptorSet::null(),
+            render_set: DescriptorSet::null(),
+            cull_set: DescriptorSet::null(),
             index_buffer: Buffer::null(),
             object_buffer: Buffer::null(),
             instance_buffer: Buffer::null(),
@@ -263,13 +274,11 @@ pub struct Renderer {
     // Command pool.
     cmd_pool: vk::CommandPool,
 
-    // Desciptor sets.
+    // Desciptor set layouts.
+    descriptor_pool: vk::DescriptorPool,
     scene_set_layout: vk::DescriptorSetLayout,
-    scene_set: vk::DescriptorSet,
     render_set_layout: vk::DescriptorSetLayout,
-    render_set: vk::DescriptorSet,
     cull_set_layout: vk::DescriptorSetLayout,
-    cull_set: vk::DescriptorSet,
 
     // Pipelines.
     render_pipeline_layout: vk::PipelineLayout,
@@ -622,9 +631,16 @@ impl Renderer {
         }
 
         // TODO: split this up.
-        let max_frames_in_flight = 2;
+        let [scene_set, render_set, cull_set] = self.device
+            .allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(self.descriptor_pool)
+                    .set_layouts(&[self.scene_set_layout, self.render_set_layout, self.cull_set_layout]),
+            )
+            .unwrap().try_into().unwrap();
+
         let frame = Frame {
-            sync_primitives: (0..max_frames_in_flight)
+            sync_primitives: (0..MAX_FRAMES_IN_FLIGHT)
                 .map(|_| FrameSyncPrimitives {
                     image_available: self
                         .device
@@ -654,6 +670,10 @@ impl Renderer {
                 )
                 .unwrap()
                 .into_boxed_slice(),
+
+            scene_set,
+            render_set,
+            cull_set,
 
             index_buffer: create_buffer(
                 &self.allocator,
@@ -806,7 +826,7 @@ impl Renderer {
                         vk::PipelineBindPoint::COMPUTE,
                         self.cull_pipeline_layout,
                         0,
-                        &[self.scene_set, self.cull_set],
+                        &[frame.scene_set, frame.cull_set],
                         &[],
                     );
 
@@ -911,7 +931,7 @@ impl Renderer {
                         vk::PipelineBindPoint::GRAPHICS,
                         self.render_pipeline_layout,
                         0,
-                        &[self.scene_set, self.render_set],
+                        &[frame.scene_set, frame.render_set],
                         &[],
                     );
 
@@ -986,7 +1006,7 @@ impl Renderer {
                 self.device.update_descriptor_sets(
                     &[
                         vk::WriteDescriptorSet::default()
-                            .dst_set(self.scene_set)
+                            .dst_set(frame.scene_set)
                             .dst_binding(0)
                             .dst_array_element(0)
                             .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
@@ -996,7 +1016,7 @@ impl Renderer {
                                 .offset(0)
                                 .range(vk::WHOLE_SIZE)]),
                         vk::WriteDescriptorSet::default()
-                            .dst_set(self.cull_set)
+                            .dst_set(frame.cull_set)
                             .dst_binding(0)
                             .dst_array_element(0)
                             .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
@@ -1007,7 +1027,7 @@ impl Renderer {
                                 .range(vk::WHOLE_SIZE)]),
                         //
                         vk::WriteDescriptorSet::default()
-                            .dst_set(self.render_set)
+                            .dst_set(frame.render_set)
                             .dst_binding(0)
                             .dst_array_element(0)
                             .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
@@ -1089,9 +1109,13 @@ impl Renderer {
                 ]
                 .concat();
 
+                let driver_api_version = entry
+                    .try_enumerate_instance_version()
+                    .unwrap_or(None)
+                    .unwrap_or(vk::API_VERSION_1_0);
                 let app_info = vk::ApplicationInfo::default()
                     .application_name(c"Raytrace")
-                    .api_version(vk::make_api_version(0, 1, 3, 0));
+                    .api_version(driver_api_version.min(vk::API_VERSION_1_3));
                 let layers = validation_layers.map(|x: &CStr| x.as_ptr());
                 let instance_cinfo = vk::InstanceCreateInfo::default()
                     .application_info(&app_info)
@@ -1107,7 +1131,7 @@ impl Renderer {
                 .enumerate_physical_devices()
                 .expect("Could not find any Vulkan compatible devices.")
                 .into_iter()
-                .find(|&physical_device| {
+                /*.find(|&physical_device| {
                     println!(
                         "{:?}",
                         instance
@@ -1118,7 +1142,8 @@ impl Renderer {
                         .get_physical_device_properties(physical_device)
                         .device_type
                         == vk::PhysicalDeviceType::DISCRETE_GPU
-                })
+                })*/
+                .next()
                 .unwrap();
 
             let surface_instance = khr::surface::Instance::new(&entry, &instance);
@@ -1258,11 +1283,12 @@ impl Renderer {
 
             // Swapchain.
             let swapchain_device = khr::swapchain::Device::new(&instance, &device);
+            let swapchain_image_count = 3.max(surface_capabilities.min_image_count);
             let swapchain = swapchain_device
                 .create_swapchain(
                     &vk::SwapchainCreateInfoKHR::default()
                         .surface(surface)
-                        .min_image_count(3)
+                        .min_image_count(swapchain_image_count)
                         .image_format(surface_format.format)
                         .image_color_space(surface_format.color_space)
                         .image_extent(Extent2D {
@@ -1405,22 +1431,18 @@ impl Renderer {
             let descriptor_pool = device
                 .create_descriptor_pool(
                     &vk::DescriptorPoolCreateInfo::default()
-                        .pool_sizes(&[vk::DescriptorPoolSize::default().descriptor_count(3)])
+                        .pool_sizes(&[
+                            vk::DescriptorPoolSize::default()
+                                .ty(vk::DescriptorType::UNIFORM_BUFFER)
+                                .descriptor_count(3 * MAX_FRAMES_IN_FLIGHT),
+                            vk::DescriptorPoolSize::default()
+                                .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                                .descriptor_count(1024)
+                        ])
                         .max_sets(3)
                         .flags(vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND),
                     None,
                 )
-                .unwrap();
-
-            // Create a render and cull set from previous layouts.
-            let (scene_set, render_set, cull_set) = device
-                .allocate_descriptor_sets(
-                    &vk::DescriptorSetAllocateInfo::default()
-                        .descriptor_pool(descriptor_pool)
-                        .set_layouts(&[scene_set_layout, render_set_layout, cull_set_layout]),
-                )
-                .ok()
-                .and_then(|v| v.into_iter().tuples().next())
                 .unwrap();
 
             // Shader creation util function.
@@ -1588,7 +1610,7 @@ impl Renderer {
                     &vk::CommandBufferAllocateInfo::default()
                         .command_pool(cmd_pool)
                         .level(vk::CommandBufferLevel::PRIMARY)
-                        .command_buffer_count(2),
+                        .command_buffer_count(MAX_FRAMES_IN_FLIGHT),
                 )
                 .unwrap()
                 .into_boxed_slice();
@@ -1644,11 +1666,9 @@ impl Renderer {
                 cmd_pool,
                 render_cmd_buffers,
 
-                scene_set,
+                descriptor_pool,
                 scene_set_layout,
-                render_set,
                 render_set_layout,
-                cull_set,
                 cull_set_layout,
 
                 render_pipeline_layout,
