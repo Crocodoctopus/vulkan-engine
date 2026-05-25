@@ -1,3 +1,6 @@
+// This project requires so much unsafe, its annoying otherwise.
+#![allow(unsafe_op_in_unsafe_fn)]
+
 extern crate ash;
 extern crate ash_window;
 extern crate glam;
@@ -38,6 +41,7 @@ fn main() {
         .load_mesh("resources/models/viking_room.obj")
         .unwrap();
     let sphere = renderer.load_mesh("resources/models/sphere.obj").unwrap();
+    let bunny = renderer.load_mesh("resources/models/bunny.obj").unwrap();
     let obj0 = renderer
         .create_object(
             viking_room,
@@ -54,15 +58,15 @@ fn main() {
             Quat::from_euler(EulerRot::XYZ, 0.0, 0.0, 0.0),
         )
         .unwrap();
-    /*let bunny_obj2 = renderer
+    let obj2 = renderer
         .create_object(
-            bunny_mesh,
+            bunny,
             Vec3::new(1.0, 0.4, 0.0),
+            2.0,
             Quat::from_euler(EulerRot::XYZ, std::f32::consts::PI, 0.0, 0.0),
-            Vec3::splat(2.0),
         )
         .unwrap();
-    let bunny_obj3 = renderer
+    /*let bunny_obj3 = renderer
         .create_object(
             bunny_mesh,
             Vec3::new(2.0, 0.4, 0.0),

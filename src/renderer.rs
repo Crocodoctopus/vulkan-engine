@@ -1,10 +1,11 @@
+use ash::vk::Handle;
 //use crate::util::Map2;
-use ash::vk::{DescriptorSet, Extent2D, ImageUsageFlags};
 use ash::{khr, vk};
 use glam::*;
 use itertools::Itertools;
 use std::collections::HashMap;
 use std::ffi::CStr;
+use std::mem::forget;
 use std::path::Path;
 use std::path::PathBuf;
 use vk_mem::Alloc;
@@ -101,41 +102,46 @@ pub struct Buffer<T> {
     len: u32,
 }
 
-fn create_buffer<T>(
-    allocator: &vk_mem::Allocator,
-    len: u32,
-    vk_usage: vk::BufferUsageFlags,
-    vma_usage: vk_mem::MemoryUsage,
-) -> Buffer<T> {
-    unsafe {
-        let (buffer, alloc) = allocator
-            .create_buffer(
-                &vk::BufferCreateInfo::default()
-                    .size(len as u64 * size_of::<T>() as u64)
-                    .usage(vk_usage),
-                &vk_mem::AllocationCreateInfo {
-                    usage: vma_usage,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-
-        Buffer {
-            phantom: std::marker::PhantomData,
-            buffer,
-            alloc: Some(alloc),
-            len,
+impl<T> Drop for Buffer<T> {
+    fn drop(&mut self) {
+        if self.alloc.is_some() {
+            panic!(
+                "Active {} dropped implicitly",
+                std::any::type_name::<Self>()
+            );
         }
     }
 }
 
-unsafe fn destroy_buffer<T>(allocator: &vk_mem::Allocator, mut buffer: Buffer<T>) {
-    if let Some(mut alloc) = buffer.alloc {
-        allocator.destroy_buffer(buffer.buffer, &mut alloc);
-    }
-}
-
 impl<T> Buffer<T> {
+    fn new(
+        allocator: &vk_mem::Allocator,
+        len: u32,
+        vk_usage: vk::BufferUsageFlags,
+        vma_usage: vk_mem::MemoryUsage,
+    ) -> Self {
+        unsafe {
+            let (buffer, alloc) = allocator
+                .create_buffer(
+                    &vk::BufferCreateInfo::default()
+                        .size(len as u64 * size_of::<T>() as u64)
+                        .usage(vk_usage),
+                    &vk_mem::AllocationCreateInfo {
+                        usage: vma_usage,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+
+            Buffer {
+                phantom: std::marker::PhantomData,
+                buffer,
+                alloc: Some(alloc),
+                len,
+            }
+        }
+    }
+
     pub fn null() -> Self {
         Self {
             phantom: std::marker::PhantomData,
@@ -143,6 +149,10 @@ impl<T> Buffer<T> {
             alloc: None,
             len: 0,
         }
+    }
+
+    pub fn is_null(&self) -> bool {
+        self.alloc.is_none()
     }
 
     pub fn len(&self) -> u32 {
@@ -159,6 +169,24 @@ impl<T> Buffer<T> {
 
     pub fn vk_handle(&self) -> vk::Buffer {
         self.buffer
+    }
+
+    pub fn take(&mut self) -> Self {
+        Self {
+            phantom: self.phantom,
+            buffer: self.buffer,
+            len: self.len,
+            alloc: self.alloc.take(),
+        }
+    }
+
+    unsafe fn destroy(mut self, allocator: &vk_mem::Allocator) {
+        if let Some(alloc) = self.alloc.as_mut() {
+            unsafe {
+                allocator.destroy_buffer(self.buffer, alloc);
+            }
+        }
+        std::mem::forget(self);
     }
 }
 
@@ -205,6 +233,7 @@ struct Frame {
     scene_cmd_buffers: Box<[vk::CommandBuffer]>,
 
     // Descriptor sets.
+    descriptor_pool: vk::DescriptorPool,
     scene_set: vk::DescriptorSet,
     render_set: vk::DescriptorSet,
     cull_set: vk::DescriptorSet,
@@ -226,9 +255,10 @@ impl Frame {
         Self {
             sync_primitives: Box::new([]),
             scene_cmd_buffers: Box::new([]),
-            scene_set: DescriptorSet::null(),
-            render_set: DescriptorSet::null(),
-            cull_set: DescriptorSet::null(),
+            descriptor_pool: vk::DescriptorPool::null(),
+            scene_set: vk::DescriptorSet::null(),
+            render_set: vk::DescriptorSet::null(),
+            cull_set: vk::DescriptorSet::null(),
             index_buffer: Buffer::null(),
             object_buffer: Buffer::null(),
             instance_buffer: Buffer::null(),
@@ -275,7 +305,6 @@ pub struct Renderer {
     cmd_pool: vk::CommandPool,
 
     // Desciptor set layouts.
-    descriptor_pool: vk::DescriptorPool,
     scene_set_layout: vk::DescriptorSetLayout,
     render_set_layout: vk::DescriptorSetLayout,
     cull_set_layout: vk::DescriptorSetLayout,
@@ -310,6 +339,15 @@ pub struct Renderer {
                        //last_timestamp: f32,
 }
 
+impl Drop for Renderer {
+    fn drop(&mut self) {
+        panic!(
+            "{} dropped implicitly; call explicit renderer shutdown before drop",
+            std::any::type_name::<Self>()
+        );
+    }
+}
+
 impl Renderer {
     pub fn render(&mut self, timestamp: f32) {
         unsafe {
@@ -337,27 +375,9 @@ impl Renderer {
 
                 // TODO: free self.current_frame.
                 unsafe {
-                    for sync in &frame.sync_primitives {
-                        self.device.destroy_semaphore(sync.image_available, None);
-                        self.device.destroy_semaphore(sync.render_finished, None);
-                        self.device.destroy_fence(sync.frame_in_flight, None);
-                    }
-                    if frame.scene_cmd_buffers.len() > 0 {
-                        self.device
-                            .free_command_buffers(self.cmd_pool, &frame.scene_cmd_buffers);
-                    }
-                    destroy_buffer(&self.allocator, frame.index_buffer);
-                    destroy_buffer(&self.allocator, frame.object_buffer);
-                    destroy_buffer(&self.allocator, frame.instance_buffer);
-                    destroy_buffer(&self.allocator, frame.meshlet_data_buffer);
-                    destroy_buffer(&self.allocator, frame.indirect_cmd_buffer);
-                    destroy_buffer(&self.allocator, frame.indirect_count_buffer);
-                    destroy_buffer(&self.allocator, frame.meshlet_cull_global_buffer);
-                    destroy_buffer(&self.allocator, frame.meshlet_render_global_buffer);
-                    println!("Old frame cleared.");
+                    self.free_frame(frame);
                 }
-
-                //
+                println!("Old frame cleared.");
             }
         }
 
@@ -469,8 +489,6 @@ impl Renderer {
                         }],
                     );
 
-                    println!("{:?}", self.cam_pos);
-
                     self.staging_buffer.stage_buffer(
                         &self.device,
                         command_buffer,
@@ -558,12 +576,33 @@ impl Renderer {
         }
     }
 
+    unsafe fn free_frame(&mut self, mut frame: Frame) {
+        for sync in &frame.sync_primitives {
+            self.device.destroy_semaphore(sync.image_available, None);
+            self.device.destroy_semaphore(sync.render_finished, None);
+            self.device.destroy_fence(sync.frame_in_flight, None);
+        }
+        if frame.scene_cmd_buffers.len() > 0 {
+            self.device
+                .free_command_buffers(self.cmd_pool, &frame.scene_cmd_buffers);
+        }
+        self.device.destroy_descriptor_pool(frame.descriptor_pool, None);
+        frame.index_buffer.take().destroy(&self.allocator);
+        frame.object_buffer.take().destroy(&self.allocator);
+        frame.instance_buffer.take().destroy(&self.allocator);
+        frame.meshlet_data_buffer.take().destroy(&self.allocator);
+        frame.indirect_cmd_buffer.take().destroy(&self.allocator);
+        frame.indirect_count_buffer.take().destroy(&self.allocator);
+        frame.meshlet_cull_global_buffer.take().destroy(&self.allocator);
+        frame.meshlet_render_global_buffer.take().destroy(&self.allocator);
+    }
+
     unsafe fn rebuild_scene(&mut self) -> Frame {
         // Generate vertex data for newly added meshes.
         let new_meshes: HashMap<MeshHandle, Box<[Vertex]>> = self
             .meshes
             .iter()
-            .filter(|(k, v)| !self.vertex_buffers.contains_key(k))
+            .filter(|(k, _)| !self.vertex_buffers.contains_key(k))
             .map(|(id, mesh)| {
                 (
                     *id,
@@ -585,7 +624,7 @@ impl Renderer {
         for (id, vertices) in &new_meshes {
             self.vertex_buffers.insert(
                 *id,
-                create_buffer(
+                Buffer::new(
                     &self.allocator,
                     vertices.len() as u32,
                     vk::BufferUsageFlags::VERTEX_BUFFER
@@ -630,15 +669,34 @@ impl Renderer {
             }
         }
 
-        // TODO: split this up.
+        // Generic descriptor pool.
+        let descriptor_pool = self.device
+            .create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .pool_sizes(&[
+                        vk::DescriptorPoolSize::default()
+                            .ty(vk::DescriptorType::UNIFORM_BUFFER)
+                            .descriptor_count(3),
+                        vk::DescriptorPoolSize::default()
+                            .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                            .descriptor_count(1024)
+                    ])
+                    .max_sets(3)
+                    .flags(vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND),
+                None,
+            )
+            .unwrap();
+
+        // Descriptor sets.
         let [scene_set, render_set, cull_set] = self.device
             .allocate_descriptor_sets(
                 &vk::DescriptorSetAllocateInfo::default()
-                    .descriptor_pool(self.descriptor_pool)
+                    .descriptor_pool(descriptor_pool)
                     .set_layouts(&[self.scene_set_layout, self.render_set_layout, self.cull_set_layout]),
             )
             .unwrap().try_into().unwrap();
 
+        // TODO: split this up.
         let frame = Frame {
             sync_primitives: (0..MAX_FRAMES_IN_FLIGHT)
                 .map(|_| FrameSyncPrimitives {
@@ -671,17 +729,18 @@ impl Renderer {
                 .unwrap()
                 .into_boxed_slice(),
 
+            descriptor_pool,
             scene_set,
             render_set,
             cull_set,
 
-            index_buffer: create_buffer(
+            index_buffer: Buffer::new(
                 &self.allocator,
                 indices.len() as u32,
                 vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
                 vk_mem::MemoryUsage::AutoPreferDevice,
             ),
-            object_buffer: create_buffer(
+            object_buffer: Buffer::new(
                 &self.allocator,
                 self.objects.len() as u32,
                 vk::BufferUsageFlags::STORAGE_BUFFER
@@ -690,14 +749,14 @@ impl Renderer {
                 vk_mem::MemoryUsage::AutoPreferDevice,
             ),
 
-            instance_buffer: create_buffer(
+            instance_buffer: Buffer::new(
                 &self.allocator,
                 instances,
                 vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
                 vk_mem::MemoryUsage::AutoPreferDevice,
             ),
 
-            meshlet_data_buffer: create_buffer(
+            meshlet_data_buffer: Buffer::new(
                 &self.allocator,
                 instances,
                 vk::BufferUsageFlags::STORAGE_BUFFER
@@ -706,7 +765,7 @@ impl Renderer {
                 vk_mem::MemoryUsage::AutoPreferDevice,
             ),
 
-            indirect_cmd_buffer: create_buffer(
+            indirect_cmd_buffer: Buffer::new(
                 &self.allocator,
                 instances,
                 vk::BufferUsageFlags::STORAGE_BUFFER
@@ -715,7 +774,7 @@ impl Renderer {
                 vk_mem::MemoryUsage::AutoPreferDevice,
             ),
 
-            indirect_count_buffer: create_buffer(
+            indirect_count_buffer: Buffer::new(
                 &self.allocator,
                 1,
                 vk::BufferUsageFlags::STORAGE_BUFFER
@@ -725,21 +784,21 @@ impl Renderer {
                 vk_mem::MemoryUsage::AutoPreferDevice,
             ),
 
-            scene_global_buffer: create_buffer(
+            scene_global_buffer: Buffer::new(
                 &self.allocator,
                 1,
                 vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
                 vk_mem::MemoryUsage::AutoPreferDevice,
             ),
 
-            meshlet_cull_global_buffer: create_buffer(
+            meshlet_cull_global_buffer: Buffer::new(
                 &self.allocator,
                 1,
                 vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
                 vk_mem::MemoryUsage::AutoPreferDevice,
             ),
 
-            meshlet_render_global_buffer: create_buffer(
+            meshlet_render_global_buffer: Buffer::new(
                 &self.allocator,
                 1,
                 vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
@@ -1291,11 +1350,11 @@ impl Renderer {
                         .min_image_count(swapchain_image_count)
                         .image_format(surface_format.format)
                         .image_color_space(surface_format.color_space)
-                        .image_extent(Extent2D {
+                        .image_extent(vk::Extent2D {
                             width: viewport_w,
                             height: viewport_h,
                         })
-                        .image_usage(ImageUsageFlags::COLOR_ATTACHMENT)
+                        .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
                         .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
                         .pre_transform(surface_capabilities.current_transform)
                         .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
@@ -1423,24 +1482,6 @@ impl Renderer {
                             .descriptor_count(1)
                             .stage_flags(vk::ShaderStageFlags::COMPUTE)])
                         .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL),
-                    None,
-                )
-                .unwrap();
-
-            // Generic descriptor pool
-            let descriptor_pool = device
-                .create_descriptor_pool(
-                    &vk::DescriptorPoolCreateInfo::default()
-                        .pool_sizes(&[
-                            vk::DescriptorPoolSize::default()
-                                .ty(vk::DescriptorType::UNIFORM_BUFFER)
-                                .descriptor_count(3 * MAX_FRAMES_IN_FLIGHT),
-                            vk::DescriptorPoolSize::default()
-                                .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                                .descriptor_count(1024)
-                        ])
-                        .max_sets(3)
-                        .flags(vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND),
                     None,
                 )
                 .unwrap();
@@ -1666,7 +1707,6 @@ impl Renderer {
                 cmd_pool,
                 render_cmd_buffers,
 
-                descriptor_pool,
                 scene_set_layout,
                 render_set_layout,
                 cull_set_layout,
@@ -1736,11 +1776,28 @@ pub fn load_mesh(filename: impl AsRef<Path>) -> Option<(f32, Box<[Meshlet]>)> {
 
     let mut indices: Box<[u32]> = model.indices.into_boxed_slice();
     let mut vertices: Box<[Vertex]> = (0..model.positions.len() / 3)
-        .map(|i| Vertex {
-            position: Vec3::from_slice(&model.positions[3 * i..]),
-            normal: Vec3::from_slice(&model.normals[3 * i..]),
-            uv: Vec2::splat(0.0), //Vec2::from_slice(&model.texcoords[2 * i..]),
-            color: Vec3::splat(1.0),
+        .map(|i| {
+            let position = model
+                .positions
+                .get(3 * i..3 * i + 3)
+                .map(Vec3::from_slice)
+                .unwrap_or_default();
+            let normal = model
+                .normals
+                .get(3 * i..3 * i + 3)
+                .map(Vec3::from_slice)
+                .unwrap_or_default();
+            let uv = model
+                .texcoords
+                .get(2 * i..2 * i + 2)
+                .map(Vec2::from_slice)
+                .unwrap_or_default();
+            Vertex {
+                position,
+                normal,
+                uv,
+                color: Vec3::splat(1.0),
+            }
         })
         .collect();
 
@@ -1770,9 +1827,11 @@ pub fn load_mesh(filename: impl AsRef<Path>) -> Option<(f32, Box<[Meshlet]>)> {
         .map(|meshlet| {
             let bounds = meshopt::compute_meshlet_bounds_decoder(meshlet, &vertices);
             Meshlet {
-                center: bounds.cone_apex,
-                radius: bounds.radius,
-                cone_apex: bounds.cone_apex,
+                // Vertex positions are quantized in normalized mesh space, so bounds need
+                // to use the same normalization to stay consistent in shaders.
+                center: (Vec3::from_array(bounds.center) / scale).to_array(),
+                radius: bounds.radius / scale,
+                cone_apex: (Vec3::from_array(bounds.cone_apex) / scale).to_array(),
                 cone_axis: bounds.cone_axis,
                 cone_cutoff: bounds.cone_cutoff,
                 indices: meshlet.triangles.to_owned().into_boxed_slice(),

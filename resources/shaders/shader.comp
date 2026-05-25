@@ -12,7 +12,7 @@ layout (std430, set = 0, binding = 0) uniform SceneGlobal {
     mat4 pv;
     mat4 proj;
     mat4 view;
-    
+
     vec3 camera_position;
     vec3 camera_direction;
     vec3 light_position;
@@ -20,7 +20,7 @@ layout (std430, set = 0, binding = 0) uniform SceneGlobal {
 };
 
 layout (std430, set = 1, binding = 0) uniform MeshletCullGlobal {
-    vec4 frustum;    
+    vec4 frustum;
 
     DrawCountBuffer draw_count_buffer;
     MeshletBuffer meshlet_buffer;
@@ -38,30 +38,31 @@ vec3 rotate_quat(vec3 v, vec4 q) {
 }
 
 void main() {
-    // 
+    //
     if (gl_GlobalInvocationID.x >= instances) return;
 
     //
     MeshletData meshlet = meshlet_buffer.data[gl_GlobalInvocationID.x];
     Object object = object_buffer.data[meshlet.object_id];
 
-    // Frustum cull.
-    vec4 center = view * vec4(object.position + object.scale * rotate_quat(meshlet.center, object.orientation), 1.0);
+    // Frustum cull (view-space sphere test).
+    vec3 center_ws = object.position + object.scale * rotate_quat(meshlet.center, object.orientation);
+    vec4 center = view * vec4(center_ws, 1.0);
     float radius = object.scale * meshlet.radius;
 
-    float znear = 1.0;
-    float zfar = 2.0;
+    float znear = -10.0;
+    float zfar = 0.0;
     bool visible_x = center.z * frustum[1] - abs(center.x) * frustum[0] > -radius;
     bool visible_y = center.z * frustum[3] - abs(center.y) * frustum[2] > -radius;
-    bool visible_z = true; //center.z + radius > znear && center.z - radius < zfar;
-    //if (!(visible_x && visible_y && visible_z)) return;
-    
-    // Backface cull.
-	vec3 cone_apex = center.xyz;
-	vec3 cone_axis = object.position + object.scale * rotate_quat(meshlet.cone_axis, object.orientation);
-	float cone_cutoff = meshlet.cone_cutoff;
-    //if (dot(normalize(cone_apex - camera_position), cone_axis) >= cone_cutoff) return;
-    // `dot(normalize(cone_apex - camera_position), cone_axis) >= cone_cutoff`
+    bool visible_z = center.z + radius > znear && center.z - radius < zfar;
+    if (!(visible_x && visible_y && visible_z)) return;
+
+    // Backface cone cull (world space, meshoptimizer perspective formula).
+    if (meshlet.cone_cutoff < 1.0) {
+        vec3 cone_apex = object.position + object.scale * rotate_quat(meshlet.cone_apex, object.orientation);
+        vec3 cone_axis = normalize(rotate_quat(meshlet.cone_axis, object.orientation));
+        if (dot(normalize(cone_apex - camera_position), cone_axis) >= meshlet.cone_cutoff) return;
+    }
 
     // Append draw command.
     const uint i = atomicAdd(draw_count_buffer.counter, 1);
@@ -69,7 +70,8 @@ void main() {
     draw_cmd_buffer.data[i].first_index = meshlet.first_index;
     draw_cmd_buffer.data[i].instance_count = 1;
     draw_cmd_buffer.data[i].vertex_offset = 0;
-    draw_cmd_buffer.data[i].first_instance = 0;
+    // Preserve source meshlet id for stable per-meshlet shading in the vertex shader.
+    draw_cmd_buffer.data[i].first_instance = gl_GlobalInvocationID.x;
     instance_buffer.data[i].object_id = meshlet.object_id;
 }
 

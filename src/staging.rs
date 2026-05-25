@@ -78,10 +78,9 @@ impl StagingBuffer {
 
 impl Drop for StagingBuffer {
     fn drop(&mut self) {
-        println!(
-            "Warning: {} must be dropped with {}::destroy!",
+        panic!(
+            "{} dropped implicitly; destroy/unmap staging Vulkan resources explicitly first",
             std::any::type_name::<Self>(),
-            std::any::type_name::<Self>()
         );
     }
 }

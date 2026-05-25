@@ -66,5 +66,5 @@ void main() {
     frag_normal = rotate_quat(normal, object.orientation);
     frag_uv = uv;
     frag_tex_id = object.tex_id;
-    frag_color = colors[gl_DrawID % 14];
+    frag_color = colors[gl_BaseInstance % 14];
 }
