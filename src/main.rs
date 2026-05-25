@@ -67,13 +67,13 @@ fn main() {
         )
         .unwrap();
     /*let bunny_obj3 = renderer
-        .create_object(
-            bunny_mesh,
-            Vec3::new(2.0, 0.4, 0.0),
-            Quat::from_euler(EulerRot::XYZ, std::f32::consts::PI, 0.0, 0.0),
-            Vec3::splat(2.0),
-        )
-        .unwrap();*/
+    .create_object(
+        bunny_mesh,
+        Vec3::new(2.0, 0.4, 0.0),
+        Quat::from_euler(EulerRot::XYZ, std::f32::consts::PI, 0.0, 0.0),
+        Vec3::splat(2.0),
+    )
+    .unwrap();*/
 
     // "Gameloop"
     //let mut timestamp = 0_u64;

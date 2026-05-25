@@ -4,6 +4,7 @@ use ash::{khr, vk};
 use glam::*;
 use itertools::Itertools;
 use std::collections::HashMap;
+use std::default;
 use std::ffi::CStr;
 use std::mem::forget;
 use std::path::Path;
@@ -216,18 +217,17 @@ pub struct MeshHandle(u32);
 #[derive(Copy, Clone, Hash, Eq, PartialEq, Debug)]
 pub struct ObjectHandle(u32);
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Default, Debug)]
 struct FrameSyncPrimitives {
     image_available: vk::Semaphore,
-    render_finished: vk::Semaphore,
     frame_in_flight: vk::Fence,
 }
 
-const MAX_FRAMES_IN_FLIGHT: u32 = 2;
+const MAX_FRAMES_IN_FLIGHT: usize = 2;
 
 struct Frame {
     //
-    sync_primitives: Box<[FrameSyncPrimitives]>,
+    sync_primitives: [FrameSyncPrimitives; MAX_FRAMES_IN_FLIGHT],
 
     //
     scene_cmd_buffers: Box<[vk::CommandBuffer]>,
@@ -253,8 +253,8 @@ struct Frame {
 impl Frame {
     fn null() -> Self {
         Self {
-            sync_primitives: Box::new([]),
-            scene_cmd_buffers: Box::new([]),
+            sync_primitives: <_>::default(),
+            scene_cmd_buffers: <_>::default(),
             descriptor_pool: vk::DescriptorPool::null(),
             scene_set: vk::DescriptorSet::null(),
             render_set: vk::DescriptorSet::null(),
@@ -329,6 +329,7 @@ pub struct Renderer {
 
     // Frame.
     render_cmd_buffers: Box<[vk::CommandBuffer]>,
+    render_finished: Box<[vk::Semaphore]>,
     current_frame: Frame,
     next_frame: Option<Frame>,
 
@@ -354,7 +355,7 @@ impl Renderer {
             // A dirty hack. When a rebuild occurs, wait for transfer to fully complete.
             if self.frame == 0 {
                 // Rebuild scene elements.
-                self.next_frame = Some(self.rebuild_scene());
+                self.current_frame = self.rebuild_scene();
             }
         }
 
@@ -393,7 +394,6 @@ impl Renderer {
         // Sync primitives associated with this frame.
         let FrameSyncPrimitives {
             image_available,
-            render_finished,
             frame_in_flight,
         } = frame.sync_primitives[frame_index];
 
@@ -411,6 +411,7 @@ impl Renderer {
                 .swapchain_device
                 .acquire_next_image(self.swapchain, u64::MAX, image_available, vk::Fence::null())
                 .unwrap();
+            let render_finished = self.render_finished[image_index as usize];
             let scene_command_buffer = frame.scene_cmd_buffers[image_index as usize];
 
             // Reset and record.
@@ -579,22 +580,28 @@ impl Renderer {
     unsafe fn free_frame(&mut self, mut frame: Frame) {
         for sync in &frame.sync_primitives {
             self.device.destroy_semaphore(sync.image_available, None);
-            self.device.destroy_semaphore(sync.render_finished, None);
             self.device.destroy_fence(sync.frame_in_flight, None);
         }
         if frame.scene_cmd_buffers.len() > 0 {
             self.device
                 .free_command_buffers(self.cmd_pool, &frame.scene_cmd_buffers);
         }
-        self.device.destroy_descriptor_pool(frame.descriptor_pool, None);
+        self.device
+            .destroy_descriptor_pool(frame.descriptor_pool, None);
         frame.index_buffer.take().destroy(&self.allocator);
         frame.object_buffer.take().destroy(&self.allocator);
         frame.instance_buffer.take().destroy(&self.allocator);
         frame.meshlet_data_buffer.take().destroy(&self.allocator);
         frame.indirect_cmd_buffer.take().destroy(&self.allocator);
         frame.indirect_count_buffer.take().destroy(&self.allocator);
-        frame.meshlet_cull_global_buffer.take().destroy(&self.allocator);
-        frame.meshlet_render_global_buffer.take().destroy(&self.allocator);
+        frame
+            .meshlet_cull_global_buffer
+            .take()
+            .destroy(&self.allocator);
+        frame
+            .meshlet_render_global_buffer
+            .take()
+            .destroy(&self.allocator);
     }
 
     unsafe fn rebuild_scene(&mut self) -> Frame {
@@ -670,7 +677,8 @@ impl Renderer {
         }
 
         // Generic descriptor pool.
-        let descriptor_pool = self.device
+        let descriptor_pool = self
+            .device
             .create_descriptor_pool(
                 &vk::DescriptorPoolCreateInfo::default()
                     .pool_sizes(&[
@@ -679,7 +687,7 @@ impl Renderer {
                             .descriptor_count(3),
                         vk::DescriptorPoolSize::default()
                             .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                            .descriptor_count(1024)
+                            .descriptor_count(1024),
                     ])
                     .max_sets(3)
                     .flags(vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND),
@@ -688,35 +696,36 @@ impl Renderer {
             .unwrap();
 
         // Descriptor sets.
-        let [scene_set, render_set, cull_set] = self.device
+        let [scene_set, render_set, cull_set] = self
+            .device
             .allocate_descriptor_sets(
                 &vk::DescriptorSetAllocateInfo::default()
                     .descriptor_pool(descriptor_pool)
-                    .set_layouts(&[self.scene_set_layout, self.render_set_layout, self.cull_set_layout]),
+                    .set_layouts(&[
+                        self.scene_set_layout,
+                        self.render_set_layout,
+                        self.cull_set_layout,
+                    ]),
             )
-            .unwrap().try_into().unwrap();
+            .unwrap()
+            .try_into()
+            .unwrap();
 
         // TODO: split this up.
         let frame = Frame {
-            sync_primitives: (0..MAX_FRAMES_IN_FLIGHT)
-                .map(|_| FrameSyncPrimitives {
-                    image_available: self
-                        .device
-                        .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
-                        .unwrap(),
-                    render_finished: self
-                        .device
-                        .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
-                        .unwrap(),
-                    frame_in_flight: self
-                        .device
-                        .create_fence(
-                            &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
-                            None,
-                        )
-                        .unwrap(),
-                })
-                .collect(),
+            sync_primitives: dbg!(std::array::from_fn(|_| FrameSyncPrimitives {
+                image_available: self
+                    .device
+                    .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+                    .unwrap(),
+                frame_in_flight: self
+                    .device
+                    .create_fence(
+                        &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+                        None,
+                    )
+                    .unwrap(),
+            })),
 
             scene_cmd_buffers: self
                 .device
@@ -1651,10 +1660,19 @@ impl Renderer {
                     &vk::CommandBufferAllocateInfo::default()
                         .command_pool(cmd_pool)
                         .level(vk::CommandBufferLevel::PRIMARY)
-                        .command_buffer_count(MAX_FRAMES_IN_FLIGHT),
+                        .command_buffer_count(MAX_FRAMES_IN_FLIGHT as _),
                 )
                 .unwrap()
                 .into_boxed_slice();
+
+            let render_finished = (0..swapchain_image_count)
+                .into_iter()
+                .map(|_| {
+                    device
+                        .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+                        .unwrap()
+                })
+                .collect();
 
             // Staging data.
             let staging_buffer = StagingBuffer::new(10000000, &allocator);
@@ -1705,7 +1723,6 @@ impl Renderer {
                 swapchain_depth_views,
 
                 cmd_pool,
-                render_cmd_buffers,
 
                 scene_set_layout,
                 render_set_layout,
@@ -1726,6 +1743,8 @@ impl Renderer {
                 staging_cmd_buffer,
                 staging_fence,
 
+                render_cmd_buffers,
+                render_finished,
                 current_frame: Frame::null(),
                 next_frame: None,
 
@@ -1774,28 +1793,49 @@ pub fn load_mesh(filename: impl AsRef<Path>) -> Option<(f32, Box<[Meshlet]>)> {
         }
     }
 
-    let mut indices: Box<[u32]> = model.indices.into_boxed_slice();
+    let mut indices = model.indices;
+    let positions: Vec<Vec3> = model
+        .positions
+        .chunks_exact(3)
+        .map(Vec3::from_slice)
+        .collect();
+    let uvs: Vec<Vec2> = model
+        .texcoords
+        .chunks_exact(2)
+        .map(Vec2::from_slice)
+        .collect();
+    let normals: Vec<Vec3> = if !model.normals.is_empty() {
+        model
+            .normals
+            .chunks_exact(3)
+            .map(Vec3::from_slice)
+            .collect()
+    } else {
+        // Normals dont exist, and are constructed here:
+        let mut normals = vec![Vec3::ZERO; positions.len()];
+        for tri in indices.chunks_exact(3) {
+            let [i0, i1, i2]: [u32; 3] = tri.try_into().unwrap();
+            let i0 = i0 as usize;
+            let i1 = i1 as usize;
+            let i2 = i2 as usize;
+            let p0 = positions[i0];
+            let p1 = positions[i1];
+            let p2 = positions[i2];
+            let face_normal = (p1 - p0).cross(p2 - p0).normalize_or_zero();
+            normals[i0] += face_normal;
+            normals[i1] += face_normal;
+            normals[i2] += face_normal;
+        }
+        normals.iter_mut().for_each(|n| *n = n.normalize_or_zero());
+        normals
+    };
+
     let mut vertices: Box<[Vertex]> = (0..model.positions.len() / 3)
         .map(|i| {
-            let position = model
-                .positions
-                .get(3 * i..3 * i + 3)
-                .map(Vec3::from_slice)
-                .unwrap_or_default();
-            let normal = model
-                .normals
-                .get(3 * i..3 * i + 3)
-                .map(Vec3::from_slice)
-                .unwrap_or_default();
-            let uv = model
-                .texcoords
-                .get(2 * i..2 * i + 2)
-                .map(Vec2::from_slice)
-                .unwrap_or_default();
             Vertex {
-                position,
-                normal,
-                uv,
+                position: positions[i],
+                normal: normals[i],
+                uv: uvs.get(i).cloned().unwrap_or_default(),
                 color: Vec3::splat(1.0),
             }
         })
