@@ -1,91 +1,99 @@
 use ash::vk;
+use vk_mem::Alloc;
 
-struct Buffer {
-    buffer: vk::Buffer,
-    alloc: vk_mem::Allocation,
-    alloc_info: vk_mem::AllocationInfo,
+#[derive(Debug)]
+pub(crate) struct Buffer<T> {
+    pub phantom: std::marker::PhantomData<T>,
+    pub buffer: vk::Buffer,
+    pub alloc: Option<vk_mem::Allocation>,
+    pub len: u32,
 }
 
-impl Buffer {
-    pub fn new(size: usize, usage: vk::BufferUsageFlags, vma_usage: vk_mem::MemoryUsage) -> Self {
-        let buffer_cinfo = vk::BufferCreateInfo::default()
-            .size(size as u64)
-            .usage(usage);
-        let buffer_acinfo = vk_mem::AllocationCreateInfo {
-            usage: vma_usage,
-            ..Default::default()
-        };
-    }
-}
-
-/*
-use alloc::alloc;
-use ash::vk;
-use ash::{Device, Instance};
-
-struct VertexBuffer {
-    handle: vk::Buffer,
-    memory: vk::DeviceMemory,
-}
-
-unsafe fn find_memory_type(
-    instance: ash::Instance,
-    pdevice: vk::PhysicalDevice,
-    device: ash::Device,
-    buffer: vk::Buffer,
-    flags: vk::MemoryPropertyFlags,
-) -> Option<u32> {
-    let memory_properties = instance.get_physical_device_memory_properties(pdevice);
-    let memory_requirements = device.get_buffer_memory_requirements(buffer);
-
-    for i in 0..memory_properties.memory_type_count {
-        // Check if this resource supports this memory type.
-        if memory_requirements.memory_type_bits & (i << 1) == 0 {
-            continue;
-        }
-
-        // Check if this memory type has the property flags needed.
-        if memory_properties.memory_types[i as usize]
-            .property_flags
-            .contains(flags)
-        {
-            return Some(i);
+impl<T> Drop for Buffer<T> {
+    fn drop(&mut self) {
+        if self.alloc.is_some() {
+            panic!(
+                "Active {} dropped implicitly",
+                std::any::type_name::<Self>()
+            );
         }
     }
-    return None;
 }
 
-impl VertexBuffer {
-    unsafe fn new(
-        instance: ash::Instance,
-        pdevice: vk::PhysicalDevice,
-        device: ash::Device,
-        size: usize,
-        usage: vk::BufferUsageFlags,
+#[allow(unused)]
+impl<T> Buffer<T> {
+    pub(crate) fn new(
+        allocator: &vk_mem::Allocator,
+        len: u32,
+        vk_usage: vk::BufferUsageFlags,
+        vma_usage: vk_mem::MemoryUsage,
     ) -> Self {
-        let buffer_info = vk::BufferCreateInfo::default()
-            .size(size as u64)
-            .usage(usage)
-            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        unsafe {
+            let (buffer, alloc) = allocator
+                .create_buffer(
+                    &vk::BufferCreateInfo::default()
+                        .size(len as u64 * size_of::<T>() as u64)
+                        .usage(vk_usage),
+                    &vk_mem::AllocationCreateInfo {
+                        usage: vma_usage,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
 
-        let buffer = device.create_buffer(&buffer_info, None).unwrap();
+            Buffer {
+                phantom: std::marker::PhantomData,
+                buffer,
+                alloc: Some(alloc),
+                len,
+            }
+        }
+    }
 
-        let index = find_memory_type(
-            instance,
-            pdevice,
-            device,
-            buffer,
-            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-        )
-        .unwrap();
+    pub(crate) fn null() -> Self {
+        Self {
+            phantom: std::marker::PhantomData,
+            buffer: vk::Buffer::null(),
+            alloc: None,
+            len: 0,
+        }
+    }
 
-        let memory_info = vk::MemoryAllocateInfo::default()
-            .allocation_size(size as u64)
-            .memory_type_index(index);
+    pub(crate) fn is_null(&self) -> bool {
+        self.alloc.is_none()
+    }
 
-        let memory = device.allocate_memory(memory_info, None).unwrap();
+    pub(crate) fn len(&self) -> u32 {
+        self.len
+    }
 
-        device.bind_buffer_memory(buffer, memory, 0);
+    pub(crate) fn size(&self) -> usize {
+        self.len as usize * size_of::<T>()
+    }
+
+    pub(crate) fn stride(&self) -> u32 {
+        size_of::<T>() as u32
+    }
+
+    pub(crate) fn vk_handle(&self) -> vk::Buffer {
+        self.buffer
+    }
+
+    pub(crate) fn take(&mut self) -> Self {
+        Self {
+            phantom: self.phantom,
+            buffer: self.buffer,
+            len: self.len,
+            alloc: self.alloc.take(),
+        }
+    }
+
+    pub(crate) unsafe fn destroy(mut self, allocator: &vk_mem::Allocator) {
+        if let Some(alloc) = self.alloc.as_mut() {
+            unsafe {
+                allocator.destroy_buffer(self.buffer, alloc);
+            }
+        }
+        std::mem::forget(self);
     }
 }
-*/

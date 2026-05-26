@@ -31,14 +31,12 @@ layout (std430, set = 1, binding = 0) uniform MeshletCullGlobal {
     uint instances;
 };
 
-// Distance to plane
-// return dot(vec4(vPoint, 1.0), vPlane);
 vec3 rotate_quat(vec3 v, vec4 q) {
     return v + 2.0 * cross(q.xyz, cross(q.xyz, v) + q.w * v);
 }
 
 void main() {
-    //
+    // Filter invalid invocation ids.
     if (gl_GlobalInvocationID.x >= instances) return;
 
     //
@@ -65,21 +63,14 @@ void main() {
     }
 
     // Append draw command.
+    VkDrawIndexedIndirectCommand cmd;
+    cmd.index_count = meshlet.index_count;
+    cmd.first_index = meshlet.first_index;
+    cmd.instance_count = 1;
+    cmd.vertex_offset = 0;
+    cmd.first_instance = gl_GlobalInvocationID.x;
+
     const uint i = atomicAdd(draw_count_buffer.counter, 1);
-    draw_cmd_buffer.data[i].index_count = meshlet.index_count;
-    draw_cmd_buffer.data[i].first_index = meshlet.first_index;
-    draw_cmd_buffer.data[i].instance_count = 1;
-    draw_cmd_buffer.data[i].vertex_offset = 0;
-    // Preserve source meshlet id for stable per-meshlet shading in the vertex shader.
-    draw_cmd_buffer.data[i].first_instance = gl_GlobalInvocationID.x;
+    draw_cmd_buffer.data[i] = cmd;
     instance_buffer.data[i].object_id = meshlet.object_id;
 }
-
-
-    /*
-    vec4 center = object.model * vec4(meshlet.center, 1.0);
-    float d0 = min(dot(center, frustum_left), dot(center, frustum_right));
-    float d1 = min(dot(center, frustum_bottom), dot(center, frustum_top));
-    //float d2 = min(dot(center, frustum_near), dot(center, frustum_far));
-    if (min(d0, d1) + meshlet.radius < 0) return;
-    */

@@ -1,216 +1,16 @@
-use ash::vk::Handle;
-//use crate::util::Map2;
-use ash::{khr, vk};
+use crate::buffer::Buffer;
+use crate::core::Core;
+use crate::glsl_types::*;
+use crate::mesh::{Meshlet, load_mesh};
+use crate::staging::StagingBuffer;
+use crate::swapchain::Swapchain;
+use ash::vk;
 use glam::*;
-use itertools::Itertools;
 use std::collections::HashMap;
-use std::default;
 use std::ffi::CStr;
-use std::mem::forget;
 use std::path::Path;
 use std::path::PathBuf;
-use vk_mem::Alloc;
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
-
-use crate::staging::StagingBuffer;
-
-#[repr(C, align(16))]
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
-struct Std430<T>(T);
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug)]
-struct SceneGlobal {
-    // Matrices.
-    pv: Mat4,
-    proj: Mat4,
-    view: Mat4,
-
-    // Misc.
-    camera_position: Std430<Vec3>,
-    camera_direction: Std430<Vec3>, // XYZ
-    light_position: Std430<Vec3>,
-    light_color: Std430<Vec4>,
-}
-
-#[repr(C, align(16))]
-#[derive(Copy, Clone, Debug)]
-struct MeshletRenderGlobal {
-    instance_buffer: vk::DeviceAddress,
-    object_buffer: vk::DeviceAddress,
-}
-
-#[repr(C, align(16))]
-#[derive(Copy, Clone, Debug)]
-struct MeshletCullGlobal {
-    frustum: [f32; 4],
-
-    draw_count_buffer: vk::DeviceAddress,
-    meshlet_buffer: vk::DeviceAddress,
-    draw_cmd_buffer: vk::DeviceAddress,
-    instance_buffer: vk::DeviceAddress,
-    object_buffer: vk::DeviceAddress,
-
-    instances: u32,
-}
-
-#[derive(Clone, Debug)]
-#[repr(C, align(16))]
-struct Object {
-    position: Vec3,
-    scale: f32,
-    orientation: Quat,
-    vertex_buffer: vk::DeviceAddress,
-    texture_id: u32,
-}
-
-#[derive(Clone, Debug)]
-#[repr(C, align(16))]
-struct Instance {
-    object_id: u32,
-}
-
-#[derive(Clone, Debug)]
-#[repr(C, align(16))]
-struct MeshletData {
-    // Culling.
-    center: [f32; 3],
-    radius: f32,
-    cone_apex: [f32; 3],
-    pad0: f32,
-    cone_axis: [f32; 3],
-    cone_cutoff: f32,
-
-    // Draw cmd.
-    object_id: u32,
-    index_count: u32,
-    first_index: u32,
-}
-
-#[repr(C)]
-#[derive(Clone, Debug, Default)]
-struct Vertex {
-    position: [i16; 3],
-    uv: [i16; 2],
-    normal: [i8; 3],
-}
-
-#[derive(Debug)]
-pub struct Buffer<T> {
-    phantom: std::marker::PhantomData<T>,
-    buffer: vk::Buffer,
-    alloc: Option<vk_mem::Allocation>,
-    len: u32,
-}
-
-impl<T> Drop for Buffer<T> {
-    fn drop(&mut self) {
-        if self.alloc.is_some() {
-            panic!(
-                "Active {} dropped implicitly",
-                std::any::type_name::<Self>()
-            );
-        }
-    }
-}
-
-impl<T> Buffer<T> {
-    fn new(
-        allocator: &vk_mem::Allocator,
-        len: u32,
-        vk_usage: vk::BufferUsageFlags,
-        vma_usage: vk_mem::MemoryUsage,
-    ) -> Self {
-        unsafe {
-            let (buffer, alloc) = allocator
-                .create_buffer(
-                    &vk::BufferCreateInfo::default()
-                        .size(len as u64 * size_of::<T>() as u64)
-                        .usage(vk_usage),
-                    &vk_mem::AllocationCreateInfo {
-                        usage: vma_usage,
-                        ..Default::default()
-                    },
-                )
-                .unwrap();
-
-            Buffer {
-                phantom: std::marker::PhantomData,
-                buffer,
-                alloc: Some(alloc),
-                len,
-            }
-        }
-    }
-
-    pub fn null() -> Self {
-        Self {
-            phantom: std::marker::PhantomData,
-            buffer: vk::Buffer::null(),
-            alloc: None,
-            len: 0,
-        }
-    }
-
-    pub fn is_null(&self) -> bool {
-        self.alloc.is_none()
-    }
-
-    pub fn len(&self) -> u32 {
-        self.len
-    }
-
-    pub fn size(&self) -> usize {
-        self.len as usize * size_of::<T>()
-    }
-
-    pub fn stride(&self) -> u32 {
-        size_of::<T>() as u32
-    }
-
-    pub fn vk_handle(&self) -> vk::Buffer {
-        self.buffer
-    }
-
-    pub fn take(&mut self) -> Self {
-        Self {
-            phantom: self.phantom,
-            buffer: self.buffer,
-            len: self.len,
-            alloc: self.alloc.take(),
-        }
-    }
-
-    unsafe fn destroy(mut self, allocator: &vk_mem::Allocator) {
-        if let Some(alloc) = self.alloc.as_mut() {
-            unsafe {
-                allocator.destroy_buffer(self.buffer, alloc);
-            }
-        }
-        std::mem::forget(self);
-    }
-}
-
-#[derive(Debug)]
-pub struct Meshlet {
-    pub center: [f32; 3],
-    pub radius: f32,
-    pub cone_apex: [f32; 3],
-    pub cone_axis: [f32; 3],
-    pub cone_cutoff: f32,
-    pub indices: Box<[u8]>,
-    pub positions: Box<[[i16; 3]]>,
-    pub normals: Box<[[i8; 3]]>,
-    pub texcoords: Box<[[i16; 2]]>,
-}
-
-#[derive(Debug)]
-struct ObjectInstance {
-    mesh: MeshHandle,
-    position: Vec3,
-    scale: f32,
-    orientation: Quat,
-}
 
 #[derive(Copy, Clone, Hash, Eq, PartialEq, Debug)]
 pub struct MeshHandle(u32);
@@ -223,17 +23,21 @@ struct FrameSyncPrimitives {
     frame_in_flight: vk::Fence,
 }
 
+#[derive(Debug)]
+pub(super) struct ObjectInstance {
+    pub mesh: MeshHandle,
+    pub position: Vec3,
+    pub scale: f32,
+    pub orientation: Quat,
+}
+
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
 
 struct Frame {
     //
-    sync_primitives: [FrameSyncPrimitives; MAX_FRAMES_IN_FLIGHT],
-
-    //
     scene_cmd_buffers: Box<[vk::CommandBuffer]>,
 
     // Descriptor sets.
-    descriptor_pool: vk::DescriptorPool,
     scene_set: vk::DescriptorSet,
     render_set: vk::DescriptorSet,
     cull_set: vk::DescriptorSet,
@@ -253,9 +57,7 @@ struct Frame {
 impl Frame {
     fn null() -> Self {
         Self {
-            sync_primitives: <_>::default(),
             scene_cmd_buffers: <_>::default(),
-            descriptor_pool: vk::DescriptorPool::null(),
             scene_set: vk::DescriptorSet::null(),
             render_set: vk::DescriptorSet::null(),
             cull_set: vk::DescriptorSet::null(),
@@ -273,19 +75,10 @@ impl Frame {
 }
 
 pub struct Renderer {
-    // Various Vulkan state data.
-    entry: ash::Entry,
-    instance: ash::Instance,
-    physical_device: vk::PhysicalDevice,
-
-    surface_instance: khr::surface::Instance,
-    surface: vk::SurfaceKHR,
-    surface_format: vk::SurfaceFormatKHR,
-    surface_capabilities: vk::SurfaceCapabilitiesKHR,
-    surface_extent: vk::Extent2D,
+    //
+    core: Core,
 
     device: ash::Device,
-    queue_family_index: u32,
     graphics_queue: vk::Queue,
     present_queue: vk::Queue,
     //transfer_queue: vk::Queue,
@@ -294,12 +87,7 @@ pub struct Renderer {
     allocator: vk_mem::Allocator,
 
     // Swapchain data.
-    swapchain_device: khr::swapchain::Device,
-    swapchain: vk::SwapchainKHR,
-    depth_image: (vk::Image, vk_mem::Allocation),
-    swapchain_images: Box<[vk::Image]>,
-    swapchain_color_views: Box<[vk::ImageView]>,
-    swapchain_depth_views: Box<[vk::ImageView]>,
+    swapchain: Swapchain,
 
     // Command pool.
     cmd_pool: vk::CommandPool,
@@ -328,7 +116,9 @@ pub struct Renderer {
     staging_fence: vk::Fence,
 
     // Frame.
-    render_cmd_buffers: Box<[vk::CommandBuffer]>,
+    sync_primitives: [FrameSyncPrimitives; MAX_FRAMES_IN_FLIGHT],
+    render_cmd_buffers: [vk::CommandBuffer; MAX_FRAMES_IN_FLIGHT],
+    descriptor_pools: [vk::DescriptorPool; MAX_FRAMES_IN_FLIGHT],
     render_finished: Box<[vk::Semaphore]>,
     current_frame: Frame,
     next_frame: Option<Frame>,
@@ -350,25 +140,24 @@ impl Drop for Renderer {
 }
 
 impl Renderer {
-    pub fn render(&mut self, timestamp: f32) {
+    pub fn render(&mut self, _timestamp: f32) {
+        let frame_index = self.frame % MAX_FRAMES_IN_FLIGHT;
+        self.frame += 1;
+
         unsafe {
             // A dirty hack. When a rebuild occurs, wait for transfer to fully complete.
-            if self.frame == 0 {
+            if self.frame == 1 {
                 // Rebuild scene elements.
-                self.current_frame = self.rebuild_scene();
+                self.current_frame = self.rebuild_scene(frame_index);
             }
         }
 
         // Attempt to clean up current_frame if there is a next.
         if self.next_frame.is_some() {
             // All frames are signalled.
-            let signalled =
-                self.current_frame
-                    .sync_primitives
-                    .iter()
-                    .fold(true, |acc, syncs| unsafe {
-                        acc & self.device.get_fence_status(syncs.frame_in_flight).unwrap()
-                    });
+            let signalled = self.sync_primitives.iter().fold(true, |acc, syncs| unsafe {
+                acc & self.device.get_fence_status(syncs.frame_in_flight).unwrap()
+            });
 
             if signalled {
                 let frame =
@@ -388,14 +177,11 @@ impl Renderer {
             None => &self.current_frame,
         };
 
-        let frame_index = self.frame % frame.sync_primitives.len();
-        self.frame += 1;
-
         // Sync primitives associated with this frame.
         let FrameSyncPrimitives {
             image_available,
             frame_in_flight,
-        } = frame.sync_primitives[frame_index];
+        } = self.sync_primitives[frame_index];
 
         // Command buffer associated with this frame.
         let command_buffer = self.render_cmd_buffers[frame_index];
@@ -408,8 +194,14 @@ impl Renderer {
             self.device.reset_fences(&[frame_in_flight]).unwrap();
 
             let (image_index, _) = self
+                .swapchain
                 .swapchain_device
-                .acquire_next_image(self.swapchain, u64::MAX, image_available, vk::Fence::null())
+                .acquire_next_image(
+                    self.swapchain.swapchain,
+                    u64::MAX,
+                    image_available,
+                    vk::Fence::null(),
+                )
                 .unwrap();
             let render_finished = self.render_finished[image_index as usize];
             let scene_command_buffer = frame.scene_cmd_buffers[image_index as usize];
@@ -438,19 +230,9 @@ impl Renderer {
                 // Upload global descriptor data & object data.
                 let projection = Mat4::perspective_infinite_rh(
                     std::f32::consts::FRAC_PI_6,
-                    self.surface_extent.width as f32 / self.surface_extent.height as f32,
+                    self.core.surface_extent.width as f32 / self.core.surface_extent.height as f32,
                     0.1,
-                    //2.0,
                 );
-                /*let view = (Mat4::from_rotation_translation(
-                    Quat::from_euler(
-                        EulerRot::XYZ,
-                        0., //-std::f32::consts::FRAC_PI_8,
-                        self.cam_rot[0],
-                        0.,
-                    ),
-                    Vec3::splat(0.),
-                ) * Mat4::from_translation(-self.cam_pos));*/
 
                 let p = Vec3::new(self.cam_rot[0].sin(), 0., -self.cam_rot[0].cos());
                 let view = Mat4::look_to_rh(self.cam_pos, p, Vec3::new(0., 1., 0.));
@@ -460,7 +242,7 @@ impl Renderer {
                 let temp = projection.transpose();
                 let frustum_x = normalize_plane(temp.w_axis + temp.x_axis);
                 let frustum_y = normalize_plane(temp.w_axis + temp.y_axis);
-                let frustum = [frustum_x.x, frustum_x.z, frustum_y.y, frustum_y.z];
+                let frustum = Vec4::from([frustum_x.x, frustum_x.z, frustum_y.y, frustum_y.z]);
 
                 // Upload data.
                 {
@@ -483,10 +265,10 @@ impl Renderer {
                             pv: projection * view,
                             proj: projection,
                             view,
-                            camera_position: Std430(self.cam_pos),
-                            camera_direction: Std430(p),
-                            light_position: Std430(Vec3::new(1.0, 0.0, 0.0)),
-                            light_color: Std430(Vec4::new(1.0, 1.0, 1.0, 1.0)),
+                            camera_position: self.cam_pos.extend(1.0),
+                            camera_direction: p.extend(0.0),
+                            light_position: Vec4::new(1.0, 0.0, 0.0, 1.0),
+                            light_color: Vec4::new(1.0, 1.0, 1.0, 1.0),
                         }],
                     );
 
@@ -565,12 +347,13 @@ impl Renderer {
                 .unwrap();
 
             // Swap backbuffer.
-            self.swapchain_device
+            self.swapchain
+                .swapchain_device
                 .queue_present(
                     self.present_queue,
                     &vk::PresentInfoKHR::default()
                         .wait_semaphores(&[render_finished])
-                        .swapchains(&[self.swapchain])
+                        .swapchains(&[self.swapchain.swapchain])
                         .image_indices(&[image_index]),
                 )
                 .unwrap();
@@ -578,16 +361,10 @@ impl Renderer {
     }
 
     unsafe fn free_frame(&mut self, mut frame: Frame) {
-        for sync in &frame.sync_primitives {
-            self.device.destroy_semaphore(sync.image_available, None);
-            self.device.destroy_fence(sync.frame_in_flight, None);
-        }
         if frame.scene_cmd_buffers.len() > 0 {
             self.device
                 .free_command_buffers(self.cmd_pool, &frame.scene_cmd_buffers);
         }
-        self.device
-            .destroy_descriptor_pool(frame.descriptor_pool, None);
         frame.index_buffer.take().destroy(&self.allocator);
         frame.object_buffer.take().destroy(&self.allocator);
         frame.instance_buffer.take().destroy(&self.allocator);
@@ -604,7 +381,7 @@ impl Renderer {
             .destroy(&self.allocator);
     }
 
-    unsafe fn rebuild_scene(&mut self) -> Frame {
+    unsafe fn rebuild_scene(&mut self, fif: usize) -> Frame {
         // Generate vertex data for newly added meshes.
         let new_meshes: HashMap<MeshHandle, Box<[Vertex]>> = self
             .meshes
@@ -661,11 +438,11 @@ impl Renderer {
             // Mesh data.
             for meshlet in mesh {
                 meshlet_data.push(MeshletData {
-                    center: meshlet.center,
+                    center: Vec3::from(meshlet.center),
                     radius: meshlet.radius,
-                    cone_apex: meshlet.cone_apex,
+                    cone_apex: Vec3::from(meshlet.cone_apex),
                     pad0: 0.,
-                    cone_axis: meshlet.cone_axis,
+                    cone_axis: Vec3::from(meshlet.cone_axis),
                     cone_cutoff: meshlet.cone_cutoff,
                     object_id: i as u32,
                     index_count: meshlet.indices.len() as u32,
@@ -676,31 +453,12 @@ impl Renderer {
             }
         }
 
-        // Generic descriptor pool.
-        let descriptor_pool = self
-            .device
-            .create_descriptor_pool(
-                &vk::DescriptorPoolCreateInfo::default()
-                    .pool_sizes(&[
-                        vk::DescriptorPoolSize::default()
-                            .ty(vk::DescriptorType::UNIFORM_BUFFER)
-                            .descriptor_count(3),
-                        vk::DescriptorPoolSize::default()
-                            .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                            .descriptor_count(1024),
-                    ])
-                    .max_sets(3)
-                    .flags(vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND),
-                None,
-            )
-            .unwrap();
-
         // Descriptor sets.
         let [scene_set, render_set, cull_set] = self
             .device
             .allocate_descriptor_sets(
                 &vk::DescriptorSetAllocateInfo::default()
-                    .descriptor_pool(descriptor_pool)
+                    .descriptor_pool(self.descriptor_pools[fif])
                     .set_layouts(&[
                         self.scene_set_layout,
                         self.render_set_layout,
@@ -713,32 +471,17 @@ impl Renderer {
 
         // TODO: split this up.
         let frame = Frame {
-            sync_primitives: dbg!(std::array::from_fn(|_| FrameSyncPrimitives {
-                image_available: self
-                    .device
-                    .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
-                    .unwrap(),
-                frame_in_flight: self
-                    .device
-                    .create_fence(
-                        &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
-                        None,
-                    )
-                    .unwrap(),
-            })),
-
             scene_cmd_buffers: self
                 .device
                 .allocate_command_buffers(
                     &vk::CommandBufferAllocateInfo::default()
                         .command_pool(self.cmd_pool)
                         .level(vk::CommandBufferLevel::SECONDARY)
-                        .command_buffer_count(self.swapchain_images.len() as u32),
+                        .command_buffer_count(self.swapchain.images.len() as u32),
                 )
                 .unwrap()
                 .into_boxed_slice(),
 
-            descriptor_pool,
             scene_set,
             render_set,
             cull_set,
@@ -868,11 +611,11 @@ impl Renderer {
             .unwrap();
 
         // Rerecord scene command buffers.
-        for i in 0..self.swapchain_images.len() {
+        for i in 0..self.swapchain.images.len() {
             let command_buffer = frame.scene_cmd_buffers[i];
-            let image = self.swapchain_images[i];
-            let color_view = self.swapchain_color_views[i];
-            let depth_view = self.swapchain_depth_views[i];
+            let image = self.swapchain.images[i];
+            let color_view = self.swapchain.color_views[i];
+            let depth_view = self.swapchain.depth_views[i];
 
             unsafe {
                 // Begin recording.
@@ -940,7 +683,7 @@ impl Renderer {
                             vk::ImageMemoryBarrier2::default()
                                 .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
                                 .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-                                .image(self.depth_image.0)
+                                .image(self.swapchain.depth_image.0)
                                 .subresource_range(
                                     vk::ImageSubresourceRange::default()
                                         .aspect_mask(vk::ImageAspectFlags::DEPTH)
@@ -963,8 +706,8 @@ impl Renderer {
                             .render_area(vk::Rect2D {
                                 offset: vk::Offset2D { x: 0, y: 0 },
                                 extent: vk::Extent2D {
-                                    width: self.surface_extent.width,
-                                    height: self.surface_extent.height,
+                                    width: self.core.surface_extent.width,
+                                    height: self.core.surface_extent.height,
                                 },
                             })
                             .layer_count(1)
@@ -1052,7 +795,7 @@ impl Renderer {
                         vk::ImageMemoryBarrier2::default()
                             .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
                             .dst_stage_mask(vk::PipelineStageFlags2::BOTTOM_OF_PIPE)
-                            .image(self.depth_image.0)
+                            .image(self.swapchain.depth_image.0)
                             .subresource_range(
                                 vk::ImageSubresourceRange::default()
                                     .aspect_mask(vk::ImageAspectFlags::DEPTH)
@@ -1153,12 +896,7 @@ impl Renderer {
         viewport_h: u32,
         display: impl HasDisplayHandle + HasWindowHandle,
     ) -> Self {
-        let raw_display_handle = display.display_handle().unwrap().as_raw();
-        let raw_window_handle = display.window_handle().unwrap().as_raw();
-
         // Required Vulkan features (pass some of these in?).
-        let instance_extensions = [];
-        let validation_layers = [c"VK_LAYER_KHRONOS_validation"];
         let device_extensions = [
             c"VK_KHR_dynamic_rendering",
             c"VK_EXT_descriptor_indexing",
@@ -1166,101 +904,14 @@ impl Renderer {
         ];
 
         unsafe {
-            let entry = ash::Entry::load().expect("Failed to load vulkan functions.");
-
-            let instance = {
-                let required_extensions =
-                    ash_window::enumerate_required_extensions(raw_display_handle).unwrap();
-                let extensions = [
-                    required_extensions,
-                    &instance_extensions.map(|x: &CStr| x.as_ptr()),
-                ]
-                .concat();
-
-                let driver_api_version = entry
-                    .try_enumerate_instance_version()
-                    .unwrap_or(None)
-                    .unwrap_or(vk::API_VERSION_1_0);
-                let app_info = vk::ApplicationInfo::default()
-                    .application_name(c"Raytrace")
-                    .api_version(driver_api_version.min(vk::API_VERSION_1_3));
-                let layers = validation_layers.map(|x: &CStr| x.as_ptr());
-                let instance_cinfo = vk::InstanceCreateInfo::default()
-                    .application_info(&app_info)
-                    .enabled_layer_names(&layers)
-                    .enabled_extension_names(&extensions);
-                entry
-                    .create_instance(&instance_cinfo, None)
-                    .expect("Failed to create vulkan instance.")
-            };
-
-            // Find first descrete GPU.
-            let physical_device = instance
-                .enumerate_physical_devices()
-                .expect("Could not find any Vulkan compatible devices.")
-                .into_iter()
-                /*.find(|&physical_device| {
-                    println!(
-                        "{:?}",
-                        instance
-                            .get_physical_device_properties(physical_device)
-                            .device_type
-                    );
-                    instance
-                        .get_physical_device_properties(physical_device)
-                        .device_type
-                        == vk::PhysicalDeviceType::DISCRETE_GPU
-                })*/
-                .next()
-                .unwrap();
-
-            let surface_instance = khr::surface::Instance::new(&entry, &instance);
-            let surface = ash_window::create_surface(
-                &entry,
-                &instance,
-                raw_display_handle,
-                raw_window_handle,
-                None,
-            )
-            .unwrap();
-
-            let surface_format = surface_instance
-                .get_physical_device_surface_formats(physical_device, surface)
-                .unwrap()
-                .into_iter()
-                .next()
-                .unwrap();
-            let surface_capabilities = surface_instance
-                .get_physical_device_surface_capabilities(physical_device, surface)
-                .unwrap();
-
-            // Find a queue family that is capable of both present and graphics commands.
-            let queue_family_index = instance
-                .get_physical_device_queue_family_properties(physical_device)
-                .into_iter()
-                .enumerate()
-                .find_map(|(index, properties)| {
-                    let graphics = properties.queue_flags.contains(vk::QueueFlags::GRAPHICS);
-                    let present = surface_instance
-                        .get_physical_device_surface_support(physical_device, index as u32, surface)
-                        .unwrap();
-                    (graphics && present).then_some(index as u32)
-                })
-                .expect("Could not find a suitable graphics queue.");
-
-            // Find a queue family that is capable of just transfer commands.
-            /*let queue_family_index = instance
-            .get_physical_device_queue_family_properties(physical_device)
-            .into_iter()
-            .enumerate()
-            .find_map(|(index, properties)| {
-                println!("{:?}", properties.queue_flags);
-                properties
-                    .queue_flags
-                    .eq(&vk::QueueFlags::TRANSFER)
-                    .then_some(index as u32)
-            })
-            .expect("Could not find a suitable graphics queue.");*/
+            let core = Core::new(viewport_w, viewport_h, display);
+            let &Core {
+                ref instance,
+                physical_device,
+                queue_family_index,
+                surface_format,
+                ..
+            } = &core;
 
             // Create logical device and its associated queues.
             let (device, graphics_queue, present_queue) = {
@@ -1317,112 +968,13 @@ impl Renderer {
             };
 
             // AMD memory allocator.
-            use vk_mem::Alloc;
             let mut allocator_cinfo =
                 vk_mem::AllocatorCreateInfo::new(&instance, &device, physical_device);
             allocator_cinfo.flags |= vk_mem::AllocatorCreateFlags::BUFFER_DEVICE_ADDRESS;
             let allocator = vk_mem::Allocator::new(allocator_cinfo).unwrap();
 
-            // Create depth attachment for rendering.
-            let (depth_image, depth_alloc) = allocator
-                .create_image(
-                    &vk::ImageCreateInfo::default()
-                        .image_type(vk::ImageType::TYPE_2D)
-                        .extent(
-                            vk::Extent3D::default()
-                                .width(viewport_w)
-                                .height(viewport_h)
-                                .depth(1),
-                        )
-                        .mip_levels(1)
-                        .array_layers(1)
-                        .initial_layout(vk::ImageLayout::UNDEFINED)
-                        .samples(vk::SampleCountFlags::TYPE_1)
-                        .sharing_mode(vk::SharingMode::EXCLUSIVE)
-                        .format(vk::Format::D32_SFLOAT)
-                        .tiling(vk::ImageTiling::OPTIMAL)
-                        .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT),
-                    &vk_mem::AllocationCreateInfo {
-                        required_flags: vk::MemoryPropertyFlags::DEVICE_LOCAL,
-                        ..Default::default()
-                    },
-                )
-                .unwrap();
-
-            // Swapchain.
-            let swapchain_device = khr::swapchain::Device::new(&instance, &device);
-            let swapchain_image_count = 3.max(surface_capabilities.min_image_count);
-            let swapchain = swapchain_device
-                .create_swapchain(
-                    &vk::SwapchainCreateInfoKHR::default()
-                        .surface(surface)
-                        .min_image_count(swapchain_image_count)
-                        .image_format(surface_format.format)
-                        .image_color_space(surface_format.color_space)
-                        .image_extent(vk::Extent2D {
-                            width: viewport_w,
-                            height: viewport_h,
-                        })
-                        .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
-                        .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
-                        .pre_transform(surface_capabilities.current_transform)
-                        .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
-                        .present_mode(vk::PresentModeKHR::FIFO)
-                        .clipped(true)
-                        .image_array_layers(1),
-                    None,
-                )
-                .unwrap();
-
-            // Create image views.
-            let swapchain_images = swapchain_device
-                .get_swapchain_images(swapchain)
-                .unwrap()
-                .into_boxed_slice();
-            let (swapchain_color_views, swapchain_depth_views) = {
-                let n = swapchain_images.len();
-                let mut color_views = vec![vk::ImageView::null(); n].into_boxed_slice();
-                let mut depth_views = vec![vk::ImageView::null(); n].into_boxed_slice();
-                for i in 0..n {
-                    let swapchain_view = device
-                        .create_image_view(
-                            &vk::ImageViewCreateInfo::default()
-                                .image(swapchain_images[i])
-                                .view_type(vk::ImageViewType::TYPE_2D)
-                                .format(surface_format.format)
-                                .subresource_range(vk::ImageSubresourceRange {
-                                    aspect_mask: vk::ImageAspectFlags::COLOR,
-                                    base_mip_level: 0,
-                                    level_count: 1,
-                                    base_array_layer: 0,
-                                    layer_count: 1,
-                                }),
-                            None,
-                        )
-                        .unwrap();
-
-                    let depth_view = device
-                        .create_image_view(
-                            &vk::ImageViewCreateInfo::default()
-                                .image(depth_image)
-                                .view_type(vk::ImageViewType::TYPE_2D)
-                                .format(vk::Format::D32_SFLOAT)
-                                .subresource_range(vk::ImageSubresourceRange {
-                                    aspect_mask: vk::ImageAspectFlags::DEPTH,
-                                    base_mip_level: 0,
-                                    level_count: 1,
-                                    base_array_layer: 0,
-                                    layer_count: 1,
-                                }),
-                            None,
-                        )
-                        .unwrap();
-
-                    color_views[i] = swapchain_view;
-                    depth_views[i] = depth_view;
-                }
-                (color_views, depth_views)
-            };
+            // Build swapchain from core.
+            let swapchain = Swapchain::new(&core, &device, &allocator);
 
             // Descriptor set layout for all programs.
             let scene_set_layout = device
@@ -1663,9 +1215,10 @@ impl Renderer {
                         .command_buffer_count(MAX_FRAMES_IN_FLIGHT as _),
                 )
                 .unwrap()
-                .into_boxed_slice();
+                .try_into()
+                .unwrap();
 
-            let render_finished = (0..swapchain_image_count)
+            let render_finished = (0..swapchain.images.len())
                 .into_iter()
                 .map(|_| {
                     device
@@ -1693,34 +1246,49 @@ impl Renderer {
                 )
                 .unwrap();
 
+            let sync_primitives = std::array::from_fn(|_| FrameSyncPrimitives {
+                image_available: device
+                    .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+                    .unwrap(),
+                frame_in_flight: device
+                    .create_fence(
+                        &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+                        None,
+                    )
+                    .unwrap(),
+            });
+
+            // Generic descriptor pool.
+            let descriptor_pools = std::array::from_fn(|_| {
+                device
+                    .create_descriptor_pool(
+                        &vk::DescriptorPoolCreateInfo::default()
+                            .pool_sizes(&[
+                                vk::DescriptorPoolSize::default()
+                                    .ty(vk::DescriptorType::UNIFORM_BUFFER)
+                                    .descriptor_count(3),
+                                vk::DescriptorPoolSize::default()
+                                    .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                                    .descriptor_count(1024),
+                            ])
+                            .max_sets(3)
+                            .flags(vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND),
+                        None,
+                    )
+                    .unwrap()
+            });
+
             //
             Self {
-                entry,
-                instance,
-                physical_device,
-
-                surface_instance,
-                surface,
-                surface_format,
-                surface_capabilities,
-                surface_extent: vk::Extent2D {
-                    width: viewport_w,
-                    height: viewport_h,
-                },
+                core,
 
                 device,
-                queue_family_index,
                 graphics_queue,
                 present_queue,
 
                 allocator,
 
-                swapchain_device,
                 swapchain,
-                depth_image: (depth_image, depth_alloc),
-                swapchain_images,
-                swapchain_color_views,
-                swapchain_depth_views,
 
                 cmd_pool,
 
@@ -1743,7 +1311,9 @@ impl Renderer {
                 staging_cmd_buffer,
                 staging_fence,
 
+                sync_primitives,
                 render_cmd_buffers,
+                descriptor_pools,
                 render_finished,
                 current_frame: Frame::null(),
                 next_frame: None,
@@ -1754,149 +1324,4 @@ impl Renderer {
             }
         }
     }
-}
-
-pub fn load_mesh(filename: impl AsRef<Path>) -> Option<(f32, Box<[Meshlet]>)> {
-    let model = {
-        use std::io::BufReader;
-        let data = std::fs::read(filename.as_ref()).ok()?;
-        let (models, _) = tobj::load_obj_buf(&mut BufReader::new(&data[..]), |_| {
-            Ok((Vec::new(), HashMap::new()))
-        })
-        .unwrap();
-        models.into_iter().next()?.mesh
-    };
-    println!("Model details ({:?}):", filename.as_ref());
-    println!("  Indices: {}", model.indices.len());
-    println!("  Positions: {}", model.positions.len());
-    println!("  Normals: {}", model.normals.len());
-
-    // Calculate bounds.
-    let scale = model
-        .positions
-        .iter()
-        .tuples()
-        .fold(0f32, |scale, (x, y, z)| {
-            scale.max(x.abs()).max(y.abs()).max(z.abs())
-        });
-
-    struct Vertex {
-        position: Vec3,
-        normal: Vec3,
-        uv: Vec2,
-        color: Vec3,
-    }
-
-    impl meshopt::DecodePosition for Vertex {
-        fn decode_position(&self) -> [f32; 3] {
-            self.position.to_array()
-        }
-    }
-
-    let mut indices = model.indices;
-    let positions: Vec<Vec3> = model
-        .positions
-        .chunks_exact(3)
-        .map(Vec3::from_slice)
-        .collect();
-    let uvs: Vec<Vec2> = model
-        .texcoords
-        .chunks_exact(2)
-        .map(Vec2::from_slice)
-        .collect();
-    let normals: Vec<Vec3> = if !model.normals.is_empty() {
-        model
-            .normals
-            .chunks_exact(3)
-            .map(Vec3::from_slice)
-            .collect()
-    } else {
-        // Normals dont exist, and are constructed here:
-        let mut normals = vec![Vec3::ZERO; positions.len()];
-        for tri in indices.chunks_exact(3) {
-            let [i0, i1, i2]: [u32; 3] = tri.try_into().unwrap();
-            let i0 = i0 as usize;
-            let i1 = i1 as usize;
-            let i2 = i2 as usize;
-            let p0 = positions[i0];
-            let p1 = positions[i1];
-            let p2 = positions[i2];
-            let face_normal = (p1 - p0).cross(p2 - p0).normalize_or_zero();
-            normals[i0] += face_normal;
-            normals[i1] += face_normal;
-            normals[i2] += face_normal;
-        }
-        normals.iter_mut().for_each(|n| *n = n.normalize_or_zero());
-        normals
-    };
-
-    let mut vertices: Box<[Vertex]> = (0..model.positions.len() / 3)
-        .map(|i| {
-            Vertex {
-                position: positions[i],
-                normal: normals[i],
-                uv: uvs.get(i).cloned().unwrap_or_default(),
-                color: Vec3::splat(1.0),
-            }
-        })
-        .collect();
-
-    // Optimize index count.
-    meshopt::optimize_vertex_cache_in_place(&mut indices, vertices.len());
-
-    // Optimize overdraw.
-    meshopt::optimize_overdraw_in_place_decoder(&mut indices, &vertices, 1.05);
-
-    // Optimize vertex fetch.
-    meshopt::optimize_vertex_fetch_in_place(&mut indices, &mut vertices);
-
-    let adapter = meshopt::VertexDataAdapter {
-        reader: std::io::Cursor::new(unsafe {
-            std::slice::from_raw_parts(
-                vertices.as_ptr() as *const u8,
-                size_of::<Vertex>() * vertices.len(),
-            )
-        }),
-        vertex_count: vertices.len(),
-        vertex_stride: size_of::<Vertex>(),
-        position_offset: 0,
-    };
-
-    let meshlets = meshopt::build_meshlets(&indices, &adapter, 64, 124, 0.5)
-        .iter()
-        .map(|meshlet| {
-            let bounds = meshopt::compute_meshlet_bounds_decoder(meshlet, &vertices);
-            Meshlet {
-                // Vertex positions are quantized in normalized mesh space, so bounds need
-                // to use the same normalization to stay consistent in shaders.
-                center: (Vec3::from_array(bounds.center) / scale).to_array(),
-                radius: bounds.radius / scale,
-                cone_apex: (Vec3::from_array(bounds.cone_apex) / scale).to_array(),
-                cone_axis: bounds.cone_axis,
-                cone_cutoff: bounds.cone_cutoff,
-                indices: meshlet.triangles.to_owned().into_boxed_slice(),
-                positions: meshlet
-                    .vertices
-                    .iter()
-                    .map(|&i| {
-                        (vertices[i as usize].position / scale * 32767.)
-                            .to_array()
-                            .map(|e| e as i16)
-                    })
-                    .collect(),
-                normals: meshlet
-                    .vertices
-                    .iter()
-                    .map(|&i| {
-                        (vertices[i as usize].normal * 127.)
-                            .to_array()
-                            .map(|e| e as i8)
-                    })
-                    .collect(),
-                texcoords: Box::new([]),
-            }
-        })
-        .collect();
-
-    Some((scale, meshlets))
 }

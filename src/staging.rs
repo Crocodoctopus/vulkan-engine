@@ -1,7 +1,7 @@
 use ash::vk;
 use std::borrow::Borrow;
 
-use crate::Buffer;
+use crate::buffer::Buffer;
 
 pub struct StagingBuffer {
     buffer: vk::Buffer,

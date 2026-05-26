@@ -6,7 +6,7 @@ layout (std430, set = 0, binding = 0) uniform SceneGlobal {
     mat4 pv;
     mat4 proj;
     mat4 view;
-    
+
     vec3 camera_position;
     vec3 camera_direction;
     vec3 light_position;
@@ -32,8 +32,9 @@ void main() {
     float ambient = .75;
     float diffuse = max(0.0, dot(incident_ray, normal));
     float specular = pow(max(0.0, dot(to_camera_ray, reflected_ray)), 64.0);
-    
+
     vec2 uv = frag_uv;
     uv.y = 1.0f - frag_uv[1];
-    out_color = vec4(frag_color.rgb * light_color.rgb * (0.5 * ambient + 0.5 * diffuse + 0.5 * specular), 1.0);//texture(samplers[frag_tex_id], uv); 
+    out_color = vec4(frag_color.rgb * light_color.rgb * (0.5 * ambient + 0.5 * diffuse + 0.5 * specular), 1.0);
+    //out_color = texture(samplers[frag_tex_id], uv);
 }

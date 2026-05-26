@@ -9,7 +9,7 @@ layout (std430, set = 0, binding = 0) uniform SceneGlobal {
     mat4 pv;
     mat4 proj;
     mat4 view;
-    
+
     vec3 camera_position;
     vec3 camera_direction;
     vec3 light_position;
@@ -35,7 +35,7 @@ vec4 colors[14] = {
     vec4(1.0, 0.0, 1.0, 1.0),
     vec4(1.0, 1.0, 0.0, 1.0),
     vec4(1.0, 1.0, 1.0, 1.0),
-    
+
     vec4(0.25, 0.25, 1.0, 1.0),
     vec4(0.25, 1.0, 0.25, 1.0),
     vec4(0.25, 1.0, 1.0, 1.0),
@@ -53,7 +53,7 @@ void main() {
     Instance instance = instance_buffer.data[gl_DrawID];
     Object object = object_buffer.data[instance.object_id];
     Vertex vert = object.vertex_buffer.data[gl_VertexIndex];
-    
+
     // Decompress.
     vec3 position = vec3(vert.x, vert.y, vert.z) / 32767.0f;
     vec3 normal = vec3(vert.nx, vert.ny, vert.nz) / 127.0f;

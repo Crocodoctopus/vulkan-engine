@@ -10,9 +10,13 @@ extern crate tobj;
 extern crate vk_mem;
 extern crate winit;
 
+mod buffer;
+mod core;
+mod glsl_types;
+mod mesh;
 mod renderer;
 mod staging;
-//mod util;
+mod swapchain;
 
 use crate::renderer::*;
 use glam::*;
@@ -42,7 +46,7 @@ fn main() {
         .unwrap();
     let sphere = renderer.load_mesh("resources/models/sphere.obj").unwrap();
     let bunny = renderer.load_mesh("resources/models/bunny.obj").unwrap();
-    let obj0 = renderer
+    let _obj0 = renderer
         .create_object(
             viking_room,
             Vec3::new(0.0, 0.5, 0.0),
@@ -50,7 +54,7 @@ fn main() {
             Quat::from_euler(EulerRot::XYZ, std::f32::consts::FRAC_PI_2, 0.0, 0.0),
         )
         .unwrap();
-    let obj1 = renderer
+    let _obj1 = renderer
         .create_object(
             sphere,
             Vec3::new(0.0, 0.0, 0.0),
@@ -58,7 +62,7 @@ fn main() {
             Quat::from_euler(EulerRot::XYZ, 0.0, 0.0, 0.0),
         )
         .unwrap();
-    let obj2 = renderer
+    let _obj2 = renderer
         .create_object(
             bunny,
             Vec3::new(1.0, 0.4, 0.0),
