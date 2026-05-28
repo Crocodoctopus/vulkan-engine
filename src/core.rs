@@ -7,6 +7,7 @@ pub(crate) struct Core {
     pub _entry: ash::Entry,
     pub instance: ash::Instance,
     pub physical_device: vk::PhysicalDevice,
+    pub physical_device_properties: vk::PhysicalDeviceProperties,
     pub queue_family_index: u32,
 
     pub _surface_instance: khr::surface::Instance,
@@ -77,6 +78,9 @@ impl Core {
             .next()
             .unwrap();
 
+        // For later.
+        let physical_device_properties = instance.get_physical_device_properties(physical_device);
+
         let surface_instance = khr::surface::Instance::new(&entry, &instance);
         let surface = ash_window::create_surface(
             &entry,
@@ -130,6 +134,7 @@ impl Core {
             instance,
             physical_device,
             queue_family_index,
+            physical_device_properties,
 
             _surface_instance: surface_instance,
             surface,

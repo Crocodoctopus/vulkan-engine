@@ -90,6 +90,7 @@ pub struct Renderer {
     swapchain: Swapchain,
 
     // Command pool.
+    query_pool: vk::QueryPool,
     cmd_pool: vk::CommandPool,
 
     // Desciptor set layouts.
@@ -140,6 +141,452 @@ impl Drop for Renderer {
 }
 
 impl Renderer {
+    pub fn new(
+        cwd: impl AsRef<Path>,
+        viewport_w: u32,
+        viewport_h: u32,
+        display: impl HasDisplayHandle + HasWindowHandle,
+    ) -> Self {
+        // Required Vulkan features (pass some of these in?).
+        let device_extensions = [
+            c"VK_KHR_dynamic_rendering",
+            c"VK_EXT_descriptor_indexing",
+            c"VK_KHR_swapchain",
+        ];
+
+        unsafe {
+            let core = Core::new(viewport_w, viewport_h, display);
+            let &Core {
+                ref instance,
+                physical_device,
+                queue_family_index,
+                surface_format,
+                ..
+            } = &core;
+
+            // Create logical device and its associated queues.
+            let (device, graphics_queue, present_queue) = {
+                let features = vk::PhysicalDeviceFeatures::default()
+                    .multi_draw_indirect(true)
+                    .shader_int16(true);
+                let extensions = device_extensions.map(|x: &CStr| x.as_ptr());
+
+                let device = {
+                    let mut vk11features = vk::PhysicalDeviceVulkan11Features::default()
+                        .shader_draw_parameters(true)
+                        .storage_buffer16_bit_access(true);
+
+                    let mut vk12features = vk::PhysicalDeviceVulkan12Features::default()
+                        .shader_int8(true)
+                        .storage_buffer8_bit_access(true)
+                        .draw_indirect_count(true)
+                        .buffer_device_address(true)
+                        .descriptor_binding_uniform_buffer_update_after_bind(true)
+                        .descriptor_binding_storage_buffer_update_after_bind(true)
+                        .descriptor_binding_partially_bound(true)
+                        .descriptor_binding_sampled_image_update_after_bind(true)
+                        .descriptor_indexing(true)
+                        .runtime_descriptor_array(true);
+
+                    let mut vk13features = vk::PhysicalDeviceVulkan13Features::default()
+                        .dynamic_rendering(true)
+                        .synchronization2(true);
+
+                    let priority = [1.0];
+
+                    let queue_cinfo = [vk::DeviceQueueCreateInfo::default()
+                        .queue_family_index(queue_family_index)
+                        .queue_priorities(&priority)];
+
+                    let device_cinfo = vk::DeviceCreateInfo::default()
+                        .push_next(&mut vk11features)
+                        .push_next(&mut vk12features)
+                        .push_next(&mut vk13features)
+                        .queue_create_infos(&queue_cinfo)
+                        .enabled_extension_names(&extensions)
+                        .enabled_features(&features);
+
+                    instance
+                        .create_device(physical_device, &device_cinfo, None)
+                        .unwrap()
+                };
+
+                // Extract queues.
+                let graphics_queue = device.get_device_queue(queue_family_index, 0);
+                let present_queue = device.get_device_queue(queue_family_index, 0);
+
+                (device, graphics_queue, present_queue)
+            };
+
+            // AMD memory allocator.
+            let mut allocator_cinfo =
+                vk_mem::AllocatorCreateInfo::new(&instance, &device, physical_device);
+            allocator_cinfo.flags |= vk_mem::AllocatorCreateFlags::BUFFER_DEVICE_ADDRESS;
+            let allocator = vk_mem::Allocator::new(allocator_cinfo).unwrap();
+
+            // Build swapchain from core.
+            let swapchain = Swapchain::new(&core, &device, &allocator);
+
+            // Query pool.
+            let query_pool = device
+                .create_query_pool(
+                    &vk::QueryPoolCreateInfo::default()
+                        .query_type(vk::QueryType::TIMESTAMP)
+                        .query_count(MAX_FRAMES_IN_FLIGHT as u32 * 2),
+                    None,
+                )
+                .unwrap();
+
+            // Descriptor set layout for all programs.
+            let scene_set_layout = device
+                .create_descriptor_set_layout(
+                    &vk::DescriptorSetLayoutCreateInfo::default()
+                        .push_next(
+                            &mut vk::DescriptorSetLayoutBindingFlagsCreateInfo::default()
+                                .binding_flags(&[vk::DescriptorBindingFlags::PARTIALLY_BOUND
+                                    | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND]),
+                        )
+                        .bindings(&[
+                            // SceneGlobal
+                            vk::DescriptorSetLayoutBinding::default()
+                                .binding(0)
+                                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                                .descriptor_count(1)
+                                .stage_flags(vk::ShaderStageFlags::ALL),
+                        ])
+                        .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL),
+                    None,
+                )
+                .unwrap();
+
+            // Desciptor set layout for the rendering program.
+            let render_set_layout = device
+                .create_descriptor_set_layout(
+                    &vk::DescriptorSetLayoutCreateInfo::default()
+                        .push_next(
+                            &mut vk::DescriptorSetLayoutBindingFlagsCreateInfo::default()
+                                .binding_flags(&[
+                                    vk::DescriptorBindingFlags::PARTIALLY_BOUND
+                                        | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
+                                    vk::DescriptorBindingFlags::PARTIALLY_BOUND
+                                        | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
+                                ]),
+                        )
+                        .bindings(&[
+                            vk::DescriptorSetLayoutBinding::default()
+                                .binding(0)
+                                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                                .descriptor_count(1)
+                                .stage_flags(vk::ShaderStageFlags::ALL),
+                            vk::DescriptorSetLayoutBinding::default()
+                                .binding(1)
+                                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                                .descriptor_count(1024)
+                                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+                        ])
+                        .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL),
+                    None,
+                )
+                .unwrap();
+
+            // Descriptor set layout for cull compute program.
+            let cull_set_layout = device
+                .create_descriptor_set_layout(
+                    &vk::DescriptorSetLayoutCreateInfo::default()
+                        .push_next(
+                            &mut vk::DescriptorSetLayoutBindingFlagsCreateInfo::default()
+                                .binding_flags(&[vk::DescriptorBindingFlags::PARTIALLY_BOUND
+                                    | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND]),
+                        )
+                        .bindings(&[vk::DescriptorSetLayoutBinding::default()
+                            .binding(0)
+                            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                            .descriptor_count(1)
+                            .stage_flags(vk::ShaderStageFlags::COMPUTE)])
+                        .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL),
+                    None,
+                )
+                .unwrap();
+
+            // Shader creation util function.
+            let create_shader_module = |src: &[u8]| {
+                device
+                    .create_shader_module(
+                        &vk::ShaderModuleCreateInfo {
+                            p_code: src.as_ptr() as _,
+                            code_size: src.len(),
+                            ..Default::default()
+                        },
+                        None,
+                    )
+                    .unwrap()
+            };
+
+            // Create rendering pipeline.
+            let (render_pipeline, render_pipeline_layout) = {
+                let pipeline_layout = device
+                    .create_pipeline_layout(
+                        &vk::PipelineLayoutCreateInfo::default()
+                            .set_layouts(&[scene_set_layout, render_set_layout]),
+                        None,
+                    )
+                    .unwrap();
+
+                let vert_shader = create_shader_module(include_bytes!("shader.vert.spirv"));
+                let frag_shader = create_shader_module(include_bytes!("shader.frag.spirv"));
+
+                let pipeline = device
+                    .create_graphics_pipelines(
+                        vk::PipelineCache::null(),
+                        &[vk::GraphicsPipelineCreateInfo::default()
+                            .push_next(
+                                &mut vk::PipelineRenderingCreateInfo::default()
+                                    .color_attachment_formats(&[surface_format.format])
+                                    .depth_attachment_format(vk::Format::D32_SFLOAT),
+                            )
+                            .stages(&[
+                                vk::PipelineShaderStageCreateInfo::default()
+                                    .module(vert_shader)
+                                    .stage(vk::ShaderStageFlags::VERTEX)
+                                    .name(c"main"),
+                                vk::PipelineShaderStageCreateInfo::default()
+                                    .module(frag_shader)
+                                    .stage(vk::ShaderStageFlags::FRAGMENT)
+                                    .name(c"main"),
+                            ])
+                            .vertex_input_state(&vk::PipelineVertexInputStateCreateInfo::default())
+                            .input_assembly_state(
+                                &vk::PipelineInputAssemblyStateCreateInfo::default()
+                                    .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
+                                    .primitive_restart_enable(false),
+                            )
+                            .viewport_state(
+                                &vk::PipelineViewportStateCreateInfo::default()
+                                    .viewports(&[vk::Viewport {
+                                        x: 0.,
+                                        y: 0.,
+                                        width: viewport_w as f32,
+                                        height: viewport_h as f32,
+                                        min_depth: 0.0,
+                                        max_depth: 1.0,
+                                    }])
+                                    .scissors(&[vk::Rect2D {
+                                        offset: vk::Offset2D { x: 0, y: 0 },
+                                        extent: vk::Extent2D {
+                                            width: viewport_w,
+                                            height: viewport_h,
+                                        },
+                                    }]),
+                            )
+                            .rasterization_state(
+                                &vk::PipelineRasterizationStateCreateInfo::default()
+                                    .depth_clamp_enable(false)
+                                    .rasterizer_discard_enable(false)
+                                    .polygon_mode(vk::PolygonMode::FILL)
+                                    .line_width(1.0)
+                                    .cull_mode(vk::CullModeFlags::BACK)
+                                    .front_face(vk::FrontFace::CLOCKWISE)
+                                    .depth_bias_enable(false),
+                            )
+                            .multisample_state(
+                                &vk::PipelineMultisampleStateCreateInfo::default()
+                                    .sample_shading_enable(false)
+                                    .rasterization_samples(vk::SampleCountFlags::TYPE_1),
+                            )
+                            .color_blend_state(
+                                &vk::PipelineColorBlendStateCreateInfo::default()
+                                    .logic_op_enable(false)
+                                    .attachments(&[
+                                        vk::PipelineColorBlendAttachmentState::default()
+                                            .color_write_mask(vk::ColorComponentFlags::RGBA)
+                                            .blend_enable(false),
+                                    ]),
+                            )
+                            .depth_stencil_state(
+                                &vk::PipelineDepthStencilStateCreateInfo::default()
+                                    .depth_test_enable(true)
+                                    .depth_write_enable(true)
+                                    .depth_compare_op(vk::CompareOp::LESS),
+                            )
+                            .layout(pipeline_layout)],
+                        None,
+                    )
+                    .unwrap()
+                    .into_iter()
+                    .next()
+                    .unwrap();
+
+                device.destroy_shader_module(vert_shader, None);
+                device.destroy_shader_module(frag_shader, None);
+
+                (pipeline, pipeline_layout)
+            };
+
+            // Create cull compute pipeline.
+            let (cull_pipeline, cull_pipeline_layout) = {
+                let comp_shader = create_shader_module(include_bytes!("shader.comp.spirv"));
+
+                let pipeline_layout = device
+                    .create_pipeline_layout(
+                        &vk::PipelineLayoutCreateInfo::default()
+                            .set_layouts(&[scene_set_layout, cull_set_layout]),
+                        None,
+                    )
+                    .unwrap();
+
+                let pipeline = device
+                    .create_compute_pipelines(
+                        vk::PipelineCache::default(),
+                        &[vk::ComputePipelineCreateInfo::default()
+                            .layout(pipeline_layout)
+                            .stage(
+                                vk::PipelineShaderStageCreateInfo::default()
+                                    .stage(vk::ShaderStageFlags::COMPUTE)
+                                    .name(c"main")
+                                    .module(comp_shader),
+                            )],
+                        None,
+                    )
+                    .unwrap()
+                    .into_iter()
+                    .next()
+                    .unwrap();
+
+                device.destroy_shader_module(comp_shader, None);
+
+                (pipeline, pipeline_layout)
+            };
+
+            // Generic command pool.
+            let cmd_pool = device
+                .create_command_pool(
+                    &vk::CommandPoolCreateInfo::default()
+                        .queue_family_index(queue_family_index)
+                        .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
+                    None,
+                )
+                .unwrap();
+
+            // Per-frame recorded render buffers.
+            let render_cmd_buffers = device
+                .allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default()
+                        .command_pool(cmd_pool)
+                        .level(vk::CommandBufferLevel::PRIMARY)
+                        .command_buffer_count(MAX_FRAMES_IN_FLIGHT as _),
+                )
+                .unwrap()
+                .try_into()
+                .unwrap();
+
+            let render_finished = (0..swapchain.images.len())
+                .into_iter()
+                .map(|_| {
+                    device
+                        .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+                        .unwrap()
+                })
+                .collect();
+
+            // Staging data.
+            let staging_buffer = StagingBuffer::new(10000000, &allocator);
+
+            let staging_cmd_buffer = device
+                .allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default()
+                        .command_pool(cmd_pool)
+                        .level(vk::CommandBufferLevel::PRIMARY)
+                        .command_buffer_count(1),
+                )
+                .unwrap()[0];
+
+            let staging_fence = device
+                .create_fence(
+                    &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+                    None,
+                )
+                .unwrap();
+
+            let sync_primitives = std::array::from_fn(|_| FrameSyncPrimitives {
+                image_available: device
+                    .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+                    .unwrap(),
+                frame_in_flight: device
+                    .create_fence(
+                        &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+                        None,
+                    )
+                    .unwrap(),
+            });
+
+            // Generic descriptor pool.
+            let descriptor_pools = std::array::from_fn(|_| {
+                device
+                    .create_descriptor_pool(
+                        &vk::DescriptorPoolCreateInfo::default()
+                            .pool_sizes(&[
+                                vk::DescriptorPoolSize::default()
+                                    .ty(vk::DescriptorType::UNIFORM_BUFFER)
+                                    .descriptor_count(3),
+                                vk::DescriptorPoolSize::default()
+                                    .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                                    .descriptor_count(1024),
+                            ])
+                            .max_sets(3)
+                            .flags(vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND),
+                        None,
+                    )
+                    .unwrap()
+            });
+
+            //
+            Self {
+                core,
+
+                device,
+                graphics_queue,
+                present_queue,
+
+                allocator,
+
+                swapchain,
+
+                query_pool,
+                cmd_pool,
+
+                scene_set_layout,
+                render_set_layout,
+                cull_set_layout,
+
+                render_pipeline_layout,
+                render_pipeline,
+                cull_pipeline_layout,
+                cull_pipeline,
+
+                cwd: cwd.as_ref().to_owned(),
+                resource_counter: 0,
+                meshes: HashMap::new(),
+                objects: HashMap::new(),
+                vertex_buffers: HashMap::new(),
+
+                staging_buffer,
+                staging_cmd_buffer,
+                staging_fence,
+
+                sync_primitives,
+                render_cmd_buffers,
+                descriptor_pools,
+                render_finished,
+                current_frame: Frame::null(),
+                next_frame: None,
+
+                frame: 0,
+                cam_pos: <_>::default(),
+                cam_rot: <_>::default(),
+            }
+        }
+    }
+
     pub fn render(&mut self, _timestamp: f32) {
         let frame_index = self.frame % MAX_FRAMES_IN_FLIGHT;
         self.frame += 1;
@@ -206,6 +653,22 @@ impl Renderer {
             let render_finished = self.render_finished[image_index as usize];
             let scene_command_buffer = frame.scene_cmd_buffers[image_index as usize];
 
+            // Get the previous frame's timestamps.
+            let mut data = [0u64; 2];
+            if self.frame > MAX_FRAMES_IN_FLIGHT {
+                self.device
+                    .get_query_pool_results(
+                        self.query_pool,
+                        2 * frame_index as u32,
+                        &mut data,
+                        vk::QueryResultFlags::TYPE_64,
+                    )
+                    .unwrap();
+                let multi =
+                    self.core.physical_device_properties.limits.timestamp_period / 1_000_000.;
+                println!("timestamp: {} ms", multi * (data[1] - data[0]) as f32);
+            }
+
             // Reset and record.
             self.device
                 .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
@@ -213,6 +676,18 @@ impl Renderer {
             self.device
                 .begin_command_buffer(command_buffer, &vk::CommandBufferBeginInfo::default())
                 .unwrap();
+            self.device.cmd_reset_query_pool(
+                command_buffer,
+                self.query_pool,
+                2 * frame_index as u32,
+                2,
+            );
+            self.device.cmd_write_timestamp(
+                command_buffer,
+                vk::PipelineStageFlags::TOP_OF_PIPE,
+                self.query_pool,
+                (2 * frame_index + 0) as u32,
+            );
 
             // Transfer some global state data.
             {
@@ -328,6 +803,12 @@ impl Renderer {
                 }
             }
 
+            self.device.cmd_write_timestamp(
+                command_buffer,
+                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                self.query_pool,
+                (2 * frame_index + 1) as u32,
+            );
             self.device
                 .cmd_execute_commands(command_buffer, &[scene_command_buffer]);
 
@@ -888,440 +1369,5 @@ impl Renderer {
         self.resource_counter += 1;
         self.meshes.insert(handle, mesh);
         return Some(handle);
-    }
-
-    pub fn new(
-        cwd: impl AsRef<Path>,
-        viewport_w: u32,
-        viewport_h: u32,
-        display: impl HasDisplayHandle + HasWindowHandle,
-    ) -> Self {
-        // Required Vulkan features (pass some of these in?).
-        let device_extensions = [
-            c"VK_KHR_dynamic_rendering",
-            c"VK_EXT_descriptor_indexing",
-            c"VK_KHR_swapchain",
-        ];
-
-        unsafe {
-            let core = Core::new(viewport_w, viewport_h, display);
-            let &Core {
-                ref instance,
-                physical_device,
-                queue_family_index,
-                surface_format,
-                ..
-            } = &core;
-
-            // Create logical device and its associated queues.
-            let (device, graphics_queue, present_queue) = {
-                let features = vk::PhysicalDeviceFeatures::default()
-                    .multi_draw_indirect(true)
-                    .shader_int16(true);
-                let extensions = device_extensions.map(|x: &CStr| x.as_ptr());
-
-                let device = {
-                    let mut vk11features = vk::PhysicalDeviceVulkan11Features::default()
-                        .shader_draw_parameters(true)
-                        .storage_buffer16_bit_access(true);
-
-                    let mut vk12features = vk::PhysicalDeviceVulkan12Features::default()
-                        .shader_int8(true)
-                        .storage_buffer8_bit_access(true)
-                        .draw_indirect_count(true)
-                        .buffer_device_address(true)
-                        .descriptor_binding_uniform_buffer_update_after_bind(true)
-                        .descriptor_binding_storage_buffer_update_after_bind(true)
-                        .descriptor_binding_partially_bound(true)
-                        .descriptor_binding_sampled_image_update_after_bind(true)
-                        .descriptor_indexing(true)
-                        .runtime_descriptor_array(true);
-
-                    let mut vk13features = vk::PhysicalDeviceVulkan13Features::default()
-                        .dynamic_rendering(true)
-                        .synchronization2(true);
-
-                    let priority = [1.0];
-
-                    let queue_cinfo = [vk::DeviceQueueCreateInfo::default()
-                        .queue_family_index(queue_family_index)
-                        .queue_priorities(&priority)];
-
-                    let device_cinfo = vk::DeviceCreateInfo::default()
-                        .push_next(&mut vk11features)
-                        .push_next(&mut vk12features)
-                        .push_next(&mut vk13features)
-                        .queue_create_infos(&queue_cinfo)
-                        .enabled_extension_names(&extensions)
-                        .enabled_features(&features);
-
-                    instance
-                        .create_device(physical_device, &device_cinfo, None)
-                        .unwrap()
-                };
-
-                // Extract queues.
-                let graphics_queue = device.get_device_queue(queue_family_index, 0);
-                let present_queue = device.get_device_queue(queue_family_index, 0);
-
-                (device, graphics_queue, present_queue)
-            };
-
-            // AMD memory allocator.
-            let mut allocator_cinfo =
-                vk_mem::AllocatorCreateInfo::new(&instance, &device, physical_device);
-            allocator_cinfo.flags |= vk_mem::AllocatorCreateFlags::BUFFER_DEVICE_ADDRESS;
-            let allocator = vk_mem::Allocator::new(allocator_cinfo).unwrap();
-
-            // Build swapchain from core.
-            let swapchain = Swapchain::new(&core, &device, &allocator);
-
-            // Descriptor set layout for all programs.
-            let scene_set_layout = device
-                .create_descriptor_set_layout(
-                    &vk::DescriptorSetLayoutCreateInfo::default()
-                        .push_next(
-                            &mut vk::DescriptorSetLayoutBindingFlagsCreateInfo::default()
-                                .binding_flags(&[vk::DescriptorBindingFlags::PARTIALLY_BOUND
-                                    | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND]),
-                        )
-                        .bindings(&[
-                            // SceneGlobal
-                            vk::DescriptorSetLayoutBinding::default()
-                                .binding(0)
-                                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                                .descriptor_count(1)
-                                .stage_flags(vk::ShaderStageFlags::ALL),
-                        ])
-                        .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL),
-                    None,
-                )
-                .unwrap();
-
-            // Desciptor set layout for the rendering program.
-            let render_set_layout = device
-                .create_descriptor_set_layout(
-                    &vk::DescriptorSetLayoutCreateInfo::default()
-                        .push_next(
-                            &mut vk::DescriptorSetLayoutBindingFlagsCreateInfo::default()
-                                .binding_flags(&[
-                                    vk::DescriptorBindingFlags::PARTIALLY_BOUND
-                                        | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
-                                    vk::DescriptorBindingFlags::PARTIALLY_BOUND
-                                        | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
-                                ]),
-                        )
-                        .bindings(&[
-                            vk::DescriptorSetLayoutBinding::default()
-                                .binding(0)
-                                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                                .descriptor_count(1)
-                                .stage_flags(vk::ShaderStageFlags::ALL),
-                            vk::DescriptorSetLayoutBinding::default()
-                                .binding(1)
-                                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                                .descriptor_count(1024)
-                                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
-                        ])
-                        .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL),
-                    None,
-                )
-                .unwrap();
-
-            // Descriptor set layout for cull compute program.
-            let cull_set_layout = device
-                .create_descriptor_set_layout(
-                    &vk::DescriptorSetLayoutCreateInfo::default()
-                        .push_next(
-                            &mut vk::DescriptorSetLayoutBindingFlagsCreateInfo::default()
-                                .binding_flags(&[vk::DescriptorBindingFlags::PARTIALLY_BOUND
-                                    | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND]),
-                        )
-                        .bindings(&[vk::DescriptorSetLayoutBinding::default()
-                            .binding(0)
-                            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                            .descriptor_count(1)
-                            .stage_flags(vk::ShaderStageFlags::COMPUTE)])
-                        .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL),
-                    None,
-                )
-                .unwrap();
-
-            // Shader creation util function.
-            let create_shader_module = |src: &[u8]| {
-                device
-                    .create_shader_module(
-                        &vk::ShaderModuleCreateInfo {
-                            p_code: src.as_ptr() as _,
-                            code_size: src.len(),
-                            ..Default::default()
-                        },
-                        None,
-                    )
-                    .unwrap()
-            };
-
-            // Create rendering pipeline.
-            let (render_pipeline, render_pipeline_layout) = {
-                let pipeline_layout = device
-                    .create_pipeline_layout(
-                        &vk::PipelineLayoutCreateInfo::default()
-                            .set_layouts(&[scene_set_layout, render_set_layout]),
-                        None,
-                    )
-                    .unwrap();
-
-                let vert_shader = create_shader_module(include_bytes!("shader.vert.spirv"));
-                let frag_shader = create_shader_module(include_bytes!("shader.frag.spirv"));
-
-                let pipeline = device
-                    .create_graphics_pipelines(
-                        vk::PipelineCache::null(),
-                        &[vk::GraphicsPipelineCreateInfo::default()
-                            .push_next(
-                                &mut vk::PipelineRenderingCreateInfo::default()
-                                    .color_attachment_formats(&[surface_format.format])
-                                    .depth_attachment_format(vk::Format::D32_SFLOAT),
-                            )
-                            .stages(&[
-                                vk::PipelineShaderStageCreateInfo::default()
-                                    .module(vert_shader)
-                                    .stage(vk::ShaderStageFlags::VERTEX)
-                                    .name(c"main"),
-                                vk::PipelineShaderStageCreateInfo::default()
-                                    .module(frag_shader)
-                                    .stage(vk::ShaderStageFlags::FRAGMENT)
-                                    .name(c"main"),
-                            ])
-                            .vertex_input_state(&vk::PipelineVertexInputStateCreateInfo::default())
-                            .input_assembly_state(
-                                &vk::PipelineInputAssemblyStateCreateInfo::default()
-                                    .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
-                                    .primitive_restart_enable(false),
-                            )
-                            .viewport_state(
-                                &vk::PipelineViewportStateCreateInfo::default()
-                                    .viewports(&[vk::Viewport {
-                                        x: 0.,
-                                        y: 0.,
-                                        width: viewport_w as f32,
-                                        height: viewport_h as f32,
-                                        min_depth: 0.0,
-                                        max_depth: 1.0,
-                                    }])
-                                    .scissors(&[vk::Rect2D {
-                                        offset: vk::Offset2D { x: 0, y: 0 },
-                                        extent: vk::Extent2D {
-                                            width: viewport_w,
-                                            height: viewport_h,
-                                        },
-                                    }]),
-                            )
-                            .rasterization_state(
-                                &vk::PipelineRasterizationStateCreateInfo::default()
-                                    .depth_clamp_enable(false)
-                                    .rasterizer_discard_enable(false)
-                                    .polygon_mode(vk::PolygonMode::FILL)
-                                    .line_width(1.0)
-                                    .cull_mode(vk::CullModeFlags::BACK)
-                                    .front_face(vk::FrontFace::CLOCKWISE)
-                                    .depth_bias_enable(false),
-                            )
-                            .multisample_state(
-                                &vk::PipelineMultisampleStateCreateInfo::default()
-                                    .sample_shading_enable(false)
-                                    .rasterization_samples(vk::SampleCountFlags::TYPE_1),
-                            )
-                            .color_blend_state(
-                                &vk::PipelineColorBlendStateCreateInfo::default()
-                                    .logic_op_enable(false)
-                                    .attachments(&[
-                                        vk::PipelineColorBlendAttachmentState::default()
-                                            .color_write_mask(vk::ColorComponentFlags::RGBA)
-                                            .blend_enable(false),
-                                    ]),
-                            )
-                            .depth_stencil_state(
-                                &vk::PipelineDepthStencilStateCreateInfo::default()
-                                    .depth_test_enable(true)
-                                    .depth_write_enable(true)
-                                    .depth_compare_op(vk::CompareOp::LESS),
-                            )
-                            .layout(pipeline_layout)],
-                        None,
-                    )
-                    .unwrap()
-                    .into_iter()
-                    .next()
-                    .unwrap();
-
-                device.destroy_shader_module(vert_shader, None);
-                device.destroy_shader_module(frag_shader, None);
-
-                (pipeline, pipeline_layout)
-            };
-
-            // Create cull compute pipeline.
-            let (cull_pipeline, cull_pipeline_layout) = {
-                let comp_shader = create_shader_module(include_bytes!("shader.comp.spirv"));
-
-                let pipeline_layout = device
-                    .create_pipeline_layout(
-                        &vk::PipelineLayoutCreateInfo::default()
-                            .set_layouts(&[scene_set_layout, cull_set_layout]),
-                        None,
-                    )
-                    .unwrap();
-
-                let pipeline = device
-                    .create_compute_pipelines(
-                        vk::PipelineCache::default(),
-                        &[vk::ComputePipelineCreateInfo::default()
-                            .layout(pipeline_layout)
-                            .stage(
-                                vk::PipelineShaderStageCreateInfo::default()
-                                    .stage(vk::ShaderStageFlags::COMPUTE)
-                                    .name(c"main")
-                                    .module(comp_shader),
-                            )],
-                        None,
-                    )
-                    .unwrap()
-                    .into_iter()
-                    .next()
-                    .unwrap();
-
-                device.destroy_shader_module(comp_shader, None);
-
-                (pipeline, pipeline_layout)
-            };
-
-            // Generic command pool.
-            let cmd_pool = device
-                .create_command_pool(
-                    &vk::CommandPoolCreateInfo::default()
-                        .queue_family_index(queue_family_index)
-                        .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
-                    None,
-                )
-                .unwrap();
-
-            // Per-frame recorded render buffers.
-            let render_cmd_buffers = device
-                .allocate_command_buffers(
-                    &vk::CommandBufferAllocateInfo::default()
-                        .command_pool(cmd_pool)
-                        .level(vk::CommandBufferLevel::PRIMARY)
-                        .command_buffer_count(MAX_FRAMES_IN_FLIGHT as _),
-                )
-                .unwrap()
-                .try_into()
-                .unwrap();
-
-            let render_finished = (0..swapchain.images.len())
-                .into_iter()
-                .map(|_| {
-                    device
-                        .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
-                        .unwrap()
-                })
-                .collect();
-
-            // Staging data.
-            let staging_buffer = StagingBuffer::new(10000000, &allocator);
-
-            let staging_cmd_buffer = device
-                .allocate_command_buffers(
-                    &vk::CommandBufferAllocateInfo::default()
-                        .command_pool(cmd_pool)
-                        .level(vk::CommandBufferLevel::PRIMARY)
-                        .command_buffer_count(1),
-                )
-                .unwrap()[0];
-
-            let staging_fence = device
-                .create_fence(
-                    &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
-                    None,
-                )
-                .unwrap();
-
-            let sync_primitives = std::array::from_fn(|_| FrameSyncPrimitives {
-                image_available: device
-                    .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
-                    .unwrap(),
-                frame_in_flight: device
-                    .create_fence(
-                        &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
-                        None,
-                    )
-                    .unwrap(),
-            });
-
-            // Generic descriptor pool.
-            let descriptor_pools = std::array::from_fn(|_| {
-                device
-                    .create_descriptor_pool(
-                        &vk::DescriptorPoolCreateInfo::default()
-                            .pool_sizes(&[
-                                vk::DescriptorPoolSize::default()
-                                    .ty(vk::DescriptorType::UNIFORM_BUFFER)
-                                    .descriptor_count(3),
-                                vk::DescriptorPoolSize::default()
-                                    .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                                    .descriptor_count(1024),
-                            ])
-                            .max_sets(3)
-                            .flags(vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND),
-                        None,
-                    )
-                    .unwrap()
-            });
-
-            //
-            Self {
-                core,
-
-                device,
-                graphics_queue,
-                present_queue,
-
-                allocator,
-
-                swapchain,
-
-                cmd_pool,
-
-                scene_set_layout,
-                render_set_layout,
-                cull_set_layout,
-
-                render_pipeline_layout,
-                render_pipeline,
-                cull_pipeline_layout,
-                cull_pipeline,
-
-                cwd: cwd.as_ref().to_owned(),
-                resource_counter: 0,
-                meshes: HashMap::new(),
-                objects: HashMap::new(),
-                vertex_buffers: HashMap::new(),
-
-                staging_buffer,
-                staging_cmd_buffer,
-                staging_fence,
-
-                sync_primitives,
-                render_cmd_buffers,
-                descriptor_pools,
-                render_finished,
-                current_frame: Frame::null(),
-                next_frame: None,
-
-                frame: 0,
-                cam_pos: <_>::default(),
-                cam_rot: <_>::default(),
-            }
-        }
     }
 }
