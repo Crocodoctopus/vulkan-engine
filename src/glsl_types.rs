@@ -28,6 +28,7 @@ pub(super) struct MeshletRenderGlobal {
 pub(super) struct MeshletCullGlobal {
     pub frustum: Vec4,
 
+    pub meshlet_visibility_buffer: vk::DeviceAddress,
     pub draw_count_buffer: vk::DeviceAddress,
     pub meshlet_buffer: vk::DeviceAddress,
     pub draw_cmd_buffer: vk::DeviceAddress,

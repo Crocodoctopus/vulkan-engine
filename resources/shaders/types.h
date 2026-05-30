@@ -20,7 +20,7 @@ struct Object {
 };
 
 struct Instance {
-    uint object_id;   
+    uint object_id;
 };
 
 layout (buffer_reference, std430) readonly buffer InstanceBuffer {
@@ -55,7 +55,7 @@ struct MeshletData {
     // Draw cmd.
     uint object_id;
     uint index_count;
-    uint first_index;    
+    uint first_index;
 };
 
 layout (buffer_reference, std430) readonly buffer MeshletBuffer {
@@ -63,5 +63,9 @@ layout (buffer_reference, std430) readonly buffer MeshletBuffer {
 };
 
 layout (buffer_reference, std430) writeonly buffer DrawCmdBuffer {
-    VkDrawIndexedIndirectCommand data[];  
+    VkDrawIndexedIndirectCommand data[];
+};
+
+layout (buffer_reference, scalar) buffer MeshletVisibilityBuffer {
+    bool data[];
 };

@@ -43,6 +43,7 @@ struct Frame {
     cull_set: vk::DescriptorSet,
 
     // Various buffers.
+    visibility_buffer: Buffer<u32>, // per meshlet
     index_buffer: Buffer<u32>,
     object_buffer: Buffer<Object>,
     instance_buffer: Buffer<Instance>,
@@ -57,6 +58,7 @@ struct Frame {
 impl Frame {
     fn null() -> Self {
         Self {
+            visibility_buffer: Buffer::null(),
             scene_cmd_buffers: <_>::default(),
             scene_set: vk::DescriptorSet::null(),
             render_set: vk::DescriptorSet::null(),
@@ -581,7 +583,7 @@ impl Renderer {
                 next_frame: None,
 
                 frame: 0,
-                cam_pos: <_>::default(),
+                cam_pos: Vec3::new(0., 0., 3.),
                 cam_rot: <_>::default(),
             }
         }
@@ -778,6 +780,10 @@ impl Renderer {
                         [MeshletCullGlobal {
                             instances: frame.indirect_cmd_buffer.len,
                             frustum,
+                            meshlet_visibility_buffer: self.device.get_buffer_device_address(
+                                &vk::BufferDeviceAddressInfo::default()
+                                    .buffer(frame.visibility_buffer.vk_handle()),
+                            ),
                             draw_count_buffer: self.device.get_buffer_device_address(
                                 &vk::BufferDeviceAddressInfo::default()
                                     .buffer(frame.indirect_count_buffer.vk_handle()),
@@ -967,12 +973,20 @@ impl Renderer {
             render_set,
             cull_set,
 
+            visibility_buffer: Buffer::new(
+                &self.allocator,
+                instances,
+                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                vk_mem::MemoryUsage::AutoPreferDevice,
+            ),
+
             index_buffer: Buffer::new(
                 &self.allocator,
                 indices.len() as u32,
                 vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
                 vk_mem::MemoryUsage::AutoPreferDevice,
             ),
+
             object_buffer: Buffer::new(
                 &self.allocator,
                 self.objects.len() as u32,
@@ -1053,6 +1067,7 @@ impl Renderer {
             .unwrap();
 
         // Upload.
+        //
         self.staging_buffer.reset();
         self.staging_buffer.stage_buffer(
             &self.device,
@@ -1076,6 +1091,14 @@ impl Renderer {
             &frame.meshlet_data_buffer,
             0,
             meshlet_data,
+        );
+
+        self.device.cmd_fill_buffer(
+            self.staging_cmd_buffer,
+            frame.visibility_buffer.vk_handle(),
+            0,
+            frame.visibility_buffer.size() as u64,
+            1,
         );
 
         // Submit (& wait at end of function).
