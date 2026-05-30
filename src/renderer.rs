@@ -33,7 +33,7 @@ pub(super) struct ObjectInstance {
 
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
 
-struct Frame {
+struct Scene {
     //
     scene_cmd_buffers: Box<[vk::CommandBuffer]>,
 
@@ -55,7 +55,7 @@ struct Frame {
     meshlet_render_global_buffer: Buffer<MeshletRenderGlobal>,
 }
 
-impl Frame {
+impl Scene {
     fn null() -> Self {
         Self {
             visibility_buffer: Buffer::null(),
@@ -103,8 +103,8 @@ pub struct Renderer {
     // Pipelines.
     render_pipeline_layout: vk::PipelineLayout,
     render_pipeline: vk::Pipeline,
-    cull_pipeline_layout: vk::PipelineLayout,
-    cull_pipeline: vk::Pipeline,
+    frustum_cull_pipeline_layout: vk::PipelineLayout,
+    frustum_cull_pipeline: vk::Pipeline,
 
     // Generic resource containers.
     cwd: PathBuf,
@@ -118,13 +118,13 @@ pub struct Renderer {
     staging_cmd_buffer: vk::CommandBuffer,
     staging_fence: vk::Fence,
 
-    // Frame.
+    // Scene.
     sync_primitives: [FrameSyncPrimitives; MAX_FRAMES_IN_FLIGHT],
     render_cmd_buffers: [vk::CommandBuffer; MAX_FRAMES_IN_FLIGHT],
     descriptor_pools: [vk::DescriptorPool; MAX_FRAMES_IN_FLIGHT],
     render_finished: Box<[vk::Semaphore]>,
-    current_frame: Frame,
-    next_frame: Option<Frame>,
+    current_scene: Scene,
+    next_scene: Option<Scene>,
 
     // Various render state data.
     frame: usize,
@@ -334,8 +334,8 @@ impl Renderer {
                     )
                     .unwrap();
 
-                let vert_shader = create_shader_module(include_bytes!("shader.vert.spirv"));
-                let frag_shader = create_shader_module(include_bytes!("shader.frag.spirv"));
+                let vert_shader = create_shader_module(include_bytes!("render.vert.spirv"));
+                let frag_shader = create_shader_module(include_bytes!("render.frag.spirv"));
 
                 let pipeline = device
                     .create_graphics_pipelines(
@@ -425,8 +425,8 @@ impl Renderer {
             };
 
             // Create cull compute pipeline.
-            let (cull_pipeline, cull_pipeline_layout) = {
-                let comp_shader = create_shader_module(include_bytes!("shader.comp.spirv"));
+            let (frustum_cull_pipeline, frustum_cull_pipeline_layout) = {
+                let comp_shader = create_shader_module(include_bytes!("frustum_cull.comp.spirv"));
 
                 let pipeline_layout = device
                     .create_pipeline_layout(
@@ -562,8 +562,8 @@ impl Renderer {
 
                 render_pipeline_layout,
                 render_pipeline,
-                cull_pipeline_layout,
-                cull_pipeline,
+                frustum_cull_pipeline_layout,
+                frustum_cull_pipeline,
 
                 cwd: cwd.as_ref().to_owned(),
                 resource_counter: 0,
@@ -579,8 +579,8 @@ impl Renderer {
                 render_cmd_buffers,
                 descriptor_pools,
                 render_finished,
-                current_frame: Frame::null(),
-                next_frame: None,
+                current_scene: Scene::null(),
+                next_scene: None,
 
                 frame: 0,
                 cam_pos: Vec3::new(0., 0., 3.),
@@ -597,33 +597,32 @@ impl Renderer {
             // A dirty hack. When a rebuild occurs, wait for transfer to fully complete.
             if self.frame == 1 {
                 // Rebuild scene elements.
-                self.current_frame = self.rebuild_scene(frame_index);
+                self.current_scene = self.rebuild_scene(frame_index);
             }
         }
 
-        // Attempt to clean up current_frame if there is a next.
-        if self.next_frame.is_some() {
+        // Attempt to clean up current_scene if there is a next.
+        if self.next_scene.is_some() {
             // All frames are signalled.
             let signalled = self.sync_primitives.iter().fold(true, |acc, syncs| unsafe {
                 acc & self.device.get_fence_status(syncs.frame_in_flight).unwrap()
             });
 
             if signalled {
-                let frame =
-                    std::mem::replace(&mut self.current_frame, self.next_frame.take().unwrap());
+                let scene =
+                    std::mem::replace(&mut self.current_scene, self.next_scene.take().unwrap());
 
-                // TODO: free self.current_frame.
                 unsafe {
-                    self.free_frame(frame);
+                    self.free_scene(scene);
                 }
-                println!("Old frame cleared.");
+                println!("Old scene cleared.");
             }
         }
 
         // Get current working frame.
-        let frame = match &self.next_frame {
+        let frame = match &self.next_scene {
             Some(frame) => frame,
-            None => &self.current_frame,
+            None => &self.current_scene,
         };
 
         // Sync primitives associated with this frame.
@@ -847,28 +846,28 @@ impl Renderer {
         }
     }
 
-    unsafe fn free_frame(&mut self, mut frame: Frame) {
-        if frame.scene_cmd_buffers.len() > 0 {
+    unsafe fn free_scene(&mut self, mut scene: Scene) {
+        if scene.scene_cmd_buffers.len() > 0 {
             self.device
-                .free_command_buffers(self.cmd_pool, &frame.scene_cmd_buffers);
+                .free_command_buffers(self.cmd_pool, &scene.scene_cmd_buffers);
         }
-        frame.index_buffer.take().destroy(&self.allocator);
-        frame.object_buffer.take().destroy(&self.allocator);
-        frame.instance_buffer.take().destroy(&self.allocator);
-        frame.meshlet_data_buffer.take().destroy(&self.allocator);
-        frame.indirect_cmd_buffer.take().destroy(&self.allocator);
-        frame.indirect_count_buffer.take().destroy(&self.allocator);
-        frame
+        scene.index_buffer.take().destroy(&self.allocator);
+        scene.object_buffer.take().destroy(&self.allocator);
+        scene.instance_buffer.take().destroy(&self.allocator);
+        scene.meshlet_data_buffer.take().destroy(&self.allocator);
+        scene.indirect_cmd_buffer.take().destroy(&self.allocator);
+        scene.indirect_count_buffer.take().destroy(&self.allocator);
+        scene
             .meshlet_cull_global_buffer
             .take()
             .destroy(&self.allocator);
-        frame
+        scene
             .meshlet_render_global_buffer
             .take()
             .destroy(&self.allocator);
     }
 
-    unsafe fn rebuild_scene(&mut self, fif: usize) -> Frame {
+    unsafe fn rebuild_scene(&mut self, fif: usize) -> Scene {
         // Generate vertex data for newly added meshes.
         let new_meshes: HashMap<MeshHandle, Box<[Vertex]>> = self
             .meshes
@@ -957,7 +956,7 @@ impl Renderer {
             .unwrap();
 
         // TODO: split this up.
-        let frame = Frame {
+        let frame = Scene {
             scene_cmd_buffers: self
                 .device
                 .allocate_command_buffers(
@@ -1139,7 +1138,7 @@ impl Renderer {
                     self.device.cmd_bind_descriptor_sets(
                         command_buffer,
                         vk::PipelineBindPoint::COMPUTE,
-                        self.cull_pipeline_layout,
+                        self.frustum_cull_pipeline_layout,
                         0,
                         &[frame.scene_set, frame.cull_set],
                         &[],
@@ -1148,7 +1147,7 @@ impl Renderer {
                     self.device.cmd_bind_pipeline(
                         command_buffer,
                         vk::PipelineBindPoint::COMPUTE,
-                        self.cull_pipeline,
+                        self.frustum_cull_pipeline,
                     );
 
                     self.device

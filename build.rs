@@ -1,39 +1,27 @@
 use std::process::Command;
 
 fn main() {
-    // Build vertex shader.
-    let output = Command::new("glslc")
-        .arg("resources/shaders/shader.vert")
-        .args(["-o", "src/shader.vert.spirv"])
-        .output()
-        .unwrap();
-    if !output.status.success() {
-        panic!("{}", String::from_utf8_lossy(&output.stderr));
-    }
-    println!("cargo:rerun-if-changed=resources/shaders/shader.vert");
-    println!("cargo:rerun-if-changed=src/shader.vert.spirv");
+    // Add shader filenames here to build them.
+    let shaders: &[&str] = &[
+        "render.vert",
+        "render.frag",
+        "frustum_cull.comp",
+    ];
 
-    // Build fragment shader.
-    let output = Command::new("glslc")
-        .arg("resources/shaders/shader.frag")
-        .args(["-o", "src/shader.frag.spirv"])
-        .output()
-        .unwrap();
-    if !output.status.success() {
-        panic!("{}", String::from_utf8_lossy(&output.stderr));
-    }
-    println!("cargo:rerun-if-changed=resources/shaders/shader.frag");
-    println!("cargo:rerun-if-changed=src/shader.frag.spirv");
+    for shader in shaders {
+        let input = format!("resources/shaders/{shader}");
+        let output_path = format!("src/{shader}.spirv");
 
-    // Build fragment shader.
-    let output = Command::new("glslc")
-        .arg("resources/shaders/shader.comp")
-        .args(["-o", "src/shader.comp.spirv"])
-        .output()
-        .unwrap();
-    if !output.status.success() {
-        panic!("{}", String::from_utf8_lossy(&output.stderr));
+        let output = Command::new("glslc")
+            .arg(&input)
+            .args(["-o", &output_path])
+            .output()
+            .unwrap();
+        if !output.status.success() {
+            panic!("{}", String::from_utf8_lossy(&output.stderr));
+        }
+
+        println!("cargo:rerun-if-changed={input}");
+        println!("cargo:rerun-if-changed={output_path}");
     }
-    println!("cargo:rerun-if-changed=resources/shaders/shader.comp");
-    println!("cargo:rerun-if-changed=src/shader.comp.spirv");
 }
