@@ -923,14 +923,6 @@ impl Renderer {
                 self.device.cmd_pipeline_barrier2(
                     cmd,
                     &vk::DependencyInfo::default()
-                        .memory_barriers(&[
-                            //
-                            vk::MemoryBarrier2::default()
-                                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                                .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
-                                .dst_stage_mask(vk::PipelineStageFlags2::INDEX_INPUT)
-                                .dst_access_mask(vk::AccessFlags2::MEMORY_READ),
-                        ])
                         .image_memory_barriers(&[
                             // Convert VK_IMAGE_LAYOUT_UNDEFINED -> VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL.
                             vk::ImageMemoryBarrier2::default()
@@ -1105,23 +1097,20 @@ impl Renderer {
                         .wait_semaphore_infos(&[
                             vk::SemaphoreSubmitInfo::default()
                                 .semaphore(image_available)
-                                .stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT),
+                                .stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE),
                             vk::SemaphoreSubmitInfo::default()
                                 .semaphore(self.pipeline_semaphore)
                                 .value(subframe(frame_count, PipelineStage::FirstDraw))
-                                .stage_mask(
-                                    vk::PipelineStageFlags2::DRAW_INDIRECT
-                                        | vk::PipelineStageFlags2::INDEX_INPUT,
-                                ),
+                                .stage_mask(vk::PipelineStageFlags2::DRAW_INDIRECT),
                         ])
                         .signal_semaphore_infos(&[
                             vk::SemaphoreSubmitInfo::default()
                                 .semaphore(self.pipeline_semaphore)
                                 .value(subframe(frame_count, PipelineStage::FirstDraw) + 1)
-                                .stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT),
+                                .stage_mask(vk::PipelineStageFlags2::BOTTOM_OF_PIPE),
                             vk::SemaphoreSubmitInfo::default()
                                 .semaphore(render_finished)
-                                .stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT),
+                                .stage_mask(vk::PipelineStageFlags2::BOTTOM_OF_PIPE),
                         ])],
                     frame_in_flight,
                 )
