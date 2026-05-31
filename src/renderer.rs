@@ -33,6 +33,17 @@ pub(super) struct ObjectInstance {
 
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(usize)]
+enum PipelineStage {
+    DataUpload,
+    FrustumCull,
+    FirstDraw,
+    COUNT,
+}
+
+const MAX_PIPELINE_STAGES: usize = PipelineStage::COUNT as usize;
+
 struct Scene {
     // Descriptor sets.
     scene_set: vk::DescriptorSet,
@@ -55,10 +66,10 @@ struct Scene {
 impl Scene {
     fn null() -> Self {
         Self {
-            visibility_buffer: Buffer::null(),
             scene_set: vk::DescriptorSet::null(),
             render_set: vk::DescriptorSet::null(),
             cull_set: vk::DescriptorSet::null(),
+            visibility_buffer: Buffer::null(),
             index_buffer: Buffer::null(),
             object_buffer: Buffer::null(),
             instance_buffer: Buffer::null(),
@@ -89,7 +100,7 @@ pub struct Renderer {
 
     // Command pool.
     query_pool: vk::QueryPool,
-    cmd_pool: vk::CommandPool,
+    _cmd_pool: vk::CommandPool,
 
     // Desciptor set layouts.
     scene_set_layout: vk::DescriptorSetLayout,
@@ -115,8 +126,9 @@ pub struct Renderer {
     staging_fence: vk::Fence,
 
     // Scene.
+    pipeline_semaphore: vk::Semaphore,
     sync_primitives: [FrameSyncPrimitives; MAX_FRAMES_IN_FLIGHT],
-    render_cmd_buffers: [vk::CommandBuffer; MAX_FRAMES_IN_FLIGHT],
+    cmd_buffers: [[vk::CommandBuffer; MAX_PIPELINE_STAGES]; MAX_FRAMES_IN_FLIGHT],
     descriptor_pools: [vk::DescriptorPool; MAX_FRAMES_IN_FLIGHT],
     depth_images: [(vk::Image, vk_mem::Allocation); MAX_FRAMES_IN_FLIGHT],
     depth_views: [vk::ImageView; MAX_FRAMES_IN_FLIGHT],
@@ -469,16 +481,18 @@ impl Renderer {
                 .unwrap();
 
             // Per-frame recorded render buffers.
-            let render_cmd_buffers = device
-                .allocate_command_buffers(
-                    &vk::CommandBufferAllocateInfo::default()
-                        .command_pool(cmd_pool)
-                        .level(vk::CommandBufferLevel::PRIMARY)
-                        .command_buffer_count(MAX_FRAMES_IN_FLIGHT as _),
-                )
-                .unwrap()
-                .try_into()
-                .unwrap();
+            let cmd_buffers = std::array::from_fn(|_| {
+                device
+                    .allocate_command_buffers(
+                        &vk::CommandBufferAllocateInfo::default()
+                            .command_pool(cmd_pool)
+                            .level(vk::CommandBufferLevel::PRIMARY)
+                            .command_buffer_count(MAX_PIPELINE_STAGES as _),
+                    )
+                    .unwrap()
+                    .try_into()
+                    .unwrap()
+            });
 
             let render_finished = (0..swapchain.images.len())
                 .into_iter()
@@ -588,6 +602,18 @@ impl Renderer {
                     .unwrap()
             });
 
+            // Semaphore for pipeline signalling.
+            let pipeline_semaphore = device
+                .create_semaphore(
+                    &vk::SemaphoreCreateInfo::default().push_next(
+                        &mut vk::SemaphoreTypeCreateInfo::default()
+                            .semaphore_type(vk::SemaphoreType::TIMELINE)
+                            .initial_value(0),
+                    ),
+                    None,
+                )
+                .unwrap();
+
             //
             Self {
                 core,
@@ -601,7 +627,7 @@ impl Renderer {
                 swapchain,
 
                 query_pool,
-                cmd_pool,
+                _cmd_pool: cmd_pool,
 
                 scene_set_layout,
                 render_set_layout,
@@ -622,8 +648,9 @@ impl Renderer {
                 staging_cmd_buffer,
                 staging_fence,
 
+                pipeline_semaphore,
                 sync_primitives,
-                render_cmd_buffers,
+                cmd_buffers,
                 descriptor_pools,
                 depth_images,
                 depth_views,
@@ -640,6 +667,7 @@ impl Renderer {
 
     pub fn render(&mut self, _timestamp: f32) {
         let frame_index = self.frame % MAX_FRAMES_IN_FLIGHT;
+        let frame_count = self.frame;
         self.frame += 1;
 
         unsafe {
@@ -681,7 +709,10 @@ impl Renderer {
         } = self.sync_primitives[frame_index];
 
         // Command buffer associated with this frame.
-        let command_buffer = self.render_cmd_buffers[frame_index];
+        let command_buffers = &self.cmd_buffers[frame_index];
+        let data_upload = command_buffers[PipelineStage::DataUpload as usize];
+        let frustum_cull = command_buffers[PipelineStage::FrustumCull as usize];
+        let first_draw = command_buffers[PipelineStage::FirstDraw as usize];
 
         unsafe {
             // Wait for next image to become available.
@@ -724,30 +755,35 @@ impl Renderer {
                 println!("timestamp: {} ms", multi * (data[1] - data[0]) as f32);
             }
 
-            // Reset and record.
-            self.device
-                .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
-                .unwrap();
-            self.device
-                .begin_command_buffer(command_buffer, &vk::CommandBufferBeginInfo::default())
-                .unwrap();
+            // TODO: Make command buffers better.
+            unsafe fn cmd_buffer_record(
+                device: &ash::Device,
+                cmd: vk::CommandBuffer,
+                f: impl FnOnce(vk::CommandBuffer),
+            ) {
+                device
+                    .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
+                    .unwrap();
+                device
+                    .begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())
+                    .unwrap();
 
-            // Reset query pools and write a timestamp for frame keeping (keep this right at the top).
-            self.device.cmd_reset_query_pool(
-                command_buffer,
-                self.query_pool,
-                2 * frame_index as u32,
-                2,
-            );
-            self.device.cmd_write_timestamp(
-                command_buffer,
-                vk::PipelineStageFlags::TOP_OF_PIPE,
-                self.query_pool,
-                (2 * frame_index + 0) as u32,
-            );
+                f(cmd);
 
-            // Transfer some global state data.
-            {
+                device.end_command_buffer(cmd).unwrap();
+            }
+
+            cmd_buffer_record(&self.device, data_upload, |cmd| {
+                // Reset query pools and write a timestamp for frame keeping (keep this right at the top).
+                self.device
+                    .cmd_reset_query_pool(cmd, self.query_pool, 2 * frame_index as u32, 2);
+                self.device.cmd_write_timestamp(
+                    cmd,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    self.query_pool,
+                    (2 * frame_index + 0) as u32,
+                );
+
                 let object_data = self.objects.values().map(|obj| Object {
                     position: obj.position,
                     scale: obj.scale * self.meshes.get(&obj.mesh).unwrap().0,
@@ -776,137 +812,96 @@ impl Renderer {
                 let frustum_y = normalize_plane(temp.w_axis + temp.y_axis);
                 let frustum = Vec4::from([frustum_x.x, frustum_x.z, frustum_y.y, frustum_y.z]);
 
-                // Upload data.
-                {
-                    self.staging_buffer.reset();
+                // Upload scene data.
+                self.staging_buffer.reset();
 
-                    self.staging_buffer.stage_buffer(
-                        &self.device,
-                        command_buffer,
-                        &scene.object_buffer,
-                        0,
-                        object_data,
-                    );
+                self.staging_buffer.stage_buffer(
+                    &self.device,
+                    cmd,
+                    &scene.object_buffer,
+                    0,
+                    object_data,
+                );
 
-                    self.staging_buffer.stage_buffer(
-                        &self.device,
-                        command_buffer,
-                        &scene.scene_global_buffer,
-                        0,
-                        [SceneGlobal {
-                            pv: projection * view,
-                            proj: projection,
-                            view,
-                            camera_position: self.cam_pos.extend(1.0),
-                            camera_direction: p.extend(0.0),
-                            light_position: Vec4::new(1.0, 0.0, 0.0, 1.0),
-                            light_color: Vec4::new(1.0, 1.0, 1.0, 1.0),
-                        }],
-                    );
+                self.staging_buffer.stage_buffer(
+                    &self.device,
+                    cmd,
+                    &scene.scene_global_buffer,
+                    0,
+                    [SceneGlobal {
+                        pv: projection * view,
+                        proj: projection,
+                        view,
+                        camera_position: self.cam_pos.extend(1.0),
+                        camera_direction: p.extend(0.0),
+                        light_position: Vec4::new(1.0, 0.0, 0.0, 1.0),
+                        light_color: Vec4::new(1.0, 1.0, 1.0, 1.0),
+                    }],
+                );
 
-                    self.staging_buffer.stage_buffer(
-                        &self.device,
-                        command_buffer,
-                        &scene.meshlet_render_global_buffer,
-                        0,
-                        [MeshletRenderGlobal {
-                            instance_buffer: self.device.get_buffer_device_address(
-                                &vk::BufferDeviceAddressInfo::default()
-                                    .buffer(scene.instance_buffer.vk_handle()),
-                            ),
-                            object_buffer: self.device.get_buffer_device_address(
-                                &vk::BufferDeviceAddressInfo::default()
-                                    .buffer(scene.object_buffer.vk_handle()),
-                            ),
-                        }],
-                    );
-                    self.staging_buffer.stage_buffer(
-                        &self.device,
-                        command_buffer,
-                        &scene.indirect_count_buffer,
-                        0,
-                        [0u32],
-                    );
-                    self.staging_buffer.stage_buffer(
-                        &self.device,
-                        command_buffer,
-                        &scene.meshlet_cull_global_buffer,
-                        0,
-                        [MeshletCullGlobal {
-                            instances: scene.indirect_cmd_buffer.len,
-                            frustum,
-                            meshlet_visibility_buffer: self.device.get_buffer_device_address(
-                                &vk::BufferDeviceAddressInfo::default()
-                                    .buffer(scene.visibility_buffer.vk_handle()),
-                            ),
-                            draw_count_buffer: self.device.get_buffer_device_address(
-                                &vk::BufferDeviceAddressInfo::default()
-                                    .buffer(scene.indirect_count_buffer.vk_handle()),
-                            ),
-                            meshlet_buffer: self.device.get_buffer_device_address(
-                                &vk::BufferDeviceAddressInfo::default()
-                                    .buffer(scene.meshlet_data_buffer.vk_handle()),
-                            ),
-                            draw_cmd_buffer: self.device.get_buffer_device_address(
-                                &vk::BufferDeviceAddressInfo::default()
-                                    .buffer(scene.indirect_cmd_buffer.vk_handle()),
-                            ),
-                            instance_buffer: self.device.get_buffer_device_address(
-                                &vk::BufferDeviceAddressInfo::default()
-                                    .buffer(scene.instance_buffer.vk_handle()),
-                            ),
-                            object_buffer: self.device.get_buffer_device_address(
-                                &vk::BufferDeviceAddressInfo::default()
-                                    .buffer(scene.object_buffer.vk_handle()),
-                            ),
-                        }],
-                    );
-                }
-            }
-
-            self.device.cmd_write_timestamp(
-                command_buffer,
-                vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-                self.query_pool,
-                (2 * frame_index + 1) as u32,
-            );
-
-            // Transition the swapchain image to optimal.
-            self.device.cmd_pipeline_barrier2(
-                command_buffer,
-                &vk::DependencyInfo::default()
-                    .memory_barriers(&[
-                        //
-                        vk::MemoryBarrier2::default()
-                            .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                            .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
-                            .dst_stage_mask(vk::PipelineStageFlags2::INDEX_INPUT)
-                            .dst_access_mask(vk::AccessFlags2::MEMORY_READ),
-                    ])
-                    .image_memory_barriers(&[
-                        // Convert VK_IMAGE_LAYOUT_UNDEFINED -> VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL.
-                        vk::ImageMemoryBarrier2::default()
-                            .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
-                            .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-                            .image(swapchain_image)
-                            .subresource_range(
-                                vk::ImageSubresourceRange::default()
-                                    .aspect_mask(vk::ImageAspectFlags::COLOR)
-                                    .base_mip_level(0)
-                                    .level_count(1)
-                                    .base_array_layer(0)
-                                    .layer_count(1),
-                            )
-                            .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
-                            .old_layout(vk::ImageLayout::UNDEFINED)
-                            .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
-                    ]),
-            );
+                self.staging_buffer.stage_buffer(
+                    &self.device,
+                    cmd,
+                    &scene.meshlet_render_global_buffer,
+                    0,
+                    [MeshletRenderGlobal {
+                        instance_buffer: self.device.get_buffer_device_address(
+                            &vk::BufferDeviceAddressInfo::default()
+                                .buffer(scene.instance_buffer.vk_handle()),
+                        ),
+                        object_buffer: self.device.get_buffer_device_address(
+                            &vk::BufferDeviceAddressInfo::default()
+                                .buffer(scene.object_buffer.vk_handle()),
+                        ),
+                    }],
+                );
+                self.staging_buffer.stage_buffer(
+                    &self.device,
+                    cmd,
+                    &scene.indirect_count_buffer,
+                    0,
+                    [0u32],
+                );
+                self.staging_buffer.stage_buffer(
+                    &self.device,
+                    cmd,
+                    &scene.meshlet_cull_global_buffer,
+                    0,
+                    [MeshletCullGlobal {
+                        instances: scene.indirect_cmd_buffer.len,
+                        frustum,
+                        meshlet_visibility_buffer: self.device.get_buffer_device_address(
+                            &vk::BufferDeviceAddressInfo::default()
+                                .buffer(scene.visibility_buffer.vk_handle()),
+                        ),
+                        draw_count_buffer: self.device.get_buffer_device_address(
+                            &vk::BufferDeviceAddressInfo::default()
+                                .buffer(scene.indirect_count_buffer.vk_handle()),
+                        ),
+                        meshlet_buffer: self.device.get_buffer_device_address(
+                            &vk::BufferDeviceAddressInfo::default()
+                                .buffer(scene.meshlet_data_buffer.vk_handle()),
+                        ),
+                        draw_cmd_buffer: self.device.get_buffer_device_address(
+                            &vk::BufferDeviceAddressInfo::default()
+                                .buffer(scene.indirect_cmd_buffer.vk_handle()),
+                        ),
+                        instance_buffer: self.device.get_buffer_device_address(
+                            &vk::BufferDeviceAddressInfo::default()
+                                .buffer(scene.instance_buffer.vk_handle()),
+                        ),
+                        object_buffer: self.device.get_buffer_device_address(
+                            &vk::BufferDeviceAddressInfo::default()
+                                .buffer(scene.object_buffer.vk_handle()),
+                        ),
+                    }],
+                );
+            });
 
             // Compute prepass.
-            {
+            cmd_buffer_record(&self.device, frustum_cull, |cmd| {
                 self.device.cmd_bind_descriptor_sets(
-                    command_buffer,
+                    cmd,
                     vk::PipelineBindPoint::COMPUTE,
                     self.frustum_cull_pipeline_layout,
                     0,
@@ -915,20 +910,50 @@ impl Renderer {
                 );
 
                 self.device.cmd_bind_pipeline(
-                    command_buffer,
+                    cmd,
                     vk::PipelineBindPoint::COMPUTE,
                     self.frustum_cull_pipeline,
                 );
 
                 self.device
-                    .cmd_dispatch(command_buffer, scene.meshlet_data_buffer.len().div_ceil(64), 1, 1);
-            }
+                    .cmd_dispatch(cmd, scene.meshlet_data_buffer.len().div_ceil(64), 1, 1);
+            });
 
-            // Begin rendering.
-            {
+            cmd_buffer_record(&self.device, first_draw, |cmd| {
+                self.device.cmd_pipeline_barrier2(
+                    cmd,
+                    &vk::DependencyInfo::default()
+                        .memory_barriers(&[
+                            //
+                            vk::MemoryBarrier2::default()
+                                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                                .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
+                                .dst_stage_mask(vk::PipelineStageFlags2::INDEX_INPUT)
+                                .dst_access_mask(vk::AccessFlags2::MEMORY_READ),
+                        ])
+                        .image_memory_barriers(&[
+                            // Convert VK_IMAGE_LAYOUT_UNDEFINED -> VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL.
+                            vk::ImageMemoryBarrier2::default()
+                                .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
+                                .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                                .image(swapchain_image)
+                                .subresource_range(
+                                    vk::ImageSubresourceRange::default()
+                                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                        .base_mip_level(0)
+                                        .level_count(1)
+                                        .base_array_layer(0)
+                                        .layer_count(1),
+                                )
+                                .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                                .old_layout(vk::ImageLayout::UNDEFINED)
+                                .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
+                        ]),
+                );
+
                 // Use dynamic rendering.
                 self.device.cmd_begin_rendering(
-                    command_buffer,
+                    cmd,
                     &vk::RenderingInfo::default()
                         .render_area(vk::Rect2D {
                             offset: vk::Offset2D { x: 0, y: 0 },
@@ -965,7 +990,7 @@ impl Renderer {
 
                 // Begin draw calls.
                 self.device.cmd_bind_descriptor_sets(
-                    command_buffer,
+                    cmd,
                     vk::PipelineBindPoint::GRAPHICS,
                     self.render_pipeline_layout,
                     0,
@@ -974,20 +999,20 @@ impl Renderer {
                 );
 
                 self.device.cmd_bind_pipeline(
-                    command_buffer,
+                    cmd,
                     vk::PipelineBindPoint::GRAPHICS,
                     self.render_pipeline,
                 );
 
                 self.device.cmd_bind_index_buffer(
-                    command_buffer,
+                    cmd,
                     scene.index_buffer.vk_handle(),
                     0,
                     vk::IndexType::UINT32,
                 );
 
                 self.device.cmd_draw_indexed_indirect_count(
-                    command_buffer,
+                    cmd,
                     scene.indirect_cmd_buffer.vk_handle(),
                     0,
                     scene.indirect_count_buffer.vk_handle(),
@@ -996,44 +1021,108 @@ impl Renderer {
                     size_of::<vk::DrawIndexedIndirectCommand>() as u32,
                 );
 
-                self.device.cmd_end_rendering(command_buffer);
+                self.device.cmd_end_rendering(cmd);
 
-            }
+                // Transition swapchain image to present.
+                self.device.cmd_pipeline_barrier2(
+                    cmd,
+                    &vk::DependencyInfo::default().image_memory_barriers(&[
+                        // Convert VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL -> VK_IMAGE_LAYOUT_PRESENT_SRC_KHR.
+                        vk::ImageMemoryBarrier2::default()
+                            .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                            .dst_stage_mask(vk::PipelineStageFlags2::BOTTOM_OF_PIPE)
+                            .image(swapchain_image)
+                            .subresource_range(
+                                vk::ImageSubresourceRange::default()
+                                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                    .base_mip_level(0)
+                                    .level_count(1)
+                                    .base_array_layer(0)
+                                    .layer_count(1),
+                            )
+                            .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                            .new_layout(vk::ImageLayout::PRESENT_SRC_KHR),
+                    ]),
+                );
 
-            // Transition swapchain image to present.
-            self.device.cmd_pipeline_barrier2(
-                command_buffer,
-                &vk::DependencyInfo::default().image_memory_barriers(&[
-                    // Convert VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL -> VK_IMAGE_LAYOUT_PRESENT_SRC_KHR.
-                    vk::ImageMemoryBarrier2::default()
-                        .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-                        .dst_stage_mask(vk::PipelineStageFlags2::BOTTOM_OF_PIPE)
-                        .image(swapchain_image)
-                        .subresource_range(
-                            vk::ImageSubresourceRange::default()
-                                .aspect_mask(vk::ImageAspectFlags::COLOR)
-                                .base_mip_level(0)
-                                .level_count(1)
-                                .base_array_layer(0)
-                                .layer_count(1),
-                        )
-                        .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
-                        .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                        .new_layout(vk::ImageLayout::PRESENT_SRC_KHR),
-                ]),
-            );
+                // Run this at the end!
+                self.device.cmd_write_timestamp(
+                    cmd,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    self.query_pool,
+                    (2 * frame_index + 1) as u32,
+                );
+            });
 
-            self.device.end_command_buffer(command_buffer).unwrap();
-
-            // Execute command buffer.
+            // TODO: Submit all queues.
+            let subframe = |frame, subframe: PipelineStage| {
+                frame as u64 * MAX_PIPELINE_STAGES as u64 + subframe as u64
+            };
             self.device
-                .queue_submit(
+                .queue_submit2(
                     self.graphics_queue,
-                    &[vk::SubmitInfo::default()
-                        .wait_semaphores(&[image_available])
-                        .signal_semaphores(&[render_finished])
-                        .wait_dst_stage_mask(&[vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT])
-                        .command_buffers(&[command_buffer])],
+                    &[vk::SubmitInfo2::default()
+                        .command_buffer_infos(&[
+                            vk::CommandBufferSubmitInfo::default().command_buffer(data_upload)
+                        ])
+                        .wait_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
+                            .semaphore(self.pipeline_semaphore)
+                            .value(subframe(frame_count, PipelineStage::DataUpload))
+                            .stage_mask(vk::PipelineStageFlags2::TRANSFER)])
+                        .signal_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
+                            .semaphore(self.pipeline_semaphore)
+                            .value(subframe(frame_count, PipelineStage::DataUpload) + 1)
+                            .stage_mask(vk::PipelineStageFlags2::TRANSFER)])],
+                    vk::Fence::null(),
+                )
+                .unwrap();
+            self.device
+                .queue_submit2(
+                    self.graphics_queue,
+                    &[vk::SubmitInfo2::default()
+                        .command_buffer_infos(&[
+                            vk::CommandBufferSubmitInfo::default().command_buffer(frustum_cull)
+                        ])
+                        .wait_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
+                            .semaphore(self.pipeline_semaphore)
+                            .value(subframe(frame_count, PipelineStage::FrustumCull))
+                            .stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)])
+                        .signal_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
+                            .semaphore(self.pipeline_semaphore)
+                            .value(subframe(frame_count, PipelineStage::FrustumCull) + 1)
+                            .stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)])],
+                    vk::Fence::null(),
+                )
+                .unwrap();
+            self.device
+                .queue_submit2(
+                    self.graphics_queue,
+                    &[vk::SubmitInfo2::default()
+                        .command_buffer_infos(&[
+                            vk::CommandBufferSubmitInfo::default().command_buffer(first_draw)
+                        ])
+                        .wait_semaphore_infos(&[
+                            vk::SemaphoreSubmitInfo::default()
+                                .semaphore(image_available)
+                                .stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT),
+                            vk::SemaphoreSubmitInfo::default()
+                                .semaphore(self.pipeline_semaphore)
+                                .value(subframe(frame_count, PipelineStage::FirstDraw))
+                                .stage_mask(
+                                    vk::PipelineStageFlags2::DRAW_INDIRECT
+                                        | vk::PipelineStageFlags2::INDEX_INPUT,
+                                ),
+                        ])
+                        .signal_semaphore_infos(&[
+                            vk::SemaphoreSubmitInfo::default()
+                                .semaphore(self.pipeline_semaphore)
+                                .value(subframe(frame_count, PipelineStage::FirstDraw) + 1)
+                                .stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT),
+                            vk::SemaphoreSubmitInfo::default()
+                                .semaphore(render_finished)
+                                .stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT),
+                        ])],
                     frame_in_flight,
                 )
                 .unwrap();
