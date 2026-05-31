@@ -2,11 +2,7 @@ use std::process::Command;
 
 fn main() {
     // Add shader filenames here to build them.
-    let shaders: &[&str] = &[
-        "render.vert",
-        "render.frag",
-        "frustum_cull.comp",
-    ];
+    let shaders: &[&str] = &["render.vert", "render.frag", "frustum_cull.comp"];
 
     for shader in shaders {
         let input = format!("resources/shaders/{shader}");

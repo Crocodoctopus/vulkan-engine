@@ -34,9 +34,6 @@ pub(super) struct ObjectInstance {
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
 
 struct Scene {
-    //
-    scene_cmd_buffers: Box<[vk::CommandBuffer]>,
-
     // Descriptor sets.
     scene_set: vk::DescriptorSet,
     render_set: vk::DescriptorSet,
@@ -59,7 +56,6 @@ impl Scene {
     fn null() -> Self {
         Self {
             visibility_buffer: Buffer::null(),
-            scene_cmd_buffers: <_>::default(),
             scene_set: vk::DescriptorSet::null(),
             render_set: vk::DescriptorSet::null(),
             cull_set: vk::DescriptorSet::null(),
@@ -122,6 +118,8 @@ pub struct Renderer {
     sync_primitives: [FrameSyncPrimitives; MAX_FRAMES_IN_FLIGHT],
     render_cmd_buffers: [vk::CommandBuffer; MAX_FRAMES_IN_FLIGHT],
     descriptor_pools: [vk::DescriptorPool; MAX_FRAMES_IN_FLIGHT],
+    depth_images: [(vk::Image, vk_mem::Allocation); MAX_FRAMES_IN_FLIGHT],
+    depth_views: [vk::ImageView; MAX_FRAMES_IN_FLIGHT],
     render_finished: Box<[vk::Semaphore]>,
     current_scene: Scene,
     next_scene: Option<Scene>,
@@ -163,6 +161,7 @@ impl Renderer {
                 physical_device,
                 queue_family_index,
                 surface_format,
+                surface_extent,
                 ..
             } = &core;
 
@@ -227,7 +226,7 @@ impl Renderer {
             let allocator = vk_mem::Allocator::new(allocator_cinfo).unwrap();
 
             // Build swapchain from core.
-            let swapchain = Swapchain::new(&core, &device, &allocator);
+            let swapchain = Swapchain::new(&core, &device);
 
             // Query pool.
             let query_pool = device
@@ -541,6 +540,54 @@ impl Renderer {
                     .unwrap()
             });
 
+            // Create depth attachment for rendering.
+            let depth_images = std::array::from_fn(|_| {
+                use vk_mem::Alloc;
+                allocator
+                    .create_image(
+                        &vk::ImageCreateInfo::default()
+                            .image_type(vk::ImageType::TYPE_2D)
+                            .extent(
+                                vk::Extent3D::default()
+                                    .width(surface_extent.width)
+                                    .height(surface_extent.height)
+                                    .depth(1),
+                            )
+                            .mip_levels(1)
+                            .array_layers(1)
+                            .initial_layout(vk::ImageLayout::UNDEFINED)
+                            .samples(vk::SampleCountFlags::TYPE_1)
+                            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+                            .format(vk::Format::D32_SFLOAT)
+                            .tiling(vk::ImageTiling::OPTIMAL)
+                            .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT),
+                        &vk_mem::AllocationCreateInfo {
+                            required_flags: vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap()
+            });
+
+            let depth_views = std::array::from_fn(|i| {
+                device
+                    .create_image_view(
+                        &vk::ImageViewCreateInfo::default()
+                            .image(depth_images[i].0)
+                            .view_type(vk::ImageViewType::TYPE_2D)
+                            .format(vk::Format::D32_SFLOAT)
+                            .subresource_range(vk::ImageSubresourceRange {
+                                aspect_mask: vk::ImageAspectFlags::DEPTH,
+                                base_mip_level: 0,
+                                level_count: 1,
+                                base_array_layer: 0,
+                                layer_count: 1,
+                            }),
+                        None,
+                    )
+                    .unwrap()
+            });
+
             //
             Self {
                 core,
@@ -578,6 +625,8 @@ impl Renderer {
                 sync_primitives,
                 render_cmd_buffers,
                 descriptor_pools,
+                depth_images,
+                depth_views,
                 render_finished,
                 current_scene: Scene::null(),
                 next_scene: None,
@@ -620,8 +669,8 @@ impl Renderer {
         }
 
         // Get current working frame.
-        let frame = match &self.next_scene {
-            Some(frame) => frame,
+        let scene = match &self.next_scene {
+            Some(scene) => scene,
             None => &self.current_scene,
         };
 
@@ -641,6 +690,10 @@ impl Renderer {
                 .unwrap();
             self.device.reset_fences(&[frame_in_flight]).unwrap();
 
+            // TODO: keep this here? Its a per-fif variable.
+            let depth_view = self.depth_views[frame_index];
+
+            //
             let (image_index, _) = self
                 .swapchain
                 .swapchain_device
@@ -652,7 +705,8 @@ impl Renderer {
                 )
                 .unwrap();
             let render_finished = self.render_finished[image_index as usize];
-            let scene_command_buffer = frame.scene_cmd_buffers[image_index as usize];
+            let swapchain_image = self.swapchain.images[image_index as usize];
+            let swapchain_view = self.swapchain.views[image_index as usize];
 
             // Get the previous frame's timestamps.
             let mut data = [0u64; 2];
@@ -677,6 +731,8 @@ impl Renderer {
             self.device
                 .begin_command_buffer(command_buffer, &vk::CommandBufferBeginInfo::default())
                 .unwrap();
+
+            // Reset query pools and write a timestamp for frame keeping (keep this right at the top).
             self.device.cmd_reset_query_pool(
                 command_buffer,
                 self.query_pool,
@@ -727,7 +783,7 @@ impl Renderer {
                     self.staging_buffer.stage_buffer(
                         &self.device,
                         command_buffer,
-                        &frame.object_buffer,
+                        &scene.object_buffer,
                         0,
                         object_data,
                     );
@@ -735,7 +791,7 @@ impl Renderer {
                     self.staging_buffer.stage_buffer(
                         &self.device,
                         command_buffer,
-                        &frame.scene_global_buffer,
+                        &scene.scene_global_buffer,
                         0,
                         [SceneGlobal {
                             pv: projection * view,
@@ -751,57 +807,57 @@ impl Renderer {
                     self.staging_buffer.stage_buffer(
                         &self.device,
                         command_buffer,
-                        &frame.meshlet_render_global_buffer,
+                        &scene.meshlet_render_global_buffer,
                         0,
                         [MeshletRenderGlobal {
                             instance_buffer: self.device.get_buffer_device_address(
                                 &vk::BufferDeviceAddressInfo::default()
-                                    .buffer(frame.instance_buffer.vk_handle()),
+                                    .buffer(scene.instance_buffer.vk_handle()),
                             ),
                             object_buffer: self.device.get_buffer_device_address(
                                 &vk::BufferDeviceAddressInfo::default()
-                                    .buffer(frame.object_buffer.vk_handle()),
+                                    .buffer(scene.object_buffer.vk_handle()),
                             ),
                         }],
                     );
                     self.staging_buffer.stage_buffer(
                         &self.device,
                         command_buffer,
-                        &frame.indirect_count_buffer,
+                        &scene.indirect_count_buffer,
                         0,
                         [0u32],
                     );
                     self.staging_buffer.stage_buffer(
                         &self.device,
                         command_buffer,
-                        &frame.meshlet_cull_global_buffer,
+                        &scene.meshlet_cull_global_buffer,
                         0,
                         [MeshletCullGlobal {
-                            instances: frame.indirect_cmd_buffer.len,
+                            instances: scene.indirect_cmd_buffer.len,
                             frustum,
                             meshlet_visibility_buffer: self.device.get_buffer_device_address(
                                 &vk::BufferDeviceAddressInfo::default()
-                                    .buffer(frame.visibility_buffer.vk_handle()),
+                                    .buffer(scene.visibility_buffer.vk_handle()),
                             ),
                             draw_count_buffer: self.device.get_buffer_device_address(
                                 &vk::BufferDeviceAddressInfo::default()
-                                    .buffer(frame.indirect_count_buffer.vk_handle()),
+                                    .buffer(scene.indirect_count_buffer.vk_handle()),
                             ),
                             meshlet_buffer: self.device.get_buffer_device_address(
                                 &vk::BufferDeviceAddressInfo::default()
-                                    .buffer(frame.meshlet_data_buffer.vk_handle()),
+                                    .buffer(scene.meshlet_data_buffer.vk_handle()),
                             ),
                             draw_cmd_buffer: self.device.get_buffer_device_address(
                                 &vk::BufferDeviceAddressInfo::default()
-                                    .buffer(frame.indirect_cmd_buffer.vk_handle()),
+                                    .buffer(scene.indirect_cmd_buffer.vk_handle()),
                             ),
                             instance_buffer: self.device.get_buffer_device_address(
                                 &vk::BufferDeviceAddressInfo::default()
-                                    .buffer(frame.instance_buffer.vk_handle()),
+                                    .buffer(scene.instance_buffer.vk_handle()),
                             ),
                             object_buffer: self.device.get_buffer_device_address(
                                 &vk::BufferDeviceAddressInfo::default()
-                                    .buffer(frame.object_buffer.vk_handle()),
+                                    .buffer(scene.object_buffer.vk_handle()),
                             ),
                         }],
                     );
@@ -814,8 +870,158 @@ impl Renderer {
                 self.query_pool,
                 (2 * frame_index + 1) as u32,
             );
-            self.device
-                .cmd_execute_commands(command_buffer, &[scene_command_buffer]);
+
+            // Transition the swapchain image to optimal.
+            self.device.cmd_pipeline_barrier2(
+                command_buffer,
+                &vk::DependencyInfo::default()
+                    .memory_barriers(&[
+                        //
+                        vk::MemoryBarrier2::default()
+                            .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                            .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
+                            .dst_stage_mask(vk::PipelineStageFlags2::INDEX_INPUT)
+                            .dst_access_mask(vk::AccessFlags2::MEMORY_READ),
+                    ])
+                    .image_memory_barriers(&[
+                        // Convert VK_IMAGE_LAYOUT_UNDEFINED -> VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL.
+                        vk::ImageMemoryBarrier2::default()
+                            .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
+                            .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                            .image(swapchain_image)
+                            .subresource_range(
+                                vk::ImageSubresourceRange::default()
+                                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                    .base_mip_level(0)
+                                    .level_count(1)
+                                    .base_array_layer(0)
+                                    .layer_count(1),
+                            )
+                            .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                            .old_layout(vk::ImageLayout::UNDEFINED)
+                            .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
+                    ]),
+            );
+
+            // Compute prepass.
+            {
+                self.device.cmd_bind_descriptor_sets(
+                    command_buffer,
+                    vk::PipelineBindPoint::COMPUTE,
+                    self.frustum_cull_pipeline_layout,
+                    0,
+                    &[scene.scene_set, scene.cull_set],
+                    &[],
+                );
+
+                self.device.cmd_bind_pipeline(
+                    command_buffer,
+                    vk::PipelineBindPoint::COMPUTE,
+                    self.frustum_cull_pipeline,
+                );
+
+                self.device
+                    .cmd_dispatch(command_buffer, scene.meshlet_data_buffer.len().div_ceil(64), 1, 1);
+            }
+
+            // Begin rendering.
+            {
+                // Use dynamic rendering.
+                self.device.cmd_begin_rendering(
+                    command_buffer,
+                    &vk::RenderingInfo::default()
+                        .render_area(vk::Rect2D {
+                            offset: vk::Offset2D { x: 0, y: 0 },
+                            extent: vk::Extent2D {
+                                width: self.core.surface_extent.width,
+                                height: self.core.surface_extent.height,
+                            },
+                        })
+                        .layer_count(1)
+                        .depth_attachment(
+                            &vk::RenderingAttachmentInfo::default()
+                                .image_view(depth_view)
+                                .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                                .load_op(vk::AttachmentLoadOp::CLEAR)
+                                .store_op(vk::AttachmentStoreOp::STORE)
+                                .clear_value(vk::ClearValue {
+                                    depth_stencil: vk::ClearDepthStencilValue {
+                                        depth: 1.0,
+                                        stencil: 0,
+                                    },
+                                }),
+                        )
+                        .color_attachments(&[vk::RenderingAttachmentInfo::default()
+                            .image_view(swapchain_view)
+                            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                            .load_op(vk::AttachmentLoadOp::CLEAR)
+                            .store_op(vk::AttachmentStoreOp::STORE)
+                            .clear_value(vk::ClearValue {
+                                color: vk::ClearColorValue {
+                                    float32: [0.0, 0.0, 0.0, 1.0],
+                                },
+                            })]),
+                );
+
+                // Begin draw calls.
+                self.device.cmd_bind_descriptor_sets(
+                    command_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.render_pipeline_layout,
+                    0,
+                    &[scene.scene_set, scene.render_set],
+                    &[],
+                );
+
+                self.device.cmd_bind_pipeline(
+                    command_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.render_pipeline,
+                );
+
+                self.device.cmd_bind_index_buffer(
+                    command_buffer,
+                    scene.index_buffer.vk_handle(),
+                    0,
+                    vk::IndexType::UINT32,
+                );
+
+                self.device.cmd_draw_indexed_indirect_count(
+                    command_buffer,
+                    scene.indirect_cmd_buffer.vk_handle(),
+                    0,
+                    scene.indirect_count_buffer.vk_handle(),
+                    0,
+                    scene.meshlet_data_buffer.len(),
+                    size_of::<vk::DrawIndexedIndirectCommand>() as u32,
+                );
+
+                self.device.cmd_end_rendering(command_buffer);
+
+            }
+
+            // Transition swapchain image to present.
+            self.device.cmd_pipeline_barrier2(
+                command_buffer,
+                &vk::DependencyInfo::default().image_memory_barriers(&[
+                    // Convert VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL -> VK_IMAGE_LAYOUT_PRESENT_SRC_KHR.
+                    vk::ImageMemoryBarrier2::default()
+                        .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                        .dst_stage_mask(vk::PipelineStageFlags2::BOTTOM_OF_PIPE)
+                        .image(swapchain_image)
+                        .subresource_range(
+                            vk::ImageSubresourceRange::default()
+                                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                .base_mip_level(0)
+                                .level_count(1)
+                                .base_array_layer(0)
+                                .layer_count(1),
+                        )
+                        .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                        .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                        .new_layout(vk::ImageLayout::PRESENT_SRC_KHR),
+                ]),
+            );
 
             self.device.end_command_buffer(command_buffer).unwrap();
 
@@ -847,10 +1053,6 @@ impl Renderer {
     }
 
     unsafe fn free_scene(&mut self, mut scene: Scene) {
-        if scene.scene_cmd_buffers.len() > 0 {
-            self.device
-                .free_command_buffers(self.cmd_pool, &scene.scene_cmd_buffers);
-        }
         scene.index_buffer.take().destroy(&self.allocator);
         scene.object_buffer.take().destroy(&self.allocator);
         scene.instance_buffer.take().destroy(&self.allocator);
@@ -957,17 +1159,6 @@ impl Renderer {
 
         // TODO: split this up.
         let frame = Scene {
-            scene_cmd_buffers: self
-                .device
-                .allocate_command_buffers(
-                    &vk::CommandBufferAllocateInfo::default()
-                        .command_pool(self.cmd_pool)
-                        .level(vk::CommandBufferLevel::SECONDARY)
-                        .command_buffer_count(self.swapchain.images.len() as u32),
-                )
-                .unwrap()
-                .into_boxed_slice(),
-
             scene_set,
             render_set,
             cull_set,
@@ -975,7 +1166,9 @@ impl Renderer {
             visibility_buffer: Buffer::new(
                 &self.allocator,
                 instances,
-                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                vk::BufferUsageFlags::STORAGE_BUFFER
+                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+                    | vk::BufferUsageFlags::TRANSFER_DST,
                 vk_mem::MemoryUsage::AutoPreferDevice,
             ),
 
@@ -1100,6 +1293,30 @@ impl Renderer {
             1,
         );
 
+        // Rerecord scene command buffers.
+        for i in 0..MAX_FRAMES_IN_FLIGHT {
+            self.device.cmd_pipeline_barrier2(
+                self.staging_cmd_buffer,
+                &vk::DependencyInfo::default().image_memory_barriers(&[
+                    vk::ImageMemoryBarrier2::default()
+                        .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
+                        .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                        .image(self.depth_images[i].0)
+                        .subresource_range(
+                            vk::ImageSubresourceRange::default()
+                                .aspect_mask(vk::ImageAspectFlags::DEPTH)
+                                .base_mip_level(0)
+                                .level_count(1)
+                                .base_array_layer(0)
+                                .layer_count(1),
+                        )
+                        .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                        .old_layout(vk::ImageLayout::UNDEFINED)
+                        .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL),
+                ]),
+            );
+        }
+
         // Submit (& wait at end of function).
         self.device
             .end_command_buffer(self.staging_cmd_buffer)
@@ -1113,248 +1330,42 @@ impl Renderer {
             )
             .unwrap();
 
-        // Rerecord scene command buffers.
-        for i in 0..self.swapchain.images.len() {
-            let command_buffer = frame.scene_cmd_buffers[i];
-            let image = self.swapchain.images[i];
-            let color_view = self.swapchain.color_views[i];
-            let depth_view = self.swapchain.depth_views[i];
-
-            unsafe {
-                // Begin recording.
-                self.device
-                    .reset_command_buffer(command_buffer, vk::CommandBufferResetFlags::empty())
-                    .unwrap();
-                self.device
-                    .begin_command_buffer(
-                        command_buffer,
-                        &vk::CommandBufferBeginInfo::default()
-                            .inheritance_info(&vk::CommandBufferInheritanceInfo::default()),
-                    )
-                    .unwrap();
-
-                // Compute prepass.
-                {
-                    self.device.cmd_bind_descriptor_sets(
-                        command_buffer,
-                        vk::PipelineBindPoint::COMPUTE,
-                        self.frustum_cull_pipeline_layout,
-                        0,
-                        &[frame.scene_set, frame.cull_set],
-                        &[],
-                    );
-
-                    self.device.cmd_bind_pipeline(
-                        command_buffer,
-                        vk::PipelineBindPoint::COMPUTE,
-                        self.frustum_cull_pipeline,
-                    );
-
-                    self.device
-                        .cmd_dispatch(command_buffer, instances.div_ceil(64), 1, 1);
-                }
-
-                self.device.cmd_pipeline_barrier2(
-                    command_buffer,
-                    &vk::DependencyInfo::default()
-                        .memory_barriers(&[
-                            //
-                            vk::MemoryBarrier2::default()
-                                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                                .src_access_mask(vk::AccessFlags2::SHADER_WRITE)
-                                .dst_stage_mask(vk::PipelineStageFlags2::INDEX_INPUT)
-                                .dst_access_mask(vk::AccessFlags2::MEMORY_READ),
-                        ])
-                        .image_memory_barriers(&[
-                            // Convert VK_IMAGE_LAYOUT_UNDEFINED -> VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL.
-                            vk::ImageMemoryBarrier2::default()
-                                .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
-                                .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-                                .image(image)
-                                .subresource_range(
-                                    vk::ImageSubresourceRange::default()
-                                        .aspect_mask(vk::ImageAspectFlags::COLOR)
-                                        .base_mip_level(0)
-                                        .level_count(1)
-                                        .base_array_layer(0)
-                                        .layer_count(1),
-                                )
-                                .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
-                                .old_layout(vk::ImageLayout::UNDEFINED)
-                                .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
-                            //
-                            vk::ImageMemoryBarrier2::default()
-                                .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
-                                .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-                                .image(self.swapchain.depth_image.0)
-                                .subresource_range(
-                                    vk::ImageSubresourceRange::default()
-                                        .aspect_mask(vk::ImageAspectFlags::DEPTH)
-                                        .base_mip_level(0)
-                                        .level_count(1)
-                                        .base_array_layer(0)
-                                        .layer_count(1),
-                                )
-                                .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
-                                .old_layout(vk::ImageLayout::UNDEFINED)
-                                .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL),
-                        ]),
-                );
-
-                // Begin rendering.
-                {
-                    self.device.cmd_begin_rendering(
-                        command_buffer,
-                        &vk::RenderingInfo::default()
-                            .render_area(vk::Rect2D {
-                                offset: vk::Offset2D { x: 0, y: 0 },
-                                extent: vk::Extent2D {
-                                    width: self.core.surface_extent.width,
-                                    height: self.core.surface_extent.height,
-                                },
-                            })
-                            .layer_count(1)
-                            .depth_attachment(
-                                &vk::RenderingAttachmentInfo::default()
-                                    .image_view(depth_view)
-                                    .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
-                                    .load_op(vk::AttachmentLoadOp::CLEAR)
-                                    .store_op(vk::AttachmentStoreOp::STORE)
-                                    .clear_value(vk::ClearValue {
-                                        depth_stencil: vk::ClearDepthStencilValue {
-                                            depth: 1.0,
-                                            stencil: 0,
-                                        },
-                                    }),
-                            )
-                            .color_attachments(&[vk::RenderingAttachmentInfo::default()
-                                .image_view(color_view)
-                                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                                .load_op(vk::AttachmentLoadOp::CLEAR)
-                                .store_op(vk::AttachmentStoreOp::STORE)
-                                .clear_value(vk::ClearValue {
-                                    color: vk::ClearColorValue {
-                                        float32: [0.0, 0.0, 0.0, 1.0],
-                                    },
-                                })]),
-                    );
-
-                    // Begin draw calls.
-                    self.device.cmd_bind_descriptor_sets(
-                        command_buffer,
-                        vk::PipelineBindPoint::GRAPHICS,
-                        self.render_pipeline_layout,
-                        0,
-                        &[frame.scene_set, frame.render_set],
-                        &[],
-                    );
-
-                    self.device.cmd_bind_pipeline(
-                        command_buffer,
-                        vk::PipelineBindPoint::GRAPHICS,
-                        self.render_pipeline,
-                    );
-
-                    self.device.cmd_bind_index_buffer(
-                        command_buffer,
-                        frame.index_buffer.vk_handle(),
-                        0,
-                        vk::IndexType::UINT32,
-                    );
-
-                    self.device.cmd_draw_indexed_indirect_count(
-                        command_buffer,
-                        frame.indirect_cmd_buffer.vk_handle(),
-                        0,
-                        frame.indirect_count_buffer.vk_handle(),
-                        0,
-                        instances,
-                        size_of::<vk::DrawIndexedIndirectCommand>() as u32,
-                    );
-
-                    self.device.cmd_end_rendering(command_buffer);
-                }
-
-                self.device.cmd_pipeline_barrier2(
-                    command_buffer,
-                    &vk::DependencyInfo::default().image_memory_barriers(&[
-                        // Convert VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL -> VK_IMAGE_LAYOUT_PRESENT_SRC_KHR.
-                        vk::ImageMemoryBarrier2::default()
-                            .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-                            .dst_stage_mask(vk::PipelineStageFlags2::BOTTOM_OF_PIPE)
-                            .image(image)
-                            .subresource_range(
-                                vk::ImageSubresourceRange::default()
-                                    .aspect_mask(vk::ImageAspectFlags::COLOR)
-                                    .base_mip_level(0)
-                                    .level_count(1)
-                                    .base_array_layer(0)
-                                    .layer_count(1),
-                            )
-                            .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
-                            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                            .new_layout(vk::ImageLayout::PRESENT_SRC_KHR),
-                        //
-                        vk::ImageMemoryBarrier2::default()
-                            .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-                            .dst_stage_mask(vk::PipelineStageFlags2::BOTTOM_OF_PIPE)
-                            .image(self.swapchain.depth_image.0)
-                            .subresource_range(
-                                vk::ImageSubresourceRange::default()
-                                    .aspect_mask(vk::ImageAspectFlags::DEPTH)
-                                    .base_mip_level(0)
-                                    .level_count(1)
-                                    .base_array_layer(0)
-                                    .layer_count(1),
-                            )
-                            .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
-                            .old_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
-                            .new_layout(vk::ImageLayout::PRESENT_SRC_KHR),
-                    ]),
-                );
-
-                // End recording.
-                self.device.end_command_buffer(command_buffer).unwrap();
-
+        self.device.update_descriptor_sets(
+            &[
+                vk::WriteDescriptorSet::default()
+                    .dst_set(frame.scene_set)
+                    .dst_binding(0)
+                    .dst_array_element(0)
+                    .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                    .descriptor_count(1)
+                    .buffer_info(&[vk::DescriptorBufferInfo::default()
+                        .buffer(frame.scene_global_buffer.vk_handle())
+                        .offset(0)
+                        .range(vk::WHOLE_SIZE)]),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(frame.cull_set)
+                    .dst_binding(0)
+                    .dst_array_element(0)
+                    .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                    .descriptor_count(1)
+                    .buffer_info(&[vk::DescriptorBufferInfo::default()
+                        .buffer(frame.meshlet_cull_global_buffer.vk_handle())
+                        .offset(0)
+                        .range(vk::WHOLE_SIZE)]),
                 //
-                self.device.update_descriptor_sets(
-                    &[
-                        vk::WriteDescriptorSet::default()
-                            .dst_set(frame.scene_set)
-                            .dst_binding(0)
-                            .dst_array_element(0)
-                            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                            .descriptor_count(1)
-                            .buffer_info(&[vk::DescriptorBufferInfo::default()
-                                .buffer(frame.scene_global_buffer.vk_handle())
-                                .offset(0)
-                                .range(vk::WHOLE_SIZE)]),
-                        vk::WriteDescriptorSet::default()
-                            .dst_set(frame.cull_set)
-                            .dst_binding(0)
-                            .dst_array_element(0)
-                            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                            .descriptor_count(1)
-                            .buffer_info(&[vk::DescriptorBufferInfo::default()
-                                .buffer(frame.meshlet_cull_global_buffer.vk_handle())
-                                .offset(0)
-                                .range(vk::WHOLE_SIZE)]),
-                        //
-                        vk::WriteDescriptorSet::default()
-                            .dst_set(frame.render_set)
-                            .dst_binding(0)
-                            .dst_array_element(0)
-                            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                            .descriptor_count(1)
-                            .buffer_info(&[vk::DescriptorBufferInfo::default()
-                                .buffer(frame.meshlet_render_global_buffer.vk_handle())
-                                .offset(0)
-                                .range(vk::WHOLE_SIZE)]),
-                    ],
-                    &[],
-                );
-            }
-        }
+                vk::WriteDescriptorSet::default()
+                    .dst_set(frame.render_set)
+                    .dst_binding(0)
+                    .dst_array_element(0)
+                    .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                    .descriptor_count(1)
+                    .buffer_info(&[vk::DescriptorBufferInfo::default()
+                        .buffer(frame.meshlet_render_global_buffer.vk_handle())
+                        .offset(0)
+                        .range(vk::WHOLE_SIZE)]),
+            ],
+            &[],
+        );
 
         // Wait for transfer to complete before returning.
         self.device
