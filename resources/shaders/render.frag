@@ -2,7 +2,7 @@
 #extension GL_EXT_nonuniform_qualifier : require
 #extension GL_EXT_scalar_block_layout : require
 
-layout (std430, set = 0, binding = 0) uniform SceneGlobal {
+layout (std430, set = 1, binding = 0) uniform SceneGlobal {
     mat4 pv;
     mat4 proj;
     mat4 view;
@@ -13,7 +13,7 @@ layout (std430, set = 0, binding = 0) uniform SceneGlobal {
     vec4 light_color;
 };
 
-layout (set = 1, binding = 1) uniform sampler2D samplers[];
+layout (set = 0, binding = 0) uniform sampler2D samplers[];
 
 layout (location = 0) in vec2 frag_uv;
 layout (location = 1) flat in uint frag_tex_id;

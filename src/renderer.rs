@@ -33,6 +33,15 @@ pub(super) struct ObjectInstance {
 
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
 
+/*
+Plan:
+0) Data upload
+1) frustum_cull
+2) render (only visible)
+3) build_hzb
+4) occlusion_cull
+5) render (new vibile)
+*/
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(usize)]
 enum PipelineStage {
@@ -45,12 +54,14 @@ enum PipelineStage {
 const MAX_PIPELINE_STAGES: usize = PipelineStage::COUNT as usize;
 
 struct Scene {
-    // Descriptor sets.
-    scene_set: vk::DescriptorSet,
-    render_set: vk::DescriptorSet,
-    cull_set: vk::DescriptorSet,
+    /* Images: */
+    // Note: hzb mip 0 is half depth resolution.
+    hzb_image: vk::Image, // ( TODO: make visiblity less serial )
+    hzb_alloc: vk_mem::Allocation,
+    hzb_test_view: vk::ImageView,
+    hzb_build_views: Box<[vk::ImageView]>,
 
-    // Various buffers.
+    /* Various buffers. */
     visibility_buffer: Buffer<u32>, // per meshlet
     index_buffer: Buffer<u32>,
     object_buffer: Buffer<Object>,
@@ -63,26 +74,6 @@ struct Scene {
     meshlet_render_global_buffer: Buffer<MeshletRenderGlobal>,
 }
 
-impl Scene {
-    fn null() -> Self {
-        Self {
-            scene_set: vk::DescriptorSet::null(),
-            render_set: vk::DescriptorSet::null(),
-            cull_set: vk::DescriptorSet::null(),
-            visibility_buffer: Buffer::null(),
-            index_buffer: Buffer::null(),
-            object_buffer: Buffer::null(),
-            instance_buffer: Buffer::null(),
-            meshlet_data_buffer: Buffer::null(),
-            indirect_cmd_buffer: Buffer::null(),
-            indirect_count_buffer: Buffer::null(),
-            scene_global_buffer: Buffer::null(),
-            meshlet_cull_global_buffer: Buffer::null(),
-            meshlet_render_global_buffer: Buffer::null(),
-        }
-    }
-}
-
 pub struct Renderer {
     //
     core: Core,
@@ -92,48 +83,62 @@ pub struct Renderer {
     present_queue: vk::Queue,
     //transfer_queue: vk::Queue,
 
-    // Generic memory allocator.
+    /* Generic memory allocator: */
     allocator: vk_mem::Allocator,
 
-    // Swapchain data.
+    /* Swapchain data: */
     swapchain: Swapchain,
 
-    // Command pool.
+    /* Command pool: */
     query_pool: vk::QueryPool,
     _cmd_pool: vk::CommandPool,
 
-    // Desciptor set layouts.
+    /* Desciptor set layouts: */
+    global_set_layout: vk::DescriptorSetLayout,
     scene_set_layout: vk::DescriptorSetLayout,
     render_set_layout: vk::DescriptorSetLayout,
     cull_set_layout: vk::DescriptorSetLayout,
 
-    // Pipelines.
+    /* Pipelines: */
     render_pipeline_layout: vk::PipelineLayout,
     render_pipeline: vk::Pipeline,
     frustum_cull_pipeline_layout: vk::PipelineLayout,
     frustum_cull_pipeline: vk::Pipeline,
 
-    // Generic resource containers.
+    /* Generic resource containers: */
     cwd: PathBuf,
     resource_counter: u32,
     meshes: HashMap<MeshHandle, (f32, Box<[Meshlet]>)>,
     objects: HashMap<ObjectHandle, ObjectInstance>,
     vertex_buffers: HashMap<MeshHandle, Buffer<Vertex>>,
 
-    // Staging.
+    /* Staging: */
     staging_buffer: StagingBuffer,
     staging_cmd_buffer: vk::CommandBuffer,
     staging_fence: vk::Fence,
 
-    // Scene.
+    /* Scene: */
+    // Bindless set of all image views.
+    global_descriptor_pool: vk::DescriptorPool,
+    descriptor_pools: [vk::DescriptorPool; MAX_FRAMES_IN_FLIGHT],
+
+    global_views: vk::DescriptorSet,
+    scene_sets: [vk::DescriptorSet; MAX_FRAMES_IN_FLIGHT],
+    render_sets: [vk::DescriptorSet; MAX_FRAMES_IN_FLIGHT],
+    cull_sets: [vk::DescriptorSet; MAX_FRAMES_IN_FLIGHT],
+
+    // Used for sequencing stages, and other cross-frame syncing.
     pipeline_semaphore: vk::Semaphore,
+
+    // Misc data that does not change across scene generations.
     sync_primitives: [FrameSyncPrimitives; MAX_FRAMES_IN_FLIGHT],
     cmd_buffers: [[vk::CommandBuffer; MAX_PIPELINE_STAGES]; MAX_FRAMES_IN_FLIGHT],
-    descriptor_pools: [vk::DescriptorPool; MAX_FRAMES_IN_FLIGHT],
     depth_images: [(vk::Image, vk_mem::Allocation); MAX_FRAMES_IN_FLIGHT],
     depth_views: [vk::ImageView; MAX_FRAMES_IN_FLIGHT],
     render_finished: Box<[vk::Semaphore]>,
-    current_scene: Scene,
+
+    // Scenes contain resources that may change across scene generations.
+    current_scene: Option<Scene>,
     next_scene: Option<Scene>,
 
     // Various render state data.
@@ -199,7 +204,8 @@ impl Renderer {
                         .descriptor_binding_partially_bound(true)
                         .descriptor_binding_sampled_image_update_after_bind(true)
                         .descriptor_indexing(true)
-                        .runtime_descriptor_array(true);
+                        .runtime_descriptor_array(true)
+                        .timeline_semaphore(true);
 
                     let mut vk13features = vk::PhysicalDeviceVulkan13Features::default()
                         .dynamic_rendering(true)
@@ -251,6 +257,29 @@ impl Renderer {
                 .unwrap();
 
             // Descriptor set layout for all programs.
+            let global_set_layout = device
+                .create_descriptor_set_layout(
+                    &vk::DescriptorSetLayoutCreateInfo::default()
+                        .push_next(
+                            &mut vk::DescriptorSetLayoutBindingFlagsCreateInfo::default()
+                                .binding_flags(&[
+                                    vk::DescriptorBindingFlags::PARTIALLY_BOUND
+                                        | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
+                                ]),
+                        )
+                        .bindings(&[
+                            vk::DescriptorSetLayoutBinding::default()
+                                .binding(0)
+                                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                                .descriptor_count(1024)
+                                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+                        ])
+                        .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL),
+                    None,
+                )
+                .unwrap();
+
+            // Descriptor set layout for all programs.
             let scene_set_layout = device
                 .create_descriptor_set_layout(
                     &vk::DescriptorSetLayoutCreateInfo::default()
@@ -281,8 +310,6 @@ impl Renderer {
                                 .binding_flags(&[
                                     vk::DescriptorBindingFlags::PARTIALLY_BOUND
                                         | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
-                                    vk::DescriptorBindingFlags::PARTIALLY_BOUND
-                                        | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
                                 ]),
                         )
                         .bindings(&[
@@ -291,11 +318,6 @@ impl Renderer {
                                 .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                                 .descriptor_count(1)
                                 .stage_flags(vk::ShaderStageFlags::ALL),
-                            vk::DescriptorSetLayoutBinding::default()
-                                .binding(1)
-                                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                                .descriptor_count(1024)
-                                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
                         ])
                         .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL),
                     None,
@@ -340,7 +362,7 @@ impl Renderer {
                 let pipeline_layout = device
                     .create_pipeline_layout(
                         &vk::PipelineLayoutCreateInfo::default()
-                            .set_layouts(&[scene_set_layout, render_set_layout]),
+                            .set_layouts(&[global_set_layout, scene_set_layout, render_set_layout]),
                         None,
                     )
                     .unwrap();
@@ -534,20 +556,28 @@ impl Renderer {
                     .unwrap(),
             });
 
+            //
+            let global_descriptor_pool = device
+                .create_descriptor_pool(
+                    &vk::DescriptorPoolCreateInfo::default()
+                        .pool_sizes(&[vk::DescriptorPoolSize::default()
+                            .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                            .descriptor_count(1024)])
+                        .max_sets(1)
+                        .flags(vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND),
+                    None,
+                )
+                .unwrap();
+
             // Generic descriptor pool.
             let descriptor_pools = std::array::from_fn(|_| {
                 device
                     .create_descriptor_pool(
                         &vk::DescriptorPoolCreateInfo::default()
-                            .pool_sizes(&[
-                                vk::DescriptorPoolSize::default()
-                                    .ty(vk::DescriptorType::UNIFORM_BUFFER)
-                                    .descriptor_count(3),
-                                vk::DescriptorPoolSize::default()
-                                    .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                                    .descriptor_count(1024),
-                            ])
-                            .max_sets(3)
+                            .pool_sizes(&[vk::DescriptorPoolSize::default()
+                                .ty(vk::DescriptorType::UNIFORM_BUFFER)
+                                .descriptor_count(3)])
+                            .max_sets(3 * MAX_FRAMES_IN_FLIGHT as u32)
                             .flags(vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND),
                         None,
                     )
@@ -569,12 +599,12 @@ impl Renderer {
                             )
                             .mip_levels(1)
                             .array_layers(1)
-                            .initial_layout(vk::ImageLayout::UNDEFINED)
                             .samples(vk::SampleCountFlags::TYPE_1)
-                            .sharing_mode(vk::SharingMode::EXCLUSIVE)
                             .format(vk::Format::D32_SFLOAT)
-                            .tiling(vk::ImageTiling::OPTIMAL)
-                            .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT),
+                            .usage(
+                                vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
+                                    | vk::ImageUsageFlags::SAMPLED,
+                            ),
                         &vk_mem::AllocationCreateInfo {
                             required_flags: vk::MemoryPropertyFlags::DEVICE_LOCAL,
                             ..Default::default()
@@ -614,6 +644,45 @@ impl Renderer {
                 )
                 .unwrap();
 
+            // Descriptor sets.
+            let global_views = device
+                .allocate_descriptor_sets(
+                    &vk::DescriptorSetAllocateInfo::default()
+                        .descriptor_pool(global_descriptor_pool)
+                        .set_layouts(&[global_set_layout]),
+                )
+                .unwrap()[0];
+
+            let scene_sets = std::array::from_fn(|fif| {
+                device
+                    .allocate_descriptor_sets(
+                        &vk::DescriptorSetAllocateInfo::default()
+                            .descriptor_pool(descriptor_pools[fif])
+                            .set_layouts(&[scene_set_layout]),
+                    )
+                    .unwrap()[0]
+            });
+
+            let render_sets = std::array::from_fn(|fif| {
+                device
+                    .allocate_descriptor_sets(
+                        &vk::DescriptorSetAllocateInfo::default()
+                            .descriptor_pool(descriptor_pools[fif])
+                            .set_layouts(&[render_set_layout]),
+                    )
+                    .unwrap()[0]
+            });
+
+            let cull_sets = std::array::from_fn(|fif| {
+                device
+                    .allocate_descriptor_sets(
+                        &vk::DescriptorSetAllocateInfo::default()
+                            .descriptor_pool(descriptor_pools[fif])
+                            .set_layouts(&[cull_set_layout]),
+                    )
+                    .unwrap()[0]
+            });
+
             //
             Self {
                 core,
@@ -629,6 +698,7 @@ impl Renderer {
                 query_pool,
                 _cmd_pool: cmd_pool,
 
+                global_set_layout,
                 scene_set_layout,
                 render_set_layout,
                 cull_set_layout,
@@ -648,14 +718,23 @@ impl Renderer {
                 staging_cmd_buffer,
                 staging_fence,
 
+                global_descriptor_pool,
+                descriptor_pools,
+
+                global_views,
+                scene_sets,
+                render_sets,
+                cull_sets,
+
                 pipeline_semaphore,
+
                 sync_primitives,
                 cmd_buffers,
-                descriptor_pools,
                 depth_images,
                 depth_views,
                 render_finished,
-                current_scene: Scene::null(),
+
+                current_scene: None,
                 next_scene: None,
 
                 frame: 0,
@@ -670,13 +749,12 @@ impl Renderer {
         let frame_count = self.frame;
         self.frame += 1;
 
-        unsafe {
-            // A dirty hack. When a rebuild occurs, wait for transfer to fully complete.
-            if self.frame == 1 {
-                // Rebuild scene elements.
-                self.current_scene = self.rebuild_scene(frame_index);
+        // A dirty hack, initialize first time scene.
+        if self.current_scene.is_none() {
+            unsafe {
+                self.current_scene = Some(self.rebuild_scene(frame_index));
             }
-        }
+        };
 
         // Attempt to clean up current_scene if there is a next.
         if self.next_scene.is_some() {
@@ -686,8 +764,8 @@ impl Renderer {
             });
 
             if signalled {
-                let scene =
-                    std::mem::replace(&mut self.current_scene, self.next_scene.take().unwrap());
+                let next_scene = self.next_scene.take();
+                let scene = std::mem::replace(&mut self.current_scene, next_scene).unwrap();
 
                 unsafe {
                     self.free_scene(scene);
@@ -696,10 +774,10 @@ impl Renderer {
             }
         }
 
-        // Get current working frame.
+        // Get current scene.
         let scene = match &self.next_scene {
             Some(scene) => scene,
-            None => &self.current_scene,
+            None => self.current_scene.as_ref().unwrap(),
         };
 
         // Sync primitives associated with this frame.
@@ -713,6 +791,12 @@ impl Renderer {
         let data_upload = command_buffers[PipelineStage::DataUpload as usize];
         let frustum_cull = command_buffers[PipelineStage::FrustumCull as usize];
         let first_draw = command_buffers[PipelineStage::FirstDraw as usize];
+
+        // Descriptor sets associated with this frame.
+        let global_set = self.global_views;
+        let scene_set = self.scene_sets[frame_index];
+        let render_set = self.render_sets[frame_index];
+        let cull_set = self.cull_sets[frame_index];
 
         unsafe {
             // Wait for next image to become available.
@@ -905,7 +989,7 @@ impl Renderer {
                     vk::PipelineBindPoint::COMPUTE,
                     self.frustum_cull_pipeline_layout,
                     0,
-                    &[scene.scene_set, scene.cull_set],
+                    &[scene_set, cull_set],
                     &[],
                 );
 
@@ -922,25 +1006,24 @@ impl Renderer {
             cmd_buffer_record(&self.device, first_draw, |cmd| {
                 self.device.cmd_pipeline_barrier2(
                     cmd,
-                    &vk::DependencyInfo::default()
-                        .image_memory_barriers(&[
-                            // Convert VK_IMAGE_LAYOUT_UNDEFINED -> VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL.
-                            vk::ImageMemoryBarrier2::default()
-                                .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
-                                .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-                                .image(swapchain_image)
-                                .subresource_range(
-                                    vk::ImageSubresourceRange::default()
-                                        .aspect_mask(vk::ImageAspectFlags::COLOR)
-                                        .base_mip_level(0)
-                                        .level_count(1)
-                                        .base_array_layer(0)
-                                        .layer_count(1),
-                                )
-                                .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
-                                .old_layout(vk::ImageLayout::UNDEFINED)
-                                .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
-                        ]),
+                    &vk::DependencyInfo::default().image_memory_barriers(&[
+                        // Convert VK_IMAGE_LAYOUT_UNDEFINED -> VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL.
+                        vk::ImageMemoryBarrier2::default()
+                            .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
+                            .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                            .image(swapchain_image)
+                            .subresource_range(
+                                vk::ImageSubresourceRange::default()
+                                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                    .base_mip_level(0)
+                                    .level_count(1)
+                                    .base_array_layer(0)
+                                    .layer_count(1),
+                            )
+                            .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                            .old_layout(vk::ImageLayout::UNDEFINED)
+                            .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
+                    ]),
                 );
 
                 // Use dynamic rendering.
@@ -986,7 +1069,7 @@ impl Renderer {
                     vk::PipelineBindPoint::GRAPHICS,
                     self.render_pipeline_layout,
                     0,
-                    &[scene.scene_set, scene.render_set],
+                    &[global_set, scene_set, render_set],
                     &[],
                 );
 
@@ -1219,27 +1302,81 @@ impl Renderer {
             }
         }
 
-        // Descriptor sets.
-        let [scene_set, render_set, cull_set] = self
-            .device
-            .allocate_descriptor_sets(
-                &vk::DescriptorSetAllocateInfo::default()
-                    .descriptor_pool(self.descriptor_pools[fif])
-                    .set_layouts(&[
-                        self.scene_set_layout,
-                        self.render_set_layout,
-                        self.cull_set_layout,
-                    ]),
+        use vk_mem::Alloc;
+        let vk::Extent2D { width, height, .. } = self.core.surface_extent;
+        let mipmaps = u32::max(width, height).ilog2() + 1;
+        let (hzb_image, hzb_alloc) = self
+            .allocator
+            .create_image(
+                &vk::ImageCreateInfo::default()
+                    .image_type(vk::ImageType::TYPE_2D)
+                    .extent(vk::Extent3D {
+                        width: width / 2,
+                        height: height / 2,
+                        depth: 1,
+                    })
+                    .mip_levels(mipmaps - 1)
+                    .array_layers(1)
+                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .format(vk::Format::R32_SFLOAT)
+                    .usage(
+                        vk::ImageUsageFlags::TRANSFER_DST
+                            | vk::ImageUsageFlags::SAMPLED
+                            | vk::ImageUsageFlags::STORAGE,
+                    ),
+                &vk_mem::AllocationCreateInfo {
+                    required_flags: vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                    ..Default::default()
+                },
             )
-            .unwrap()
-            .try_into()
             .unwrap();
+
+        let hzb_test_view = self
+            .device
+            .create_image_view(
+                &vk::ImageViewCreateInfo::default()
+                    .image(hzb_image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(vk::Format::R32_SFLOAT)
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: vk::REMAINING_MIP_LEVELS,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    }),
+                None,
+            )
+            .unwrap();
+
+        let hzb_build_views = (0..mipmaps - 1)
+            .into_iter()
+            .map(|level| {
+                self.device
+                    .create_image_view(
+                        &vk::ImageViewCreateInfo::default()
+                            .image(hzb_image)
+                            .view_type(vk::ImageViewType::TYPE_2D)
+                            .format(vk::Format::R32_SFLOAT)
+                            .subresource_range(vk::ImageSubresourceRange {
+                                aspect_mask: vk::ImageAspectFlags::COLOR,
+                                base_mip_level: level,
+                                level_count: 1,
+                                base_array_layer: 0,
+                                layer_count: 1,
+                            }),
+                        None,
+                    )
+                    .unwrap()
+            })
+            .collect();
 
         // TODO: split this up.
         let frame = Scene {
-            scene_set,
-            render_set,
-            cull_set,
+            hzb_image,
+            hzb_alloc,
+            hzb_test_view,
+            hzb_build_views,
 
             visibility_buffer: Buffer::new(
                 &self.allocator,
@@ -1408,42 +1545,46 @@ impl Renderer {
             )
             .unwrap();
 
-        self.device.update_descriptor_sets(
-            &[
-                vk::WriteDescriptorSet::default()
-                    .dst_set(frame.scene_set)
-                    .dst_binding(0)
-                    .dst_array_element(0)
-                    .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                    .descriptor_count(1)
-                    .buffer_info(&[vk::DescriptorBufferInfo::default()
-                        .buffer(frame.scene_global_buffer.vk_handle())
-                        .offset(0)
-                        .range(vk::WHOLE_SIZE)]),
-                vk::WriteDescriptorSet::default()
-                    .dst_set(frame.cull_set)
-                    .dst_binding(0)
-                    .dst_array_element(0)
-                    .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                    .descriptor_count(1)
-                    .buffer_info(&[vk::DescriptorBufferInfo::default()
-                        .buffer(frame.meshlet_cull_global_buffer.vk_handle())
-                        .offset(0)
-                        .range(vk::WHOLE_SIZE)]),
-                //
-                vk::WriteDescriptorSet::default()
-                    .dst_set(frame.render_set)
-                    .dst_binding(0)
-                    .dst_array_element(0)
-                    .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                    .descriptor_count(1)
-                    .buffer_info(&[vk::DescriptorBufferInfo::default()
-                        .buffer(frame.meshlet_render_global_buffer.vk_handle())
-                        .offset(0)
-                        .range(vk::WHOLE_SIZE)]),
-            ],
-            &[],
-        );
+        // TODO: this will NOT work with scene regeneration...
+        // We can only regenerate these when the fif is not using them.
+        for i in 0..MAX_FRAMES_IN_FLIGHT {
+            self.device.update_descriptor_sets(
+                &[
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(self.scene_sets[i])
+                        .dst_binding(0)
+                        .dst_array_element(0)
+                        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                        .descriptor_count(1)
+                        .buffer_info(&[vk::DescriptorBufferInfo::default()
+                            .buffer(frame.scene_global_buffer.vk_handle())
+                            .offset(0)
+                            .range(vk::WHOLE_SIZE)]),
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(self.cull_sets[i])
+                        .dst_binding(0)
+                        .dst_array_element(0)
+                        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                        .descriptor_count(1)
+                        .buffer_info(&[vk::DescriptorBufferInfo::default()
+                            .buffer(frame.meshlet_cull_global_buffer.vk_handle())
+                            .offset(0)
+                            .range(vk::WHOLE_SIZE)]),
+                    //
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(self.render_sets[i])
+                        .dst_binding(0)
+                        .dst_array_element(0)
+                        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                        .descriptor_count(1)
+                        .buffer_info(&[vk::DescriptorBufferInfo::default()
+                            .buffer(frame.meshlet_render_global_buffer.vk_handle())
+                            .offset(0)
+                            .range(vk::WHOLE_SIZE)]),
+                ],
+                &[],
+            );
+        }
 
         // Wait for transfer to complete before returning.
         self.device

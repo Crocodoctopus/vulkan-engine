@@ -5,7 +5,7 @@
 
 #include "types.h"
 
-layout (std430, set = 0, binding = 0) uniform SceneGlobal {
+layout (std430, set = 1, binding = 0) uniform SceneGlobal {
     mat4 pv;
     mat4 proj;
     mat4 view;
@@ -16,7 +16,7 @@ layout (std430, set = 0, binding = 0) uniform SceneGlobal {
     vec4 light_color;
 };
 
-layout (set = 1, binding = 0) uniform MeshletRenderGlobal {
+layout (set = 2, binding = 0) uniform MeshletRenderGlobal {
     InstanceBuffer instance_buffer;
     ObjectBuffer object_buffer;
 };
