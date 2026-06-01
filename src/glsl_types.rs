@@ -78,3 +78,10 @@ pub(super) struct Vertex {
     pub uv: [i16; 2],
     pub normal: [i8; 3],
 }
+
+#[derive(Clone, Debug, Default)]
+#[repr(C)]
+pub(super) struct BuildHzbPushConstants {
+    pub src: u32,
+    pub dst: u32,
+}

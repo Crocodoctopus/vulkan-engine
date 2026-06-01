@@ -1,0 +1,39 @@
+#version 450
+#extension GL_EXT_nonuniform_qualifier : require
+
+layout (local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout (set = 0, binding = 0) uniform sampler2D src_views[];
+layout (set = 0, binding = 1, r32f) uniform writeonly image2D dst_views[];
+
+layout (push_constant) uniform BuildHzbPushConstants {
+    uint src_view;
+    uint dst_view;
+} pc;
+
+void main() {
+    ivec2 dst_xy = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 dst_size = imageSize(dst_views[pc.dst_view]);
+
+    if (any(greaterThanEqual(dst_xy, dst_size))) {
+        return;
+    }
+
+    // Each destination texel reduces a 2x2 footprint from the source.
+    ivec2 src_base = dst_xy * 2;
+    ivec2 src_size = textureSize(src_views[pc.src_view], 0);
+
+    // Clamp for odd extents so the last texel still reduces conservatively.
+    ivec2 p00 = min(src_base + ivec2(0, 0), src_size - 1);
+    ivec2 p10 = min(src_base + ivec2(1, 0), src_size - 1);
+    ivec2 p01 = min(src_base + ivec2(0, 1), src_size - 1);
+    ivec2 p11 = min(src_base + ivec2(1, 1), src_size - 1);
+
+    float z00 = texelFetch(src_views[pc.src_view], p00, 0).r;
+    float z10 = texelFetch(src_views[pc.src_view], p10, 0).r;
+    float z01 = texelFetch(src_views[pc.src_view], p01, 0).r;
+    float z11 = texelFetch(src_views[pc.src_view], p11, 0).r;
+
+    float reduced = max(max(z00, z10), max(z01, z11));
+    imageStore(dst_views[pc.dst_view], dst_xy, vec4(reduced, 0.0, 0.0, 0.0));
+}

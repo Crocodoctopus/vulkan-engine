@@ -59,7 +59,8 @@ struct Scene {
     hzb_image: vk::Image, // ( TODO: make visiblity less serial )
     hzb_alloc: vk_mem::Allocation,
     hzb_test_view: vk::ImageView,
-    hzb_build_views: Box<[vk::ImageView]>,
+    hzb_build_src_views: Box<[vk::ImageView]>,
+    hzb_build_dst_views: Box<[vk::ImageView]>,
 
     /* Various buffers. */
     visibility_buffer: Buffer<u32>, // per meshlet
@@ -94,16 +95,18 @@ pub struct Renderer {
     _cmd_pool: vk::CommandPool,
 
     /* Desciptor set layouts: */
-    global_set_layout: vk::DescriptorSetLayout,
-    scene_set_layout: vk::DescriptorSetLayout,
-    render_set_layout: vk::DescriptorSetLayout,
-    cull_set_layout: vk::DescriptorSetLayout,
+    _global_set_layout: vk::DescriptorSetLayout,
+    _scene_set_layout: vk::DescriptorSetLayout,
+    _render_set_layout: vk::DescriptorSetLayout,
+    _cull_set_layout: vk::DescriptorSetLayout,
 
     /* Pipelines: */
-    render_pipeline_layout: vk::PipelineLayout,
-    render_pipeline: vk::Pipeline,
     frustum_cull_pipeline_layout: vk::PipelineLayout,
     frustum_cull_pipeline: vk::Pipeline,
+    render_pipeline_layout: vk::PipelineLayout,
+    render_pipeline: vk::Pipeline,
+    build_hzb_pipeline_layout: vk::PipelineLayout,
+    build_hzb_pipeline: vk::Pipeline,
 
     /* Generic resource containers: */
     cwd: PathBuf,
@@ -119,10 +122,11 @@ pub struct Renderer {
 
     /* Scene: */
     // Bindless set of all image views.
-    global_descriptor_pool: vk::DescriptorPool,
-    descriptor_pools: [vk::DescriptorPool; MAX_FRAMES_IN_FLIGHT],
+    _global_descriptor_pool: vk::DescriptorPool,
+    _descriptor_pools: [vk::DescriptorPool; MAX_FRAMES_IN_FLIGHT],
 
-    global_views: vk::DescriptorSet,
+    hzb_sampler: vk::Sampler,
+    global_set: vk::DescriptorSet,
     scene_sets: [vk::DescriptorSet; MAX_FRAMES_IN_FLIGHT],
     render_sets: [vk::DescriptorSet; MAX_FRAMES_IN_FLIGHT],
     cull_sets: [vk::DescriptorSet; MAX_FRAMES_IN_FLIGHT],
@@ -201,6 +205,7 @@ impl Renderer {
                         .buffer_device_address(true)
                         .descriptor_binding_uniform_buffer_update_after_bind(true)
                         .descriptor_binding_storage_buffer_update_after_bind(true)
+                        .descriptor_binding_storage_image_update_after_bind(true)
                         .descriptor_binding_partially_bound(true)
                         .descriptor_binding_sampled_image_update_after_bind(true)
                         .descriptor_indexing(true)
@@ -265,6 +270,8 @@ impl Renderer {
                                 .binding_flags(&[
                                     vk::DescriptorBindingFlags::PARTIALLY_BOUND
                                         | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
+                                    vk::DescriptorBindingFlags::PARTIALLY_BOUND
+                                        | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
                                 ]),
                         )
                         .bindings(&[
@@ -272,7 +279,12 @@ impl Renderer {
                                 .binding(0)
                                 .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                                 .descriptor_count(1024)
-                                .stage_flags(vk::ShaderStageFlags::FRAGMENT),
+                                .stage_flags(vk::ShaderStageFlags::ALL),
+                            vk::DescriptorSetLayoutBinding::default()
+                                .binding(1)
+                                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                                .descriptor_count(1024)
+                                .stage_flags(vk::ShaderStageFlags::ALL),
                         ])
                         .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL),
                     None,
@@ -307,18 +319,14 @@ impl Renderer {
                     &vk::DescriptorSetLayoutCreateInfo::default()
                         .push_next(
                             &mut vk::DescriptorSetLayoutBindingFlagsCreateInfo::default()
-                                .binding_flags(&[
-                                    vk::DescriptorBindingFlags::PARTIALLY_BOUND
-                                        | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
-                                ]),
+                                .binding_flags(&[vk::DescriptorBindingFlags::PARTIALLY_BOUND
+                                    | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND]),
                         )
-                        .bindings(&[
-                            vk::DescriptorSetLayoutBinding::default()
-                                .binding(0)
-                                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                                .descriptor_count(1)
-                                .stage_flags(vk::ShaderStageFlags::ALL),
-                        ])
+                        .bindings(&[vk::DescriptorSetLayoutBinding::default()
+                            .binding(0)
+                            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                            .descriptor_count(1)
+                            .stage_flags(vk::ShaderStageFlags::ALL)])
                         .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL),
                     None,
                 )
@@ -357,12 +365,50 @@ impl Renderer {
                     .unwrap()
             };
 
+            // Create cull compute pipeline.
+            let (frustum_cull_pipeline, frustum_cull_pipeline_layout) = {
+                let comp_shader = create_shader_module(include_bytes!("frustum_cull.comp.spirv"));
+
+                let pipeline_layout = device
+                    .create_pipeline_layout(
+                        &vk::PipelineLayoutCreateInfo::default()
+                            .set_layouts(&[scene_set_layout, cull_set_layout]),
+                        None,
+                    )
+                    .unwrap();
+
+                let pipeline = device
+                    .create_compute_pipelines(
+                        vk::PipelineCache::default(),
+                        &[vk::ComputePipelineCreateInfo::default()
+                            .layout(pipeline_layout)
+                            .stage(
+                                vk::PipelineShaderStageCreateInfo::default()
+                                    .stage(vk::ShaderStageFlags::COMPUTE)
+                                    .name(c"main")
+                                    .module(comp_shader),
+                            )],
+                        None,
+                    )
+                    .unwrap()
+                    .into_iter()
+                    .next()
+                    .unwrap();
+
+                device.destroy_shader_module(comp_shader, None);
+
+                (pipeline, pipeline_layout)
+            };
+
             // Create rendering pipeline.
             let (render_pipeline, render_pipeline_layout) = {
                 let pipeline_layout = device
                     .create_pipeline_layout(
-                        &vk::PipelineLayoutCreateInfo::default()
-                            .set_layouts(&[global_set_layout, scene_set_layout, render_set_layout]),
+                        &vk::PipelineLayoutCreateInfo::default().set_layouts(&[
+                            global_set_layout,
+                            scene_set_layout,
+                            render_set_layout,
+                        ]),
                         None,
                     )
                     .unwrap();
@@ -457,14 +503,18 @@ impl Renderer {
                 (pipeline, pipeline_layout)
             };
 
-            // Create cull compute pipeline.
-            let (frustum_cull_pipeline, frustum_cull_pipeline_layout) = {
-                let comp_shader = create_shader_module(include_bytes!("frustum_cull.comp.spirv"));
+            // Create build hzb compute pipeline.
+            let (build_hzb_pipeline, build_hzb_pipeline_layout) = {
+                let comp_shader = create_shader_module(include_bytes!("build_hzb.comp.spirv"));
 
                 let pipeline_layout = device
                     .create_pipeline_layout(
                         &vk::PipelineLayoutCreateInfo::default()
-                            .set_layouts(&[scene_set_layout, cull_set_layout]),
+                            .set_layouts(&[global_set_layout])
+                            .push_constant_ranges(&[vk::PushConstantRange::default()
+                                .stage_flags(vk::ShaderStageFlags::COMPUTE)
+                                .offset(0)
+                                .size(size_of::<BuildHzbPushConstants>() as u32)]),
                         None,
                     )
                     .unwrap();
@@ -560,9 +610,14 @@ impl Renderer {
             let global_descriptor_pool = device
                 .create_descriptor_pool(
                     &vk::DescriptorPoolCreateInfo::default()
-                        .pool_sizes(&[vk::DescriptorPoolSize::default()
-                            .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                            .descriptor_count(1024)])
+                        .pool_sizes(&[
+                            vk::DescriptorPoolSize::default()
+                                .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                                .descriptor_count(1024),
+                            vk::DescriptorPoolSize::default()
+                                .ty(vk::DescriptorType::STORAGE_IMAGE)
+                                .descriptor_count(1024),
+                        ])
                         .max_sets(1)
                         .flags(vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND),
                     None,
@@ -644,8 +699,26 @@ impl Renderer {
                 )
                 .unwrap();
 
+            // Sampler.
+            let hzb_sampler = device
+                .create_sampler(
+                    &vk::SamplerCreateInfo::default()
+                        .mag_filter(vk::Filter::NEAREST)
+                        .min_filter(vk::Filter::NEAREST)
+                        .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+                        .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                        .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                        .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                        .min_lod(0.0)
+                        .max_lod(vk::LOD_CLAMP_NONE)
+                        .border_color(vk::BorderColor::FLOAT_OPAQUE_WHITE)
+                        .unnormalized_coordinates(false),
+                    None,
+                )
+                .unwrap();
+
             // Descriptor sets.
-            let global_views = device
+            let global_set = device
                 .allocate_descriptor_sets(
                     &vk::DescriptorSetAllocateInfo::default()
                         .descriptor_pool(global_descriptor_pool)
@@ -683,6 +756,27 @@ impl Renderer {
                     .unwrap()[0]
             });
 
+            // Write the depth buffers to 0 & 1
+            device.update_descriptor_sets(
+                &[vk::WriteDescriptorSet::default()
+                    .dst_set(global_set)
+                    .dst_binding(0)
+                    .dst_array_element(0)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .descriptor_count(2)
+                    .image_info(&[
+                        vk::DescriptorImageInfo::default()
+                            .image_view(depth_views[0])
+                            .sampler(hzb_sampler)
+                            .image_layout(vk::ImageLayout::GENERAL),
+                        vk::DescriptorImageInfo::default()
+                            .image_view(depth_views[1])
+                            .sampler(hzb_sampler)
+                            .image_layout(vk::ImageLayout::GENERAL),
+                    ])],
+                &[],
+            );
+
             //
             Self {
                 core,
@@ -698,15 +792,17 @@ impl Renderer {
                 query_pool,
                 _cmd_pool: cmd_pool,
 
-                global_set_layout,
-                scene_set_layout,
-                render_set_layout,
-                cull_set_layout,
+                _global_set_layout: global_set_layout,
+                _scene_set_layout: scene_set_layout,
+                _render_set_layout: render_set_layout,
+                _cull_set_layout: cull_set_layout,
 
-                render_pipeline_layout,
-                render_pipeline,
                 frustum_cull_pipeline_layout,
                 frustum_cull_pipeline,
+                render_pipeline_layout,
+                render_pipeline,
+                build_hzb_pipeline_layout,
+                build_hzb_pipeline,
 
                 cwd: cwd.as_ref().to_owned(),
                 resource_counter: 0,
@@ -718,10 +814,11 @@ impl Renderer {
                 staging_cmd_buffer,
                 staging_fence,
 
-                global_descriptor_pool,
-                descriptor_pools,
+                _global_descriptor_pool: global_descriptor_pool,
+                _descriptor_pools: descriptor_pools,
 
-                global_views,
+                hzb_sampler,
+                global_set,
                 scene_sets,
                 render_sets,
                 cull_sets,
@@ -793,7 +890,7 @@ impl Renderer {
         let first_draw = command_buffers[PipelineStage::FirstDraw as usize];
 
         // Descriptor sets associated with this frame.
-        let global_set = self.global_views;
+        let global_set = self.global_set;
         let scene_set = self.scene_sets[frame_index];
         let render_set = self.render_sets[frame_index];
         let cull_set = self.cull_sets[frame_index];
@@ -1349,7 +1446,7 @@ impl Renderer {
             )
             .unwrap();
 
-        let hzb_build_views = (0..mipmaps - 1)
+        let hzb_build_src_views = (0..mipmaps - 1)
             .into_iter()
             .map(|level| {
                 self.device
@@ -1371,12 +1468,34 @@ impl Renderer {
             })
             .collect();
 
-        // TODO: split this up.
+        let hzb_build_dst_views = (0..mipmaps - 1)
+            .into_iter()
+            .map(|level| {
+                self.device
+                    .create_image_view(
+                        &vk::ImageViewCreateInfo::default()
+                            .image(hzb_image)
+                            .view_type(vk::ImageViewType::TYPE_2D)
+                            .format(vk::Format::R32_SFLOAT)
+                            .subresource_range(vk::ImageSubresourceRange {
+                                aspect_mask: vk::ImageAspectFlags::COLOR,
+                                base_mip_level: level,
+                                level_count: 1,
+                                base_array_layer: 0,
+                                layer_count: 1,
+                            }),
+                        None,
+                    )
+                    .unwrap()
+            })
+            .collect();
+
         let frame = Scene {
             hzb_image,
             hzb_alloc,
             hzb_test_view,
-            hzb_build_views,
+            hzb_build_src_views,
+            hzb_build_dst_views,
 
             visibility_buffer: Buffer::new(
                 &self.allocator,
@@ -1547,29 +1666,74 @@ impl Renderer {
 
         // TODO: this will NOT work with scene regeneration...
         // We can only regenerate these when the fif is not using them.
-        for i in 0..MAX_FRAMES_IN_FLIGHT {
-            self.device.update_descriptor_sets(
-                &[
+        {
+            /* global_set part: */
+            let global_set_0_info: Box<_> = (0..mipmaps - 1)
+                .into_iter()
+                .map(|i| {
+                    vk::DescriptorImageInfo::default()
+                        .image_view(frame.hzb_build_src_views[i as usize])
+                        .sampler(self.hzb_sampler)
+                        .image_layout(vk::ImageLayout::GENERAL)
+                })
+                .collect();
+
+            let global_set_1_info: Box<_> = (0..mipmaps - 1)
+                .into_iter()
+                .map(|i| {
+                    vk::DescriptorImageInfo::default()
+                        .image_view(frame.hzb_build_dst_views[i as usize])
+                        .image_layout(vk::ImageLayout::GENERAL)
+                })
+                .collect();
+
+            let mut tmp = vec![
+                vk::WriteDescriptorSet::default()
+                    .dst_set(self.global_set)
+                    .dst_binding(0)
+                    .dst_array_element(2)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .descriptor_count(global_set_0_info.len() as u32)
+                    .image_info(&global_set_0_info),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(self.global_set)
+                    .dst_binding(1)
+                    .dst_array_element(0)
+                    .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                    .descriptor_count(global_set_1_info.len() as u32)
+                    .image_info(&global_set_1_info),
+            ];
+
+            /* scene/cull/render part: */
+            let scene_set_info = [vk::DescriptorBufferInfo::default()
+                .buffer(frame.scene_global_buffer.vk_handle())
+                .offset(0)
+                .range(vk::WHOLE_SIZE)];
+            let cull_set_info = [vk::DescriptorBufferInfo::default()
+                .buffer(frame.meshlet_cull_global_buffer.vk_handle())
+                .offset(0)
+                .range(vk::WHOLE_SIZE)];
+            let render_set_info = [vk::DescriptorBufferInfo::default()
+                .buffer(frame.meshlet_render_global_buffer.vk_handle())
+                .offset(0)
+                .range(vk::WHOLE_SIZE)];
+
+            tmp.extend((0..MAX_FRAMES_IN_FLIGHT).into_iter().flat_map(|i| {
+                [
                     vk::WriteDescriptorSet::default()
                         .dst_set(self.scene_sets[i])
                         .dst_binding(0)
                         .dst_array_element(0)
                         .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                         .descriptor_count(1)
-                        .buffer_info(&[vk::DescriptorBufferInfo::default()
-                            .buffer(frame.scene_global_buffer.vk_handle())
-                            .offset(0)
-                            .range(vk::WHOLE_SIZE)]),
+                        .buffer_info(&scene_set_info),
                     vk::WriteDescriptorSet::default()
                         .dst_set(self.cull_sets[i])
                         .dst_binding(0)
                         .dst_array_element(0)
                         .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                         .descriptor_count(1)
-                        .buffer_info(&[vk::DescriptorBufferInfo::default()
-                            .buffer(frame.meshlet_cull_global_buffer.vk_handle())
-                            .offset(0)
-                            .range(vk::WHOLE_SIZE)]),
+                        .buffer_info(&cull_set_info),
                     //
                     vk::WriteDescriptorSet::default()
                         .dst_set(self.render_sets[i])
@@ -1577,13 +1741,12 @@ impl Renderer {
                         .dst_array_element(0)
                         .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                         .descriptor_count(1)
-                        .buffer_info(&[vk::DescriptorBufferInfo::default()
-                            .buffer(frame.meshlet_render_global_buffer.vk_handle())
-                            .offset(0)
-                            .range(vk::WHOLE_SIZE)]),
-                ],
-                &[],
-            );
+                        .buffer_info(&render_set_info),
+                ]
+            }));
+
+            /* What a mess */
+            self.device.update_descriptor_sets(&tmp, &[]);
         }
 
         // Wait for transfer to complete before returning.
