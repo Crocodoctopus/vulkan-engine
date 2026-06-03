@@ -1,6 +1,22 @@
 #extension GL_EXT_shader_16bit_storage: require
 #extension GL_EXT_shader_8bit_storage: require
 
+#define CONCAT_INNER(a, b) a##b
+#define CONCAT(a, b) CONCAT_INNER(a, b)
+#define BUFFER_NAME(line) CONCAT(TMP_, line)
+#define UNIFORM uniform BUFFER_NAME(__LINE__)
+
+struct SceneGlobal {
+    mat4 pv;
+    mat4 proj;
+    mat4 view;
+
+    vec3 camera_position;
+    vec3 camera_direction;
+    vec3 light_position;
+    vec4 light_color;
+};
+
 struct Vertex {
     int16_t x, y, z;
     int16_t u, v;
@@ -68,4 +84,17 @@ layout (buffer_reference, std430) writeonly buffer DrawCmdBuffer {
 
 layout (buffer_reference, scalar) buffer MeshletVisibilityBuffer {
     bool data[];
+};
+
+struct MeshletCullGlobal {
+    vec4 frustum;
+
+    MeshletVisibilityBuffer meshlet_visibility_buffer;
+    DrawCountBuffer draw_count_buffer;
+    MeshletBuffer meshlet_buffer;
+    DrawCmdBuffer draw_cmd_buffer;
+    InstanceBuffer instance_buffer;
+    ObjectBuffer object_buffer;
+
+    uint instances;
 };

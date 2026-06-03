@@ -8,28 +8,12 @@ layout (local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 #include "types.h"
 
-layout (std430, set = 0, binding = 0) uniform SceneGlobal {
-    mat4 pv;
-    mat4 proj;
-    mat4 view;
-
-    vec3 camera_position;
-    vec3 camera_direction;
-    vec3 light_position;
-    vec4 light_color;
+layout(std430, set = 0, binding = 0) UNIFORM {
+    SceneGlobal scene_global;
 };
 
-layout (std430, set = 1, binding = 0) uniform MeshletCullGlobal {
-    vec4 frustum;
-
-    MeshletVisibilityBuffer meshlet_visibility_buffer;
-    DrawCountBuffer draw_count_buffer;
-    MeshletBuffer meshlet_buffer;
-    DrawCmdBuffer draw_cmd_buffer;
-    InstanceBuffer instance_buffer;
-    ObjectBuffer object_buffer;
-
-    uint instances;
+layout(std430, set = 1, binding = 0) UNIFORM {
+    MeshletCullGlobal meshlet_cull_global;
 };
 
 vec3 rotate_quat(vec3 v, vec4 q) {
@@ -40,23 +24,23 @@ void main() {
     uint meshlet_id = gl_GlobalInvocationID.x;
 
     // Filter invalid invocation ids.
-    if (meshlet_id >= instances) return;
+    if (meshlet_id >= meshlet_cull_global.instances) return;
 
     //
-    MeshletData meshlet = meshlet_buffer.data[meshlet_id];
-    Object object = object_buffer.data[meshlet.object_id];
+    MeshletData meshlet = meshlet_cull_global.meshlet_buffer.data[meshlet_id];
+    Object object = meshlet_cull_global.object_buffer.data[meshlet.object_id];
 
     // Frustum cull (view-space sphere test).
     vec3 center_ws = object.position + object.scale * rotate_quat(meshlet.center, object.orientation);
-    vec4 center = view * vec4(center_ws, 1.0);
+    vec4 center = scene_global.view * vec4(center_ws, 1.0);
     float radius = object.scale * meshlet.radius;
 
     float znear = -0.1;
-    bool visible_x = center.z * frustum[1] - abs(center.x) * frustum[0] > -radius;
-    bool visible_y = center.z * frustum[3] - abs(center.y) * frustum[2] > -radius;
+    bool visible_x = center.z * meshlet_cull_global.frustum[1] - abs(center.x) * meshlet_cull_global.frustum[0] > -radius;
+    bool visible_y = center.z * meshlet_cull_global.frustum[3] - abs(center.y) * meshlet_cull_global.frustum[2] > -radius;
     bool visible_z = center.z - radius < znear;
     if (!(visible_x && visible_y && visible_z)) {
-        meshlet_visibility_buffer.data[meshlet_id] = false;
+        meshlet_cull_global.meshlet_visibility_buffer.data[meshlet_id] = false;
         return;
     };
 
@@ -64,13 +48,13 @@ void main() {
     if (meshlet.cone_cutoff < 1.0) {
         vec3 cone_apex = object.position + object.scale * rotate_quat(meshlet.cone_apex, object.orientation);
         vec3 cone_axis = normalize(rotate_quat(meshlet.cone_axis, object.orientation));
-        if (dot(normalize(cone_apex - camera_position), cone_axis) >= meshlet.cone_cutoff) {
-            meshlet_visibility_buffer.data[meshlet_id] = false;
+        if (dot(normalize(cone_apex - scene_global.camera_position), cone_axis) >= meshlet.cone_cutoff) {
+            meshlet_cull_global.meshlet_visibility_buffer.data[meshlet_id] = false;
             return;
         }
     }
 
-    if (!meshlet_visibility_buffer.data[meshlet_id]) {
+    if (!meshlet_cull_global.meshlet_visibility_buffer.data[meshlet_id]) {
         // Append as draw candidate.
         return;
     }
@@ -83,7 +67,7 @@ void main() {
     cmd.vertex_offset = 0;
     cmd.first_instance = meshlet_id;
 
-    const uint i = atomicAdd(draw_count_buffer.counter, 1);
-    draw_cmd_buffer.data[i] = cmd;
-    instance_buffer.data[i].object_id = meshlet.object_id;
+    const uint i = atomicAdd(meshlet_cull_global.draw_count_buffer.counter, 1);
+    meshlet_cull_global.draw_cmd_buffer.data[i] = cmd;
+    meshlet_cull_global.instance_buffer.data[i].object_id = meshlet.object_id;
 }

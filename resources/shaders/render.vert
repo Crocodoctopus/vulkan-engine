@@ -5,18 +5,11 @@
 
 #include "types.h"
 
-layout (std430, set = 1, binding = 0) uniform SceneGlobal {
-    mat4 pv;
-    mat4 proj;
-    mat4 view;
-
-    vec3 camera_position;
-    vec3 camera_direction;
-    vec3 light_position;
-    vec4 light_color;
+layout(std430, set = 1, binding = 0) UNIFORM {
+    SceneGlobal scene_global;
 };
 
-layout (set = 2, binding = 0) uniform MeshletRenderGlobal {
+layout (set = 2, binding = 0) UNIFORM {
     InstanceBuffer instance_buffer;
     ObjectBuffer object_buffer;
 };
@@ -61,7 +54,7 @@ void main() {
 
     //
     vec3 wpos = object.position + object.scale * rotate_quat(position, object.orientation);
-    gl_Position = pv * vec4(wpos, 1.0);
+    gl_Position = scene_global.pv * vec4(wpos, 1.0);
     frag_position = wpos;
     frag_normal = rotate_quat(normal, object.orientation);
     frag_uv = uv;

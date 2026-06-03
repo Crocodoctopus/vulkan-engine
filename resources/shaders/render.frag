@@ -1,16 +1,12 @@
 #version 450
+#extension GL_EXT_buffer_reference : require
 #extension GL_EXT_nonuniform_qualifier : require
 #extension GL_EXT_scalar_block_layout : require
 
-layout (std430, set = 1, binding = 0) uniform SceneGlobal {
-    mat4 pv;
-    mat4 proj;
-    mat4 view;
+#include "types.h"
 
-    vec3 camera_position;
-    vec3 camera_direction;
-    vec3 light_position;
-    vec4 light_color;
+layout(std430, set = 1, binding = 0) UNIFORM {
+    SceneGlobal scene_global;
 };
 
 layout (set = 0, binding = 0) uniform sampler2D samplers[];
@@ -25,9 +21,9 @@ layout (location = 0) out vec4 out_color;
 
 void main() {
     vec3 normal = normalize(frag_normal); // Probably already normalized?
-    vec3 incident_ray = normalize(light_position - frag_position);
+    vec3 incident_ray = normalize(scene_global.light_position - frag_position);
     vec3 reflected_ray = normalize(reflect(-incident_ray, normal));
-    vec3 to_camera_ray = normalize(camera_position - frag_position);
+    vec3 to_camera_ray = normalize(scene_global.camera_position - frag_position);
 
     float ambient = .75;
     float diffuse = max(0.0, dot(incident_ray, normal));
@@ -35,6 +31,9 @@ void main() {
 
     vec2 uv = frag_uv;
     uv.y = 1.0f - frag_uv[1];
-    out_color = vec4(frag_color.rgb * light_color.rgb * (0.5 * ambient + 0.5 * diffuse + 0.5 * specular), 1.0);
+    out_color = vec4(
+        frag_color.rgb * scene_global.light_color.rgb * (0.5 * ambient + 0.5 * diffuse + 0.5 * specular),
+        1.0
+    );
     //out_color = texture(samplers[frag_tex_id], uv);
 }
