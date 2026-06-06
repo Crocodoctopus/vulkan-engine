@@ -27,8 +27,8 @@ void main() {
     if (meshlet_id >= meshlet_cull_global.instances) return;
 
     //
-    MeshletData meshlet = meshlet_cull_global.meshlet_buffer.data[meshlet_id];
-    Object object = meshlet_cull_global.object_buffer.data[meshlet.object_id];
+    MeshletInstance meshlet = meshlet_cull_global.meshlet_buffer.data[meshlet_id];
+    ObjectInstance object = meshlet_cull_global.object_buffer.data[meshlet.object_id];
 
     // Frustum cull (view-space sphere test).
     vec3 center_ws = object.position + object.scale * rotate_quat(meshlet.center, object.orientation);
@@ -64,10 +64,13 @@ void main() {
     cmd.index_count = meshlet.index_count;
     cmd.first_index = meshlet.first_index;
     cmd.instance_count = 1;
-    cmd.vertex_offset = 0;
+    // Payload convention: object vertex indices are local, so vertex_offset is
+    // otherwise zero. Use it to carry object_id and undo the offset in render.vert.
+    cmd.vertex_offset = int(meshlet.object_id);
+    // Forward one u32 through first_instance; currently this is a stable
+    // meshlet id for debug coloring, but it can be repurposed by render.vert.
     cmd.first_instance = meshlet_id;
 
     const uint i = atomicAdd(meshlet_cull_global.draw_count_buffer.counter, 1);
     meshlet_cull_global.draw_cmd_buffer.data[i] = cmd;
-    meshlet_cull_global.instance_buffer.data[i].object_id = meshlet.object_id;
 }

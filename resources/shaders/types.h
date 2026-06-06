@@ -27,7 +27,7 @@ layout (buffer_reference, scalar) readonly buffer VertexBuffer {
     Vertex data[];
 };
 
-struct Object {
+struct ObjectInstance {
     vec3 position;
     float scale;
     vec4 orientation;
@@ -35,16 +35,8 @@ struct Object {
     uint tex_id;
 };
 
-struct Instance {
-    uint object_id;
-};
-
-layout (buffer_reference, std430) readonly buffer InstanceBuffer {
-    Instance data[];
-};
-
-layout (buffer_reference, std430) readonly buffer ObjectBuffer {
-    Object data[];
+layout (buffer_reference, std430) readonly buffer ObjectInstanceBuffer {
+    ObjectInstance data[];
 };
 
 layout (buffer_reference, std430) buffer DrawCountBuffer {
@@ -59,7 +51,7 @@ struct VkDrawIndexedIndirectCommand {
     uint first_instance;
 };
 
-struct MeshletData {
+struct MeshletInstance {
     // Culling.
     vec3 center;
     float radius;
@@ -74,8 +66,8 @@ struct MeshletData {
     uint first_index;
 };
 
-layout (buffer_reference, std430) readonly buffer MeshletBuffer {
-    MeshletData data[];
+layout (buffer_reference, std430) readonly buffer MeshletInstanceBuffer {
+    MeshletInstance data[];
 };
 
 layout (buffer_reference, std430) writeonly buffer DrawCmdBuffer {
@@ -91,10 +83,9 @@ struct MeshletCullGlobal {
 
     MeshletVisibilityBuffer meshlet_visibility_buffer;
     DrawCountBuffer draw_count_buffer;
-    MeshletBuffer meshlet_buffer;
+    MeshletInstanceBuffer meshlet_buffer;
     DrawCmdBuffer draw_cmd_buffer;
-    InstanceBuffer instance_buffer;
-    ObjectBuffer object_buffer;
+    ObjectInstanceBuffer object_buffer;
 
     uint instances;
 };

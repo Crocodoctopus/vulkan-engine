@@ -10,8 +10,7 @@ layout(std430, set = 1, binding = 0) UNIFORM {
 };
 
 layout (set = 2, binding = 0) UNIFORM {
-    InstanceBuffer instance_buffer;
-    ObjectBuffer object_buffer;
+    ObjectInstanceBuffer object_buffer;
 };
 
 layout (location = 0) out vec2 frag_uv;
@@ -43,9 +42,8 @@ vec3 rotate_quat(vec3 v, vec4 q) {
 }
 
 void main() {
-    Instance instance = instance_buffer.data[gl_DrawID];
-    Object object = object_buffer.data[instance.object_id];
-    Vertex vert = object.vertex_buffer.data[gl_VertexIndex];
+    ObjectInstance object = object_buffer.data[gl_BaseVertex];
+    Vertex vert = object.vertex_buffer.data[gl_VertexIndex - gl_BaseVertex];
 
     // Decompress.
     vec3 position = vec3(vert.x, vert.y, vert.z) / 32767.0f;

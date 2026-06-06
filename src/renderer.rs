@@ -24,7 +24,7 @@ struct FrameSyncPrimitives {
 }
 
 #[derive(Debug)]
-pub(super) struct ObjectInstance {
+pub(super) struct Object {
     pub mesh: MeshHandle,
     pub position: Vec3,
     pub scale: f32,
@@ -66,9 +66,8 @@ struct Scene {
     /* Various buffers. */
     visibility_buffer: Buffer<u32>, // per meshlet
     index_buffer: Buffer<u32>,
-    object_buffer: Buffer<Object>,
-    instance_buffer: Buffer<Instance>,
-    meshlet_data_buffer: Buffer<MeshletData>,
+    object_buffer: Buffer<GpuObjectInstance>,
+    meshlet_data_buffer: Buffer<GpuMeshletInstance>,
     indirect_cmd_buffer: Buffer<vk::DrawIndexedIndirectCommand>,
     indirect_count_buffer: Buffer<u32>,
     scene_global_buffer: Buffer<SceneGlobal>,
@@ -113,8 +112,8 @@ pub struct Renderer {
     cwd: PathBuf,
     resource_counter: u32,
     meshes: HashMap<MeshHandle, (f32, Box<[Meshlet]>)>,
-    objects: HashMap<ObjectHandle, ObjectInstance>,
-    vertex_buffers: HashMap<MeshHandle, Buffer<Vertex>>,
+    objects: HashMap<ObjectHandle, Object>,
+    vertex_buffers: HashMap<MeshHandle, Buffer<GpuVertex>>,
 
     /* Staging: */
     staging_buffer: StagingBuffer,
@@ -967,7 +966,7 @@ impl Renderer {
                     (2 * frame_index + 0) as u32,
                 );
 
-                let object_data = self.objects.values().map(|obj| Object {
+                let object_data = self.objects.values().map(|obj| GpuObjectInstance {
                     position: obj.position,
                     scale: obj.scale * self.meshes.get(&obj.mesh).unwrap().0,
                     orientation: obj.orientation,
@@ -1028,10 +1027,6 @@ impl Renderer {
                     &scene.meshlet_render_global_buffer,
                     0,
                     [MeshletRenderGlobal {
-                        instance_buffer: self.device.get_buffer_device_address(
-                            &vk::BufferDeviceAddressInfo::default()
-                                .buffer(scene.instance_buffer.vk_handle()),
-                        ),
                         object_buffer: self.device.get_buffer_device_address(
                             &vk::BufferDeviceAddressInfo::default()
                                 .buffer(scene.object_buffer.vk_handle()),
@@ -1068,10 +1063,6 @@ impl Renderer {
                         draw_cmd_buffer: self.device.get_buffer_device_address(
                             &vk::BufferDeviceAddressInfo::default()
                                 .buffer(scene.indirect_cmd_buffer.vk_handle()),
-                        ),
-                        instance_buffer: self.device.get_buffer_device_address(
-                            &vk::BufferDeviceAddressInfo::default()
-                                .buffer(scene.instance_buffer.vk_handle()),
                         ),
                         object_buffer: self.device.get_buffer_device_address(
                             &vk::BufferDeviceAddressInfo::default()
@@ -1502,7 +1493,6 @@ impl Renderer {
     unsafe fn free_scene(&mut self, mut scene: Scene) {
         scene.index_buffer.take().destroy(&self.allocator);
         scene.object_buffer.take().destroy(&self.allocator);
-        scene.instance_buffer.take().destroy(&self.allocator);
         scene.meshlet_data_buffer.take().destroy(&self.allocator);
         scene.indirect_cmd_buffer.take().destroy(&self.allocator);
         scene.indirect_count_buffer.take().destroy(&self.allocator);
@@ -1518,7 +1508,7 @@ impl Renderer {
 
     unsafe fn rebuild_scene(&mut self, fif: usize) -> Scene {
         // Generate vertex data for newly added meshes.
-        let new_meshes: HashMap<MeshHandle, Box<[Vertex]>> = self
+        let new_meshes: HashMap<MeshHandle, Box<[GpuVertex]>> = self
             .meshes
             .iter()
             .filter(|(k, _)| !self.vertex_buffers.contains_key(k))
@@ -1528,7 +1518,7 @@ impl Renderer {
                     mesh.1
                         .iter()
                         .flat_map(|meshlet| {
-                            (0..meshlet.positions.len()).map(|i| Vertex {
+                            (0..meshlet.positions.len()).map(|i| GpuVertex {
                                 position: meshlet.positions[i],
                                 normal: meshlet.normals[i],
                                 uv: [0, 0],
@@ -1572,7 +1562,7 @@ impl Renderer {
 
             // Mesh data.
             for meshlet in mesh {
-                meshlet_data.push(MeshletData {
+                meshlet_data.push(GpuMeshletInstance {
                     center: Vec3::from(meshlet.center),
                     radius: meshlet.radius,
                     cone_apex: Vec3::from(meshlet.cone_apex),
@@ -1710,13 +1700,6 @@ impl Renderer {
                 vk::BufferUsageFlags::STORAGE_BUFFER
                     | vk::BufferUsageFlags::TRANSFER_DST
                     | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-                vk_mem::MemoryUsage::AutoPreferDevice,
-            ),
-
-            instance_buffer: Buffer::new(
-                &self.allocator,
-                instances,
-                vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
                 vk_mem::MemoryUsage::AutoPreferDevice,
             ),
 
@@ -1985,7 +1968,7 @@ impl Renderer {
         self.resource_counter += 1;
         self.objects.insert(
             handle,
-            ObjectInstance {
+            Object {
                 mesh,
                 position,
                 scale,

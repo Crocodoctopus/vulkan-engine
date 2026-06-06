@@ -19,7 +19,6 @@ pub(super) struct SceneGlobal {
 #[derive(Copy, Clone, Debug)]
 #[repr(C)]
 pub(super) struct MeshletRenderGlobal {
-    pub instance_buffer: vk::DeviceAddress,
     pub object_buffer: vk::DeviceAddress,
 }
 
@@ -32,7 +31,6 @@ pub(super) struct MeshletCullGlobal {
     pub draw_count_buffer: vk::DeviceAddress,
     pub meshlet_buffer: vk::DeviceAddress,
     pub draw_cmd_buffer: vk::DeviceAddress,
-    pub instance_buffer: vk::DeviceAddress,
     pub object_buffer: vk::DeviceAddress,
 
     pub instances: u32,
@@ -40,7 +38,7 @@ pub(super) struct MeshletCullGlobal {
 
 #[derive(Clone, Debug)]
 #[repr(C)]
-pub(super) struct Object {
+pub(super) struct GpuObjectInstance {
     pub position: Vec3,
     pub scale: f32,
     pub orientation: Quat,
@@ -49,14 +47,8 @@ pub(super) struct Object {
 }
 
 #[derive(Clone, Debug)]
-#[repr(C)]
-pub(super) struct Instance {
-    pub object_id: u32,
-}
-
-#[derive(Clone, Debug)]
 #[repr(C, align(16))]
-pub(super) struct MeshletData {
+pub(super) struct GpuMeshletInstance {
     // Culling.
     pub center: Vec3,
     pub radius: f32,
@@ -73,7 +65,7 @@ pub(super) struct MeshletData {
 
 #[derive(Clone, Debug, Default)]
 #[repr(C)]
-pub(super) struct Vertex {
+pub(super) struct GpuVertex {
     pub position: [i16; 3],
     pub uv: [i16; 2],
     pub normal: [i8; 3],
