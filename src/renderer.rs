@@ -96,7 +96,7 @@ pub struct Renderer {
     _cmd_pool: vk::CommandPool,
 
     /* Desciptor set layouts: */
-    global_set_layout: vk::DescriptorSetLayout,
+    _global_set_layout: vk::DescriptorSetLayout,
     _scene_set_layout: vk::DescriptorSetLayout,
     _render_set_layout: vk::DescriptorSetLayout,
     _cull_set_layout: vk::DescriptorSetLayout,
@@ -793,7 +793,7 @@ impl Renderer {
                 query_pool,
                 _cmd_pool: cmd_pool,
 
-                global_set_layout,
+                _global_set_layout: global_set_layout,
                 _scene_set_layout: scene_set_layout,
                 _render_set_layout: render_set_layout,
                 _cull_set_layout: cull_set_layout,
@@ -1231,8 +1231,8 @@ impl Renderer {
             cmd_buffer_record(&self.device, build_hzb, |cmd| {
                 self.device.cmd_pipeline_barrier2(
                     cmd,
-                    // Prepare the HZB for writing.
                     &vk::DependencyInfo::default().image_memory_barriers(&[
+                        // Prepare the HZB for writing.
                         vk::ImageMemoryBarrier2::default()
                             .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
                             .src_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
@@ -1301,8 +1301,24 @@ impl Renderer {
                         ),
                     );
 
-                    let w = self.core.surface_extent.width.div_ceil(8);
-                    let h = self.core.surface_extent.height.div_ceil(8);
+                    let w = self
+                        .core
+                        .surface_extent
+                        .width
+                        .div_ceil(2)
+                        .checked_shr(dst)
+                        .unwrap_or(0)
+                        .max(1)
+                        .div_ceil(8);
+                    let h = self
+                        .core
+                        .surface_extent
+                        .height
+                        .div_ceil(2)
+                        .checked_shr(dst)
+                        .unwrap_or(0)
+                        .max(1)
+                        .div_ceil(8);
                     self.device.cmd_dispatch(cmd, w, h, 1);
 
                     self.device.cmd_pipeline_barrier2(
@@ -1334,15 +1350,14 @@ impl Renderer {
 
                 // The rest are standard.
                 let mips = scene.hzb_build_src_views.len();
-                // NOTE: we want -2, as to not overshoot the buffer.
-                for i in 0..mips - 2 {
+                for i in 0..mips - 1 {
                     build_hzb(2 + i as u32, 1 + i as u32);
                 }
 
                 self.device.cmd_pipeline_barrier2(
                     cmd,
-                    // Transition HZB back to read.
                     &vk::DependencyInfo::default().image_memory_barriers(&[
+                        // Transition HZB back to read after all reductions.
                         vk::ImageMemoryBarrier2::default()
                             .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
                             .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
@@ -1575,18 +1590,20 @@ impl Renderer {
 
         use vk_mem::Alloc;
         let vk::Extent2D { width, height, .. } = self.core.surface_extent;
-        let mipmaps = u32::max(width, height).ilog2() + 1;
+        let hzb_width = width.div_ceil(2);
+        let hzb_height = height.div_ceil(2);
+        let mipmaps = u32::max(hzb_width, hzb_height).ilog2() + 1;
         let (hzb_image, hzb_alloc) = self
             .allocator
             .create_image(
                 &vk::ImageCreateInfo::default()
                     .image_type(vk::ImageType::TYPE_2D)
                     .extent(vk::Extent3D {
-                        width: width / 2,
-                        height: height / 2,
+                        width: hzb_width,
+                        height: hzb_height,
                         depth: 1,
                     })
-                    .mip_levels(mipmaps - 1)
+                    .mip_levels(mipmaps)
                     .array_layers(1)
                     .samples(vk::SampleCountFlags::TYPE_1)
                     .format(vk::Format::R32_SFLOAT)
@@ -1620,7 +1637,7 @@ impl Renderer {
             )
             .unwrap();
 
-        let hzb_build_src_views = (0..mipmaps - 1)
+        let hzb_build_src_views = (0..mipmaps)
             .into_iter()
             .map(|level| {
                 self.device
@@ -1642,7 +1659,7 @@ impl Renderer {
             })
             .collect();
 
-        let hzb_build_dst_views = (0..mipmaps - 1)
+        let hzb_build_dst_views = (0..mipmaps)
             .into_iter()
             .map(|level| {
                 self.device
@@ -1826,7 +1843,10 @@ impl Renderer {
             tmp.extend((0..MAX_FRAMES_IN_FLIGHT).into_iter().map(|i| {
                 vk::ImageMemoryBarrier2::default()
                     .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
-                    .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                    .dst_stage_mask(
+                        vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                            | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+                    )
                     .image(self.depth_images[i].0)
                     .subresource_range(
                         vk::ImageSubresourceRange::default()
@@ -1836,7 +1856,7 @@ impl Renderer {
                             .base_array_layer(0)
                             .layer_count(1),
                     )
-                    .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                    .dst_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
                     .old_layout(vk::ImageLayout::UNDEFINED)
                     .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
             }));
@@ -1865,7 +1885,7 @@ impl Renderer {
         // We can only regenerate these when the fif is not using them.
         {
             /* global_set part: */
-            let global_set_0_info: Box<_> = (0..mipmaps - 1)
+            let global_set_0_info: Box<_> = (0..mipmaps)
                 .into_iter()
                 .map(|i| {
                     vk::DescriptorImageInfo::default()
@@ -1875,7 +1895,7 @@ impl Renderer {
                 })
                 .collect();
 
-            let global_set_1_info: Box<_> = (0..mipmaps - 1)
+            let global_set_1_info: Box<_> = (0..mipmaps)
                 .into_iter()
                 .map(|i| {
                     vk::DescriptorImageInfo::default()
