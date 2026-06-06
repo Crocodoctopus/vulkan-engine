@@ -3,7 +3,7 @@ use glam::*;
 
 #[derive(Copy, Clone, Debug)]
 #[repr(C)]
-pub(super) struct SceneGlobal {
+pub(super) struct FrameGlobal {
     // Matrices.
     pub pv: Mat4,
     pub proj: Mat4,
@@ -14,17 +14,7 @@ pub(super) struct SceneGlobal {
     pub camera_direction: Vec4, // XYZ
     pub light_position: Vec4,
     pub light_color: Vec4,
-}
 
-#[derive(Copy, Clone, Debug)]
-#[repr(C)]
-pub(super) struct MeshletRenderGlobal {
-    pub object_buffer: vk::DeviceAddress,
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug)]
-pub(super) struct MeshletCullGlobal {
     pub frustum: Vec4,
 
     pub meshlet_visibility_buffer: vk::DeviceAddress,

@@ -66,13 +66,11 @@ struct Scene {
     /* Various buffers. */
     visibility_buffer: Buffer<u32>, // per meshlet
     index_buffer: Buffer<u32>,
-    object_buffer: Buffer<GpuObjectInstance>,
-    meshlet_data_buffer: Buffer<GpuMeshletInstance>,
+    object_instance_buffer: Buffer<GpuObjectInstance>,
+    meshlet_instance_buffer: Buffer<GpuMeshletInstance>,
     indirect_cmd_buffer: Buffer<vk::DrawIndexedIndirectCommand>,
     indirect_count_buffer: Buffer<u32>,
-    scene_global_buffer: Buffer<SceneGlobal>,
-    meshlet_cull_global_buffer: Buffer<MeshletCullGlobal>,
-    meshlet_render_global_buffer: Buffer<MeshletRenderGlobal>,
+    frame_global_buffer: Buffer<FrameGlobal>,
 }
 
 pub struct Renderer {
@@ -96,9 +94,7 @@ pub struct Renderer {
 
     /* Desciptor set layouts: */
     _global_set_layout: vk::DescriptorSetLayout,
-    _scene_set_layout: vk::DescriptorSetLayout,
-    _render_set_layout: vk::DescriptorSetLayout,
-    _cull_set_layout: vk::DescriptorSetLayout,
+    _frame_set_layout: vk::DescriptorSetLayout,
 
     /* Pipelines: */
     frustum_cull_pipeline_layout: vk::PipelineLayout,
@@ -127,9 +123,7 @@ pub struct Renderer {
 
     hzb_sampler: vk::Sampler,
     global_set: vk::DescriptorSet,
-    scene_sets: [vk::DescriptorSet; MAX_FRAMES_IN_FLIGHT],
-    render_sets: [vk::DescriptorSet; MAX_FRAMES_IN_FLIGHT],
-    cull_sets: [vk::DescriptorSet; MAX_FRAMES_IN_FLIGHT],
+    frame_sets: [vk::DescriptorSet; MAX_FRAMES_IN_FLIGHT],
 
     // Used for sequencing stages, and other cross-frame syncing.
     pipeline_semaphore: vk::Semaphore,
@@ -291,8 +285,8 @@ impl Renderer {
                 )
                 .unwrap();
 
-            // Descriptor set layout for all programs.
-            let scene_set_layout = device
+            // Descriptor set layout for per-frame globals.
+            let frame_set_layout = device
                 .create_descriptor_set_layout(
                     &vk::DescriptorSetLayoutCreateInfo::default()
                         .push_next(
@@ -301,51 +295,13 @@ impl Renderer {
                                     | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND]),
                         )
                         .bindings(&[
-                            // SceneGlobal
+                            // FrameGlobal
                             vk::DescriptorSetLayoutBinding::default()
                                 .binding(0)
                                 .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
                                 .descriptor_count(1)
                                 .stage_flags(vk::ShaderStageFlags::ALL),
                         ])
-                        .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL),
-                    None,
-                )
-                .unwrap();
-
-            // Desciptor set layout for the rendering program.
-            let render_set_layout = device
-                .create_descriptor_set_layout(
-                    &vk::DescriptorSetLayoutCreateInfo::default()
-                        .push_next(
-                            &mut vk::DescriptorSetLayoutBindingFlagsCreateInfo::default()
-                                .binding_flags(&[vk::DescriptorBindingFlags::PARTIALLY_BOUND
-                                    | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND]),
-                        )
-                        .bindings(&[vk::DescriptorSetLayoutBinding::default()
-                            .binding(0)
-                            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                            .descriptor_count(1)
-                            .stage_flags(vk::ShaderStageFlags::ALL)])
-                        .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL),
-                    None,
-                )
-                .unwrap();
-
-            // Descriptor set layout for cull compute program.
-            let cull_set_layout = device
-                .create_descriptor_set_layout(
-                    &vk::DescriptorSetLayoutCreateInfo::default()
-                        .push_next(
-                            &mut vk::DescriptorSetLayoutBindingFlagsCreateInfo::default()
-                                .binding_flags(&[vk::DescriptorBindingFlags::PARTIALLY_BOUND
-                                    | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND]),
-                        )
-                        .bindings(&[vk::DescriptorSetLayoutBinding::default()
-                            .binding(0)
-                            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                            .descriptor_count(1)
-                            .stage_flags(vk::ShaderStageFlags::COMPUTE)])
                         .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL),
                     None,
                 )
@@ -371,8 +327,7 @@ impl Renderer {
 
                 let pipeline_layout = device
                     .create_pipeline_layout(
-                        &vk::PipelineLayoutCreateInfo::default()
-                            .set_layouts(&[scene_set_layout, cull_set_layout]),
+                        &vk::PipelineLayoutCreateInfo::default().set_layouts(&[frame_set_layout]),
                         None,
                     )
                     .unwrap();
@@ -404,11 +359,8 @@ impl Renderer {
             let (render_pipeline, render_pipeline_layout) = {
                 let pipeline_layout = device
                     .create_pipeline_layout(
-                        &vk::PipelineLayoutCreateInfo::default().set_layouts(&[
-                            global_set_layout,
-                            scene_set_layout,
-                            render_set_layout,
-                        ]),
+                        &vk::PipelineLayoutCreateInfo::default()
+                            .set_layouts(&[global_set_layout, frame_set_layout]),
                         None,
                     )
                     .unwrap();
@@ -631,8 +583,8 @@ impl Renderer {
                         &vk::DescriptorPoolCreateInfo::default()
                             .pool_sizes(&[vk::DescriptorPoolSize::default()
                                 .ty(vk::DescriptorType::UNIFORM_BUFFER)
-                                .descriptor_count(3)])
-                            .max_sets(3 * MAX_FRAMES_IN_FLIGHT as u32)
+                                .descriptor_count(1)])
+                            .max_sets(1)
                             .flags(vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND),
                         None,
                     )
@@ -726,32 +678,12 @@ impl Renderer {
                 )
                 .unwrap()[0];
 
-            let scene_sets = std::array::from_fn(|fif| {
+            let frame_sets = std::array::from_fn(|fif| {
                 device
                     .allocate_descriptor_sets(
                         &vk::DescriptorSetAllocateInfo::default()
                             .descriptor_pool(descriptor_pools[fif])
-                            .set_layouts(&[scene_set_layout]),
-                    )
-                    .unwrap()[0]
-            });
-
-            let render_sets = std::array::from_fn(|fif| {
-                device
-                    .allocate_descriptor_sets(
-                        &vk::DescriptorSetAllocateInfo::default()
-                            .descriptor_pool(descriptor_pools[fif])
-                            .set_layouts(&[render_set_layout]),
-                    )
-                    .unwrap()[0]
-            });
-
-            let cull_sets = std::array::from_fn(|fif| {
-                device
-                    .allocate_descriptor_sets(
-                        &vk::DescriptorSetAllocateInfo::default()
-                            .descriptor_pool(descriptor_pools[fif])
-                            .set_layouts(&[cull_set_layout]),
+                            .set_layouts(&[frame_set_layout]),
                     )
                     .unwrap()[0]
             });
@@ -793,9 +725,7 @@ impl Renderer {
                 _cmd_pool: cmd_pool,
 
                 _global_set_layout: global_set_layout,
-                _scene_set_layout: scene_set_layout,
-                _render_set_layout: render_set_layout,
-                _cull_set_layout: cull_set_layout,
+                _frame_set_layout: frame_set_layout,
 
                 frustum_cull_pipeline_layout,
                 frustum_cull_pipeline,
@@ -819,9 +749,7 @@ impl Renderer {
 
                 hzb_sampler,
                 global_set,
-                scene_sets,
-                render_sets,
-                cull_sets,
+                frame_sets,
 
                 pipeline_semaphore,
 
@@ -892,9 +820,7 @@ impl Renderer {
 
         // Descriptor sets associated with this frame.
         let global_set = self.global_set;
-        let scene_set = self.scene_sets[frame_index];
-        let render_set = self.render_sets[frame_index];
-        let cull_set = self.cull_sets[frame_index];
+        let frame_set = self.frame_sets[frame_index];
 
         unsafe {
             // Wait for next image to become available.
@@ -1000,7 +926,7 @@ impl Renderer {
                 self.staging_buffer.stage_buffer(
                     &self.device,
                     cmd,
-                    &scene.object_buffer,
+                    &scene.object_instance_buffer,
                     0,
                     object_data,
                 );
@@ -1008,9 +934,9 @@ impl Renderer {
                 self.staging_buffer.stage_buffer(
                     &self.device,
                     cmd,
-                    &scene.scene_global_buffer,
+                    &scene.frame_global_buffer,
                     0,
-                    [SceneGlobal {
+                    [FrameGlobal {
                         pv: projection * view,
                         proj: projection,
                         view,
@@ -1018,35 +944,6 @@ impl Renderer {
                         camera_direction: p.extend(0.0),
                         light_position: Vec4::new(1.0, 0.0, 0.0, 1.0),
                         light_color: Vec4::new(1.0, 1.0, 1.0, 1.0),
-                    }],
-                );
-
-                self.staging_buffer.stage_buffer(
-                    &self.device,
-                    cmd,
-                    &scene.meshlet_render_global_buffer,
-                    0,
-                    [MeshletRenderGlobal {
-                        object_buffer: self.device.get_buffer_device_address(
-                            &vk::BufferDeviceAddressInfo::default()
-                                .buffer(scene.object_buffer.vk_handle()),
-                        ),
-                    }],
-                );
-                self.staging_buffer.stage_buffer(
-                    &self.device,
-                    cmd,
-                    &scene.indirect_count_buffer,
-                    0,
-                    [0u32],
-                );
-                self.staging_buffer.stage_buffer(
-                    &self.device,
-                    cmd,
-                    &scene.meshlet_cull_global_buffer,
-                    0,
-                    [MeshletCullGlobal {
-                        instances: scene.indirect_cmd_buffer.len,
                         frustum,
                         meshlet_visibility_buffer: self.device.get_buffer_device_address(
                             &vk::BufferDeviceAddressInfo::default()
@@ -1058,7 +955,7 @@ impl Renderer {
                         ),
                         meshlet_buffer: self.device.get_buffer_device_address(
                             &vk::BufferDeviceAddressInfo::default()
-                                .buffer(scene.meshlet_data_buffer.vk_handle()),
+                                .buffer(scene.meshlet_instance_buffer.vk_handle()),
                         ),
                         draw_cmd_buffer: self.device.get_buffer_device_address(
                             &vk::BufferDeviceAddressInfo::default()
@@ -1066,9 +963,17 @@ impl Renderer {
                         ),
                         object_buffer: self.device.get_buffer_device_address(
                             &vk::BufferDeviceAddressInfo::default()
-                                .buffer(scene.object_buffer.vk_handle()),
+                                .buffer(scene.object_instance_buffer.vk_handle()),
                         ),
+                        instances: scene.indirect_cmd_buffer.len,
                     }],
+                );
+                self.staging_buffer.stage_buffer(
+                    &self.device,
+                    cmd,
+                    &scene.indirect_count_buffer,
+                    0,
+                    [0u32],
                 );
             });
 
@@ -1078,7 +983,7 @@ impl Renderer {
                     vk::PipelineBindPoint::COMPUTE,
                     self.frustum_cull_pipeline_layout,
                     0,
-                    &[scene_set, cull_set],
+                    &[frame_set],
                     &[],
                 );
 
@@ -1089,7 +994,7 @@ impl Renderer {
                 );
 
                 self.device
-                    .cmd_dispatch(cmd, scene.meshlet_data_buffer.len().div_ceil(64), 1, 1);
+                    .cmd_dispatch(cmd, scene.meshlet_instance_buffer.len().div_ceil(64), 1, 1);
             });
 
             cmd_buffer_record(&self.device, first_draw, |cmd| {
@@ -1158,7 +1063,7 @@ impl Renderer {
                     vk::PipelineBindPoint::GRAPHICS,
                     self.render_pipeline_layout,
                     0,
-                    &[global_set, scene_set, render_set],
+                    &[global_set, frame_set],
                     &[],
                 );
 
@@ -1181,7 +1086,7 @@ impl Renderer {
                     0,
                     scene.indirect_count_buffer.vk_handle(),
                     0,
-                    scene.meshlet_data_buffer.len(),
+                    scene.meshlet_instance_buffer.len(),
                     size_of::<vk::DrawIndexedIndirectCommand>() as u32,
                 );
 
@@ -1492,18 +1397,11 @@ impl Renderer {
 
     unsafe fn free_scene(&mut self, mut scene: Scene) {
         scene.index_buffer.take().destroy(&self.allocator);
-        scene.object_buffer.take().destroy(&self.allocator);
-        scene.meshlet_data_buffer.take().destroy(&self.allocator);
+        scene.object_instance_buffer.take().destroy(&self.allocator);
+        scene.meshlet_instance_buffer.take().destroy(&self.allocator);
         scene.indirect_cmd_buffer.take().destroy(&self.allocator);
         scene.indirect_count_buffer.take().destroy(&self.allocator);
-        scene
-            .meshlet_cull_global_buffer
-            .take()
-            .destroy(&self.allocator);
-        scene
-            .meshlet_render_global_buffer
-            .take()
-            .destroy(&self.allocator);
+        scene.frame_global_buffer.take().destroy(&self.allocator);
     }
 
     unsafe fn rebuild_scene(&mut self, fif: usize) -> Scene {
@@ -1694,7 +1592,7 @@ impl Renderer {
                 vk_mem::MemoryUsage::AutoPreferDevice,
             ),
 
-            object_buffer: Buffer::new(
+            object_instance_buffer: Buffer::new(
                 &self.allocator,
                 self.objects.len() as u32,
                 vk::BufferUsageFlags::STORAGE_BUFFER
@@ -1703,7 +1601,7 @@ impl Renderer {
                 vk_mem::MemoryUsage::AutoPreferDevice,
             ),
 
-            meshlet_data_buffer: Buffer::new(
+            meshlet_instance_buffer: Buffer::new(
                 &self.allocator,
                 instances,
                 vk::BufferUsageFlags::STORAGE_BUFFER
@@ -1731,21 +1629,7 @@ impl Renderer {
                 vk_mem::MemoryUsage::AutoPreferDevice,
             ),
 
-            scene_global_buffer: Buffer::new(
-                &self.allocator,
-                1,
-                vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-                vk_mem::MemoryUsage::AutoPreferDevice,
-            ),
-
-            meshlet_cull_global_buffer: Buffer::new(
-                &self.allocator,
-                1,
-                vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-                vk_mem::MemoryUsage::AutoPreferDevice,
-            ),
-
-            meshlet_render_global_buffer: Buffer::new(
+            frame_global_buffer: Buffer::new(
                 &self.allocator,
                 1,
                 vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
@@ -1788,7 +1672,7 @@ impl Renderer {
         self.staging_buffer.stage_buffer(
             &self.device,
             self.staging_cmd_buffer,
-            &frame.meshlet_data_buffer,
+            &frame.meshlet_instance_buffer,
             0,
             meshlet_data,
         );
@@ -1904,45 +1788,20 @@ impl Renderer {
                     .image_info(&global_set_1_info),
             ];
 
-            /* scene/cull/render part: */
-            let scene_set_info = [vk::DescriptorBufferInfo::default()
-                .buffer(frame.scene_global_buffer.vk_handle())
-                .offset(0)
-                .range(vk::WHOLE_SIZE)];
-            let cull_set_info = [vk::DescriptorBufferInfo::default()
-                .buffer(frame.meshlet_cull_global_buffer.vk_handle())
-                .offset(0)
-                .range(vk::WHOLE_SIZE)];
-            let render_set_info = [vk::DescriptorBufferInfo::default()
-                .buffer(frame.meshlet_render_global_buffer.vk_handle())
+            /* frame globals part: */
+            let frame_set_info = [vk::DescriptorBufferInfo::default()
+                .buffer(frame.frame_global_buffer.vk_handle())
                 .offset(0)
                 .range(vk::WHOLE_SIZE)];
 
-            tmp.extend((0..MAX_FRAMES_IN_FLIGHT).into_iter().flat_map(|i| {
-                [
-                    vk::WriteDescriptorSet::default()
-                        .dst_set(self.scene_sets[i])
-                        .dst_binding(0)
-                        .dst_array_element(0)
-                        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                        .descriptor_count(1)
-                        .buffer_info(&scene_set_info),
-                    vk::WriteDescriptorSet::default()
-                        .dst_set(self.cull_sets[i])
-                        .dst_binding(0)
-                        .dst_array_element(0)
-                        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                        .descriptor_count(1)
-                        .buffer_info(&cull_set_info),
-                    //
-                    vk::WriteDescriptorSet::default()
-                        .dst_set(self.render_sets[i])
-                        .dst_binding(0)
-                        .dst_array_element(0)
-                        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                        .descriptor_count(1)
-                        .buffer_info(&render_set_info),
-                ]
+            tmp.extend((0..MAX_FRAMES_IN_FLIGHT).into_iter().map(|i| {
+                vk::WriteDescriptorSet::default()
+                    .dst_set(self.frame_sets[i])
+                    .dst_binding(0)
+                    .dst_array_element(0)
+                    .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                    .descriptor_count(1)
+                    .buffer_info(&frame_set_info)
             }));
 
             /* What a mess */

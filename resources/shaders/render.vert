@@ -6,11 +6,7 @@
 #include "types.h"
 
 layout(std430, set = 1, binding = 0) UNIFORM {
-    SceneGlobal scene_global;
-};
-
-layout (set = 2, binding = 0) UNIFORM {
-    ObjectInstanceBuffer object_buffer;
+    FrameGlobal frame_global;
 };
 
 layout (location = 0) out vec2 frag_uv;
@@ -42,7 +38,7 @@ vec3 rotate_quat(vec3 v, vec4 q) {
 }
 
 void main() {
-    ObjectInstance object = object_buffer.data[gl_BaseVertex];
+    ObjectInstance object = frame_global.object_buffer.data[gl_BaseVertex];
     Vertex vert = object.vertex_buffer.data[gl_VertexIndex - gl_BaseVertex];
 
     // Decompress.
@@ -52,7 +48,7 @@ void main() {
 
     //
     vec3 wpos = object.position + object.scale * rotate_quat(position, object.orientation);
-    gl_Position = scene_global.pv * vec4(wpos, 1.0);
+    gl_Position = frame_global.pv * vec4(wpos, 1.0);
     frag_position = wpos;
     frag_normal = rotate_quat(normal, object.orientation);
     frag_uv = uv;
