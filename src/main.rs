@@ -14,6 +14,7 @@ mod buffer;
 mod core;
 mod glsl_types;
 mod mesh;
+mod profiling;
 mod renderer;
 mod staging;
 mod swapchain;
