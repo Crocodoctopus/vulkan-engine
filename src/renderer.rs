@@ -167,7 +167,7 @@ pub struct Renderer {
     cwd: PathBuf,
     resource_counter: u32,
     meshes: HashMap<MeshHandle, (f32, Box<[Meshlet]>)>,
-    objects: HashMap<ObjectHandle, Object>,
+    objects: Vec<(ObjectHandle, Object)>,
     vertex_buffers: HashMap<MeshHandle, Buffer<GpuVertex>>,
 
     /* Staging: */
@@ -715,7 +715,7 @@ impl Renderer {
                 cwd: cwd.as_ref().to_owned(),
                 resource_counter: 0,
                 meshes: HashMap::new(),
-                objects: HashMap::new(),
+                objects: Vec::new(),
                 vertex_buffers: HashMap::new(),
 
                 staging_buffer,
@@ -901,7 +901,7 @@ impl Renderer {
                     (2 * frame_index + 0) as u32,
                 );
 
-                let object_data = self.objects.values().map(|obj| GpuObjectInstance {
+                let object_data = self.objects.iter().map(|(_, obj)| GpuObjectInstance {
                     position: obj.position,
                     scale: obj.scale * self.meshes.get(&obj.mesh).unwrap().0,
                     orientation: obj.orientation,
@@ -1447,7 +1447,7 @@ impl Renderer {
         let mut meshlet_data = vec![];
         let mut instances = 0u32;
         let mut first_index = 0;
-        for (i, object) in self.objects.values().enumerate() {
+        for (i, (_, object)) in self.objects.iter().enumerate() {
             // Get associated mesh and index offset.
             let mesh = &self.meshes.get(&object.mesh).unwrap().1;
 
@@ -1971,7 +1971,7 @@ impl Renderer {
         self.scene_resources_dirty = true;
         let handle = ObjectHandle(self.resource_counter);
         self.resource_counter += 1;
-        self.objects.insert(
+        self.objects.push((
             handle,
             Object {
                 mesh,
@@ -1979,7 +1979,7 @@ impl Renderer {
                 scale,
                 orientation,
             },
-        );
+        ));
         Some(handle)
     }
 
