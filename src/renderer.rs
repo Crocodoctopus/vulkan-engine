@@ -54,23 +54,82 @@ enum PipelineStage {
 
 const MAX_PIPELINE_STAGES: usize = PipelineStage::COUNT as usize;
 
-struct Scene {
-    /* Images: */
-    // Note: hzb mip 0 is half depth resolution.
-    hzb_image: vk::Image, // ( TODO: make visiblity less serial )
+/* Resources that need regeneration when Swapchain changes */
+struct SwapchainResources {
+    /* TODO: Currently, only 1 FIF can use these, so we only need 1 */
+    hzb_image: vk::Image,
     _hzb_alloc: vk_mem::Allocation,
     _hzb_test_view: vk::ImageView,
     hzb_build_src_views: Box<[vk::ImageView]>,
-    hzb_build_dst_views: Box<[vk::ImageView]>,
+    _hzb_build_dst_views: Box<[vk::ImageView]>,
 
-    /* Various buffers. */
-    visibility_buffer: Buffer<u32>, // per meshlet
+    render_finished: Box<[vk::Semaphore]>,
+    sync_primitives: [FrameSyncPrimitives; MAX_FRAMES_IN_FLIGHT],
+    cmd_buffers: [[vk::CommandBuffer; MAX_PIPELINE_STAGES]; MAX_FRAMES_IN_FLIGHT],
+    depth_images: [(vk::Image, vk_mem::Allocation); MAX_FRAMES_IN_FLIGHT],
+    depth_views: [vk::ImageView; MAX_FRAMES_IN_FLIGHT],
+}
+
+impl SwapchainResources {
+    unsafe fn free(
+        mut self,
+        device: &ash::Device,
+        allocator: &vk_mem::Allocator,
+        cmd_pool: vk::CommandPool,
+    ) {
+        device.destroy_image_view(self._hzb_test_view, None);
+        for view in self.hzb_build_src_views {
+            device.destroy_image_view(view, None);
+        }
+        for view in self._hzb_build_dst_views {
+            device.destroy_image_view(view, None);
+        }
+        allocator.destroy_image(self.hzb_image, &mut self._hzb_alloc);
+
+        for semaphore in self.render_finished {
+            device.destroy_semaphore(semaphore, None);
+        }
+        for sync in self.sync_primitives {
+            device.destroy_semaphore(sync.image_available, None);
+            device.destroy_fence(sync.frame_in_flight, None);
+        }
+
+        for cmd_buffers in self.cmd_buffers {
+            device.free_command_buffers(cmd_pool, &cmd_buffers);
+        }
+
+        for view in self.depth_views {
+            device.destroy_image_view(view, None);
+        }
+        for (image, mut alloc) in self.depth_images {
+            allocator.destroy_image(image, &mut alloc);
+        }
+    }
+}
+
+/* Resources that need regeneration when object set changes */
+struct SceneResources {
+    visibility_buffer: Buffer<u32>,
+    indirect_cmd_buffer: Buffer<vk::DrawIndexedIndirectCommand>,
+    indirect_count_buffer: Buffer<u32>,
+
+    /* TODO: These are static after creation */
     index_buffer: Buffer<u32>,
     object_instance_buffer: Buffer<GpuObjectInstance>,
     meshlet_instance_buffer: Buffer<GpuMeshletInstance>,
-    indirect_cmd_buffer: Buffer<vk::DrawIndexedIndirectCommand>,
-    indirect_count_buffer: Buffer<u32>,
-    frame_global_buffer: Buffer<FrameGlobal>,
+}
+
+impl SceneResources {
+    unsafe fn free(self, allocator: &vk_mem::Allocator) {
+        // Almost certainly this is wrong
+        self.visibility_buffer.destroy(&allocator);
+
+        self.index_buffer.destroy(&allocator);
+        self.object_instance_buffer.destroy(&allocator);
+        self.meshlet_instance_buffer.destroy(&allocator);
+        self.indirect_cmd_buffer.destroy(&allocator);
+        self.indirect_count_buffer.destroy(&allocator);
+    }
 }
 
 pub struct Renderer {
@@ -90,7 +149,7 @@ pub struct Renderer {
 
     /* Command pool: */
     query_pool: vk::QueryPool,
-    _cmd_pool: vk::CommandPool,
+    cmd_pool: vk::CommandPool,
 
     /* Desciptor set layouts: */
     _global_set_layout: vk::DescriptorSetLayout,
@@ -124,26 +183,23 @@ pub struct Renderer {
     hzb_sampler: vk::Sampler,
     global_set: vk::DescriptorSet,
     frame_sets: [vk::DescriptorSet; MAX_FRAMES_IN_FLIGHT],
+    frame_global_buffers: [Buffer<FrameGlobal>; MAX_FRAMES_IN_FLIGHT],
 
     // Used for sequencing stages, and other cross-frame syncing.
     pipeline_semaphore: vk::Semaphore,
 
-    // Misc data that does not change across scene generations.
-    sync_primitives: [FrameSyncPrimitives; MAX_FRAMES_IN_FLIGHT],
-    cmd_buffers: [[vk::CommandBuffer; MAX_PIPELINE_STAGES]; MAX_FRAMES_IN_FLIGHT],
-    depth_images: [(vk::Image, vk_mem::Allocation); MAX_FRAMES_IN_FLIGHT],
-    depth_views: [vk::ImageView; MAX_FRAMES_IN_FLIGHT],
-    render_finished: Box<[vk::Semaphore]>,
+    // Dirty flags for resource regeneration.
+    swapchain_resources_dirty: bool,
+    scene_resources_dirty: bool,
 
-    // Scenes contain resources that may change across scene generations.
-    current_scene: Option<Scene>,
-    next_scene: Option<Scene>,
+    // When rendering a FIF
+    swapchain_resources: Option<SwapchainResources>,
+    scene_resources: Vec<SceneResources>,
 
     // Various render state data.
     frame: usize,
     pub cam_pos: Vec3,
     pub cam_rot: Vec2, // YX
-                       //last_timestamp: f32,
 }
 
 impl Drop for Renderer {
@@ -176,7 +232,6 @@ impl Renderer {
                 physical_device,
                 queue_family_index,
                 surface_format,
-                surface_extent,
                 ..
             } = &core;
 
@@ -504,29 +559,6 @@ impl Renderer {
                 )
                 .unwrap();
 
-            // Per-frame recorded render buffers.
-            let cmd_buffers = std::array::from_fn(|_| {
-                device
-                    .allocate_command_buffers(
-                        &vk::CommandBufferAllocateInfo::default()
-                            .command_pool(cmd_pool)
-                            .level(vk::CommandBufferLevel::PRIMARY)
-                            .command_buffer_count(MAX_PIPELINE_STAGES as _),
-                    )
-                    .unwrap()
-                    .try_into()
-                    .unwrap()
-            });
-
-            let render_finished = (0..swapchain.images.len())
-                .into_iter()
-                .map(|_| {
-                    device
-                        .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
-                        .unwrap()
-                })
-                .collect();
-
             // Staging data.
             let staging_buffer = StagingBuffer::new(10000000, &allocator);
 
@@ -545,18 +577,6 @@ impl Renderer {
                     None,
                 )
                 .unwrap();
-
-            let sync_primitives = std::array::from_fn(|_| FrameSyncPrimitives {
-                image_available: device
-                    .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
-                    .unwrap(),
-                frame_in_flight: device
-                    .create_fence(
-                        &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
-                        None,
-                    )
-                    .unwrap(),
-            });
 
             //
             let global_descriptor_pool = device
@@ -586,54 +606,6 @@ impl Renderer {
                                 .descriptor_count(1)])
                             .max_sets(1)
                             .flags(vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND),
-                        None,
-                    )
-                    .unwrap()
-            });
-
-            // Create depth attachment for rendering.
-            let depth_images = std::array::from_fn(|_| {
-                use vk_mem::Alloc;
-                allocator
-                    .create_image(
-                        &vk::ImageCreateInfo::default()
-                            .image_type(vk::ImageType::TYPE_2D)
-                            .extent(
-                                vk::Extent3D::default()
-                                    .width(surface_extent.width)
-                                    .height(surface_extent.height)
-                                    .depth(1),
-                            )
-                            .mip_levels(1)
-                            .array_layers(1)
-                            .samples(vk::SampleCountFlags::TYPE_1)
-                            .format(vk::Format::D32_SFLOAT)
-                            .usage(
-                                vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
-                                    | vk::ImageUsageFlags::SAMPLED,
-                            ),
-                        &vk_mem::AllocationCreateInfo {
-                            required_flags: vk::MemoryPropertyFlags::DEVICE_LOCAL,
-                            ..Default::default()
-                        },
-                    )
-                    .unwrap()
-            });
-
-            let depth_views = std::array::from_fn(|i| {
-                device
-                    .create_image_view(
-                        &vk::ImageViewCreateInfo::default()
-                            .image(depth_images[i].0)
-                            .view_type(vk::ImageViewType::TYPE_2D)
-                            .format(vk::Format::D32_SFLOAT)
-                            .subresource_range(vk::ImageSubresourceRange {
-                                aspect_mask: vk::ImageAspectFlags::DEPTH,
-                                base_mip_level: 0,
-                                level_count: 1,
-                                base_array_layer: 0,
-                                layer_count: 1,
-                            }),
                         None,
                     )
                     .unwrap()
@@ -688,26 +660,32 @@ impl Renderer {
                     .unwrap()[0]
             });
 
-            // Write the depth buffers to 0 & 1
-            device.update_descriptor_sets(
-                &[vk::WriteDescriptorSet::default()
-                    .dst_set(global_set)
-                    .dst_binding(0)
-                    .dst_array_element(0)
-                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                    .descriptor_count(2)
-                    .image_info(&[
-                        vk::DescriptorImageInfo::default()
-                            .image_view(depth_views[0])
-                            .sampler(hzb_sampler)
-                            .image_layout(vk::ImageLayout::DEPTH_READ_ONLY_OPTIMAL),
-                        vk::DescriptorImageInfo::default()
-                            .image_view(depth_views[1])
-                            .sampler(hzb_sampler)
-                            .image_layout(vk::ImageLayout::DEPTH_READ_ONLY_OPTIMAL),
-                    ])],
-                &[],
-            );
+            let frame_global_buffers = std::array::from_fn(|_| {
+                Buffer::new(
+                    &allocator,
+                    1,
+                    vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+                    vk_mem::MemoryUsage::AutoPreferDevice,
+                )
+            });
+
+            for fif in 0..MAX_FRAMES_IN_FLIGHT {
+                let descriptor_buffer_infos = [vk::DescriptorBufferInfo::default()
+                    .buffer(frame_global_buffers[fif].vk_handle())
+                    .offset(0)
+                    .range(vk::WHOLE_SIZE)];
+
+                device.update_descriptor_sets(
+                    &[vk::WriteDescriptorSet::default()
+                        .dst_set(frame_sets[fif])
+                        .dst_binding(0)
+                        .dst_array_element(0)
+                        .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                        .descriptor_count(1)
+                        .buffer_info(&descriptor_buffer_infos)],
+                    &[],
+                );
+            }
 
             //
             Self {
@@ -722,7 +700,7 @@ impl Renderer {
                 swapchain,
 
                 query_pool,
-                _cmd_pool: cmd_pool,
+                cmd_pool,
 
                 _global_set_layout: global_set_layout,
                 _frame_set_layout: frame_set_layout,
@@ -750,17 +728,15 @@ impl Renderer {
                 hzb_sampler,
                 global_set,
                 frame_sets,
+                frame_global_buffers,
 
                 pipeline_semaphore,
 
-                sync_primitives,
-                cmd_buffers,
-                depth_images,
-                depth_views,
-                render_finished,
+                swapchain_resources_dirty: true,
+                scene_resources_dirty: true,
 
-                current_scene: None,
-                next_scene: None,
+                swapchain_resources: None,
+                scene_resources: vec![],
 
                 frame: 0,
                 cam_pos: Vec3::new(0., 0., 3.),
@@ -770,57 +746,90 @@ impl Renderer {
     }
 
     pub fn render(&mut self, _timestamp: f32) {
+        if self.swapchain_resources_dirty {
+            self.swapchain_resources_dirty = false;
+            unsafe {
+                self.rebuild_swapchain();
+            }
+            println!("SwapchainResource regenerated!");
+        }
+
+        if self.scene_resources_dirty {
+            self.scene_resources_dirty = false;
+            unsafe {
+                self.rebuild_scene();
+            }
+            println!("SceneResource regenerated!");
+        }
+
         let frame_index = self.frame % MAX_FRAMES_IN_FLIGHT;
         let frame_count = self.frame;
         self.frame += 1;
 
-        // A dirty hack, initialize first time scene.
-        if self.current_scene.is_none() {
-            unsafe {
-                self.current_scene = Some(self.rebuild_scene(frame_index));
-            }
-        };
+        // Attempt to clean old scenes:
+        let mut scene_resources = vec![self.scene_resources.pop().unwrap()];
+        while let Some(scene) = self.scene_resources.pop() {
+            let swapchain_resources = self.swapchain_resources.as_ref().unwrap();
 
-        // Attempt to clean up current_scene if there is a next.
-        if self.next_scene.is_some() {
-            // All frames are signalled.
-            let signalled = self.sync_primitives.iter().fold(true, |acc, syncs| unsafe {
-                acc & self.device.get_fence_status(syncs.frame_in_flight).unwrap()
-            });
+            let all_signalled =
+                swapchain_resources
+                    .sync_primitives
+                    .iter()
+                    .fold(true, |acc, syncs| unsafe {
+                        acc & self.device.get_fence_status(syncs.frame_in_flight).unwrap()
+                    });
 
-            if signalled {
-                let next_scene = self.next_scene.take();
-                let scene = std::mem::replace(&mut self.current_scene, next_scene).unwrap();
-
+            if all_signalled {
                 unsafe {
-                    self.free_scene(scene);
+                    scene.free(&self.allocator);
                 }
-                println!("Old scene cleared.");
+                println!("Scene freed!");
+                continue;
             }
-        }
 
-        // Get current scene.
-        let scene = match &self.next_scene {
-            Some(scene) => scene,
-            None => self.current_scene.as_ref().unwrap(),
-        };
+            // This scene is still in use, push it back.
+            scene_resources.push(scene);
+        }
+        scene_resources.reverse();
+        self.scene_resources = scene_resources;
+
+        let SceneResources {
+            visibility_buffer,
+            indirect_cmd_buffer,
+            indirect_count_buffer,
+            index_buffer,
+            object_instance_buffer,
+            meshlet_instance_buffer,
+            ..
+        } = self.scene_resources.last_mut().unwrap();
+
+        let SwapchainResources {
+            hzb_image,
+            hzb_build_src_views,
+            render_finished,
+            sync_primitives,
+            cmd_buffers,
+            depth_images,
+            depth_views,
+            ..
+        } = self.swapchain_resources.as_ref().unwrap();
 
         // Sync primitives associated with this frame.
         let FrameSyncPrimitives {
             image_available,
             frame_in_flight,
-        } = self.sync_primitives[frame_index];
+        } = sync_primitives[frame_index];
 
         // Command buffer associated with this frame.
-        let command_buffers = &self.cmd_buffers[frame_index];
-        let data_upload = command_buffers[PipelineStage::DataUpload as usize];
-        let frustum_cull = command_buffers[PipelineStage::FrustumCull as usize];
-        let first_draw = command_buffers[PipelineStage::FirstDraw as usize];
-        let build_hzb = command_buffers[PipelineStage::BuildHzb as usize];
+        let data_upload = cmd_buffers[frame_index][PipelineStage::DataUpload as usize];
+        let frustum_cull = cmd_buffers[frame_index][PipelineStage::FrustumCull as usize];
+        let first_draw = cmd_buffers[frame_index][PipelineStage::FirstDraw as usize];
+        let build_hzb = cmd_buffers[frame_index][PipelineStage::BuildHzb as usize];
 
         // Descriptor sets associated with this frame.
         let global_set = self.global_set;
         let frame_set = self.frame_sets[frame_index];
+        let frame_global_buffer = &self.frame_global_buffers[frame_index];
 
         unsafe {
             // Wait for next image to become available.
@@ -830,7 +839,7 @@ impl Renderer {
             self.device.reset_fences(&[frame_in_flight]).unwrap();
 
             // TODO: keep this here? Its a per-fif variable.
-            let depth_view = self.depth_views[frame_index];
+            let depth_view = depth_views[frame_index];
 
             //
             let (image_index, _) = self
@@ -843,7 +852,7 @@ impl Renderer {
                     vk::Fence::null(),
                 )
                 .unwrap();
-            let render_finished = self.render_finished[image_index as usize];
+            let render_finished = render_finished[image_index as usize];
             let swapchain_image = self.swapchain.images[image_index as usize];
             let swapchain_view = self.swapchain.views[image_index as usize];
 
@@ -926,7 +935,7 @@ impl Renderer {
                 self.staging_buffer.stage_buffer(
                     &self.device,
                     cmd,
-                    &scene.object_instance_buffer,
+                    &object_instance_buffer,
                     0,
                     object_data,
                 );
@@ -934,7 +943,7 @@ impl Renderer {
                 self.staging_buffer.stage_buffer(
                     &self.device,
                     cmd,
-                    &scene.frame_global_buffer,
+                    frame_global_buffer,
                     0,
                     [FrameGlobal {
                         pv: projection * view,
@@ -947,31 +956,31 @@ impl Renderer {
                         frustum,
                         meshlet_visibility_buffer: self.device.get_buffer_device_address(
                             &vk::BufferDeviceAddressInfo::default()
-                                .buffer(scene.visibility_buffer.vk_handle()),
+                                .buffer(visibility_buffer.vk_handle()),
                         ),
                         draw_count_buffer: self.device.get_buffer_device_address(
                             &vk::BufferDeviceAddressInfo::default()
-                                .buffer(scene.indirect_count_buffer.vk_handle()),
+                                .buffer(indirect_count_buffer.vk_handle()),
                         ),
                         meshlet_buffer: self.device.get_buffer_device_address(
                             &vk::BufferDeviceAddressInfo::default()
-                                .buffer(scene.meshlet_instance_buffer.vk_handle()),
+                                .buffer(meshlet_instance_buffer.vk_handle()),
                         ),
                         draw_cmd_buffer: self.device.get_buffer_device_address(
                             &vk::BufferDeviceAddressInfo::default()
-                                .buffer(scene.indirect_cmd_buffer.vk_handle()),
+                                .buffer(indirect_cmd_buffer.vk_handle()),
                         ),
                         object_buffer: self.device.get_buffer_device_address(
                             &vk::BufferDeviceAddressInfo::default()
-                                .buffer(scene.object_instance_buffer.vk_handle()),
+                                .buffer(object_instance_buffer.vk_handle()),
                         ),
-                        instances: scene.indirect_cmd_buffer.len,
+                        instances: indirect_cmd_buffer.len,
                     }],
                 );
                 self.staging_buffer.stage_buffer(
                     &self.device,
                     cmd,
-                    &scene.indirect_count_buffer,
+                    indirect_count_buffer,
                     0,
                     [0u32],
                 );
@@ -994,7 +1003,7 @@ impl Renderer {
                 );
 
                 self.device
-                    .cmd_dispatch(cmd, scene.meshlet_instance_buffer.len().div_ceil(64), 1, 1);
+                    .cmd_dispatch(cmd, meshlet_instance_buffer.len().div_ceil(64), 1, 1);
             });
 
             cmd_buffer_record(&self.device, first_draw, |cmd| {
@@ -1075,18 +1084,18 @@ impl Renderer {
 
                 self.device.cmd_bind_index_buffer(
                     cmd,
-                    scene.index_buffer.vk_handle(),
+                    index_buffer.vk_handle(),
                     0,
                     vk::IndexType::UINT32,
                 );
 
                 self.device.cmd_draw_indexed_indirect_count(
                     cmd,
-                    scene.indirect_cmd_buffer.vk_handle(),
+                    indirect_cmd_buffer.vk_handle(),
                     0,
-                    scene.indirect_count_buffer.vk_handle(),
+                    indirect_count_buffer.vk_handle(),
                     0,
-                    scene.meshlet_instance_buffer.len(),
+                    meshlet_instance_buffer.len(),
                     size_of::<vk::DrawIndexedIndirectCommand>() as u32,
                 );
 
@@ -1134,7 +1143,7 @@ impl Renderer {
                             .src_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
                             .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
                             .dst_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
-                            .image(scene.hzb_image)
+                            .image(*hzb_image)
                             .subresource_range(
                                 vk::ImageSubresourceRange::default()
                                     .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -1154,7 +1163,7 @@ impl Renderer {
                             .src_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
                             .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
                             .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                            .image(self.depth_images[frame_index].0)
+                            .image(depth_images[frame_index].0)
                             .subresource_range(
                                 vk::ImageSubresourceRange::default()
                                     .aspect_mask(vk::ImageAspectFlags::DEPTH)
@@ -1225,7 +1234,7 @@ impl Renderer {
                                 .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
                                 .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
                                 .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                                .image(scene.hzb_image)
+                                .image(*hzb_image)
                                 .subresource_range(
                                     vk::ImageSubresourceRange::default()
                                         .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -1245,7 +1254,7 @@ impl Renderer {
                 build_hzb(frame_index as u32, 0);
 
                 // The rest are standard.
-                let mips = scene.hzb_build_src_views.len();
+                let mips = hzb_build_src_views.len();
                 for i in 0..mips - 1 {
                     build_hzb(2 + i as u32, 1 + i as u32);
                 }
@@ -1259,7 +1268,7 @@ impl Renderer {
                             .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
                             .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
                             .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                            .image(scene.hzb_image)
+                            .image(*hzb_image)
                             .subresource_range(
                                 vk::ImageSubresourceRange::default()
                                     .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -1279,7 +1288,7 @@ impl Renderer {
                                     | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
                             )
                             .dst_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
-                            .image(self.depth_images[frame_index].0)
+                            .image(depth_images[frame_index].0)
                             .subresource_range(
                                 vk::ImageSubresourceRange::default()
                                     .aspect_mask(vk::ImageAspectFlags::DEPTH)
@@ -1395,16 +1404,7 @@ impl Renderer {
         }
     }
 
-    unsafe fn free_scene(&mut self, mut scene: Scene) {
-        scene.index_buffer.take().destroy(&self.allocator);
-        scene.object_instance_buffer.take().destroy(&self.allocator);
-        scene.meshlet_instance_buffer.take().destroy(&self.allocator);
-        scene.indirect_cmd_buffer.take().destroy(&self.allocator);
-        scene.indirect_count_buffer.take().destroy(&self.allocator);
-        scene.frame_global_buffer.take().destroy(&self.allocator);
-    }
-
-    unsafe fn rebuild_scene(&mut self, fif: usize) -> Scene {
+    unsafe fn rebuild_scene(&mut self) {
         // Generate vertex data for newly added meshes.
         let new_meshes: HashMap<MeshHandle, Box<[GpuVertex]>> = self
             .meshes
@@ -1476,6 +1476,156 @@ impl Renderer {
             }
         }
 
+        let visibility_buffer = Buffer::new(
+            &self.allocator,
+            instances,
+            vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+                | vk::BufferUsageFlags::TRANSFER_DST,
+            vk_mem::MemoryUsage::AutoPreferDevice,
+        );
+
+        let index_buffer = Buffer::new(
+            &self.allocator,
+            indices.len() as u32,
+            vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            vk_mem::MemoryUsage::AutoPreferDevice,
+        );
+
+        let object_instance_buffer = Buffer::new(
+            &self.allocator,
+            self.objects.len() as u32,
+            vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::TRANSFER_DST
+                | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+            vk_mem::MemoryUsage::AutoPreferDevice,
+        );
+
+        let meshlet_instance_buffer = Buffer::new(
+            &self.allocator,
+            instances,
+            vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::TRANSFER_DST
+                | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+            vk_mem::MemoryUsage::AutoPreferDevice,
+        );
+
+        let indirect_cmd_buffer = Buffer::new(
+            &self.allocator,
+            instances,
+            vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::INDIRECT_BUFFER
+                | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+            vk_mem::MemoryUsage::AutoPreferDevice,
+        );
+
+        let indirect_count_buffer = Buffer::new(
+            &self.allocator,
+            1,
+            vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::INDIRECT_BUFFER
+                | vk::BufferUsageFlags::TRANSFER_DST
+                | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+            vk_mem::MemoryUsage::AutoPreferDevice,
+        );
+
+        self.device
+            .wait_for_fences(&[self.staging_fence], true, u64::MAX)
+            .unwrap();
+        self.device.reset_fences(&[self.staging_fence]).unwrap();
+
+        self.device
+            .reset_command_buffer(
+                self.staging_cmd_buffer,
+                vk::CommandBufferResetFlags::empty(),
+            )
+            .unwrap();
+        self.device
+            .begin_command_buffer(
+                self.staging_cmd_buffer,
+                &vk::CommandBufferBeginInfo::default(),
+            )
+            .unwrap();
+
+        // Upload.
+        self.staging_buffer.reset();
+        self.staging_buffer.stage_buffer(
+            &self.device,
+            self.staging_cmd_buffer,
+            &index_buffer,
+            0,
+            indices,
+        );
+        for (id, vertices) in &new_meshes {
+            self.staging_buffer.stage_buffer(
+                &self.device,
+                self.staging_cmd_buffer,
+                self.vertex_buffers.get(id).unwrap(),
+                0,
+                vertices,
+            );
+        }
+        self.staging_buffer.stage_buffer(
+            &self.device,
+            self.staging_cmd_buffer,
+            &meshlet_instance_buffer,
+            0,
+            meshlet_data,
+        );
+
+        self.device.cmd_fill_buffer(
+            self.staging_cmd_buffer,
+            visibility_buffer.vk_handle(),
+            0,
+            visibility_buffer.size() as u64,
+            1,
+        );
+
+        // Submit (& wait at end of function).
+        self.device
+            .end_command_buffer(self.staging_cmd_buffer)
+            .unwrap();
+        self.device
+            .queue_submit(
+                self.graphics_queue,
+                &[vk::SubmitInfo::default().command_buffers(&[self.staging_cmd_buffer])],
+                self.staging_fence,
+            )
+            .unwrap();
+
+        // Wait for transfer to complete before returning.
+        self.device
+            .wait_for_fences(&[self.staging_fence], true, u64::MAX)
+            .unwrap();
+
+        // Scene is ready, push.
+        self.scene_resources.push(SceneResources {
+            visibility_buffer,
+            index_buffer,
+            object_instance_buffer,
+            meshlet_instance_buffer,
+            indirect_cmd_buffer,
+            indirect_count_buffer,
+        });
+    }
+
+    unsafe fn rebuild_swapchain(&mut self) {
+        // If swapchain resources already exist, in-flight frames may still be
+        // using their depth/HZB views through descriptors. Swapchain rebuilds are
+        // rare, so wait for every FIF before replacing this resource group.
+        if let Some(swapchain_resources) = &self.swapchain_resources {
+            let fences: [_; MAX_FRAMES_IN_FLIGHT] =
+                std::array::from_fn(|i| swapchain_resources.sync_primitives[i].frame_in_flight);
+            self.device
+                .wait_for_fences(&fences, true, u64::MAX)
+                .unwrap();
+        }
+
+        // Free the previous SwapchainResources.
+        if let Some(swapchain_resources) = self.swapchain_resources.take() {
+            swapchain_resources.free(&self.device, &self.allocator, self.cmd_pool);
+        }
+
         use vk_mem::Alloc;
         let vk::Extent2D { width, height, .. } = self.core.surface_extent;
         let hzb_width = width.div_ceil(2);
@@ -1525,7 +1675,7 @@ impl Renderer {
             )
             .unwrap();
 
-        let hzb_build_src_views = (0..mipmaps)
+        let hzb_build_src_views: Box<[vk::ImageView]> = (0..mipmaps)
             .into_iter()
             .map(|level| {
                 self.device
@@ -1547,7 +1697,7 @@ impl Renderer {
             })
             .collect();
 
-        let hzb_build_dst_views = (0..mipmaps)
+        let hzb_build_dst_views: Box<[vk::ImageView]> = (0..mipmaps)
             .into_iter()
             .map(|level| {
                 self.device
@@ -1569,123 +1719,151 @@ impl Renderer {
             })
             .collect();
 
-        let frame = Scene {
-            hzb_image,
-            _hzb_alloc: hzb_alloc,
-            _hzb_test_view: hzb_test_view,
-            hzb_build_src_views,
-            hzb_build_dst_views,
+        let render_finished = (0..self.swapchain.images.len())
+            .into_iter()
+            .map(|_| {
+                self.device
+                    .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+                    .unwrap()
+            })
+            .collect();
 
-            visibility_buffer: Buffer::new(
-                &self.allocator,
-                instances,
-                vk::BufferUsageFlags::STORAGE_BUFFER
-                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
-                    | vk::BufferUsageFlags::TRANSFER_DST,
-                vk_mem::MemoryUsage::AutoPreferDevice,
-            ),
+        let sync_primitives = std::array::from_fn(|_| FrameSyncPrimitives {
+            image_available: self
+                .device
+                .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+                .unwrap(),
+            frame_in_flight: self
+                .device
+                .create_fence(
+                    &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+                    None,
+                )
+                .unwrap(),
+        });
 
-            index_buffer: Buffer::new(
-                &self.allocator,
-                indices.len() as u32,
-                vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-                vk_mem::MemoryUsage::AutoPreferDevice,
-            ),
+        // Per-frame recorded render buffers.
+        let cmd_buffers = std::array::from_fn(|_| {
+            self.device
+                .allocate_command_buffers(
+                    &vk::CommandBufferAllocateInfo::default()
+                        .command_pool(self.cmd_pool)
+                        .level(vk::CommandBufferLevel::PRIMARY)
+                        .command_buffer_count(MAX_PIPELINE_STAGES as _),
+                )
+                .unwrap()
+                .try_into()
+                .unwrap()
+        });
 
-            object_instance_buffer: Buffer::new(
-                &self.allocator,
-                self.objects.len() as u32,
-                vk::BufferUsageFlags::STORAGE_BUFFER
-                    | vk::BufferUsageFlags::TRANSFER_DST
-                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-                vk_mem::MemoryUsage::AutoPreferDevice,
-            ),
+        // Create depth attachment for rendering.
+        let depth_images = std::array::from_fn(|_| {
+            use vk_mem::Alloc;
+            self.allocator
+                .create_image(
+                    &vk::ImageCreateInfo::default()
+                        .image_type(vk::ImageType::TYPE_2D)
+                        .extent(
+                            vk::Extent3D::default()
+                                .width(self.core.surface_extent.width)
+                                .height(self.core.surface_extent.height)
+                                .depth(1),
+                        )
+                        .mip_levels(1)
+                        .array_layers(1)
+                        .samples(vk::SampleCountFlags::TYPE_1)
+                        .format(vk::Format::D32_SFLOAT)
+                        .usage(
+                            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
+                                | vk::ImageUsageFlags::SAMPLED,
+                        ),
+                    &vk_mem::AllocationCreateInfo {
+                        required_flags: vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+        });
 
-            meshlet_instance_buffer: Buffer::new(
-                &self.allocator,
-                instances,
-                vk::BufferUsageFlags::STORAGE_BUFFER
-                    | vk::BufferUsageFlags::TRANSFER_DST
-                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-                vk_mem::MemoryUsage::AutoPreferDevice,
-            ),
+        let depth_views = std::array::from_fn(|i| {
+            self.device
+                .create_image_view(
+                    &vk::ImageViewCreateInfo::default()
+                        .image(depth_images[i].0)
+                        .view_type(vk::ImageViewType::TYPE_2D)
+                        .format(vk::Format::D32_SFLOAT)
+                        .subresource_range(vk::ImageSubresourceRange {
+                            aspect_mask: vk::ImageAspectFlags::DEPTH,
+                            base_mip_level: 0,
+                            level_count: 1,
+                            base_array_layer: 0,
+                            layer_count: 1,
+                        }),
+                    None,
+                )
+                .unwrap()
+        });
 
-            indirect_cmd_buffer: Buffer::new(
-                &self.allocator,
-                instances,
-                vk::BufferUsageFlags::STORAGE_BUFFER
-                    | vk::BufferUsageFlags::INDIRECT_BUFFER
-                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-                vk_mem::MemoryUsage::AutoPreferDevice,
-            ),
+        let hzb_src_infos: Box<_> = hzb_build_src_views
+            .iter()
+            .map(|&image_view| {
+                vk::DescriptorImageInfo::default()
+                    .image_view(image_view)
+                    .sampler(self.hzb_sampler)
+                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            })
+            .collect();
 
-            indirect_count_buffer: Buffer::new(
-                &self.allocator,
-                1,
-                vk::BufferUsageFlags::STORAGE_BUFFER
-                    | vk::BufferUsageFlags::INDIRECT_BUFFER
-                    | vk::BufferUsageFlags::TRANSFER_DST
-                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-                vk_mem::MemoryUsage::AutoPreferDevice,
-            ),
+        let hzb_dst_infos: Box<_> = hzb_build_dst_views
+            .iter()
+            .map(|&image_view| {
+                vk::DescriptorImageInfo::default()
+                    .image_view(image_view)
+                    .image_layout(vk::ImageLayout::GENERAL)
+            })
+            .collect();
 
-            frame_global_buffer: Buffer::new(
-                &self.allocator,
-                1,
-                vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
-                vk_mem::MemoryUsage::AutoPreferDevice,
-            ),
-        };
+        let depth_infos = [
+            vk::DescriptorImageInfo::default()
+                .image_view(depth_views[0])
+                .sampler(self.hzb_sampler)
+                .image_layout(vk::ImageLayout::DEPTH_READ_ONLY_OPTIMAL),
+            vk::DescriptorImageInfo::default()
+                .image_view(depth_views[1])
+                .sampler(self.hzb_sampler)
+                .image_layout(vk::ImageLayout::DEPTH_READ_ONLY_OPTIMAL),
+        ];
 
-        self.device
-            .reset_command_buffer(
-                self.staging_cmd_buffer,
-                vk::CommandBufferResetFlags::empty(),
-            )
-            .unwrap();
-        self.device
-            .begin_command_buffer(
-                self.staging_cmd_buffer,
-                &vk::CommandBufferBeginInfo::default(),
-            )
-            .unwrap();
-
-        // Upload.
-        //
-        self.staging_buffer.reset();
-        self.staging_buffer.stage_buffer(
-            &self.device,
-            self.staging_cmd_buffer,
-            &frame.index_buffer,
-            0,
-            indices,
+        // Write the depth buffers to index 0 & 1, followed by HZB mips.
+        // This is safe because all FIF are done.
+        self.device.update_descriptor_sets(
+            &[
+                vk::WriteDescriptorSet::default()
+                    .dst_set(self.global_set)
+                    .dst_binding(0)
+                    .dst_array_element(0)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .descriptor_count(depth_infos.len() as u32)
+                    .image_info(&depth_infos),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(self.global_set)
+                    .dst_binding(0)
+                    .dst_array_element(depth_infos.len() as u32)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .descriptor_count(hzb_src_infos.len() as u32)
+                    .image_info(&hzb_src_infos),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(self.global_set)
+                    .dst_binding(1)
+                    .dst_array_element(0)
+                    .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                    .descriptor_count(hzb_dst_infos.len() as u32)
+                    .image_info(&hzb_dst_infos),
+            ],
+            &[],
         );
-        for (id, vertices) in &new_meshes {
-            self.staging_buffer.stage_buffer(
-                &self.device,
-                self.staging_cmd_buffer,
-                self.vertex_buffers.get(id).unwrap(),
-                0,
-                vertices,
-            );
-        }
-        self.staging_buffer.stage_buffer(
-            &self.device,
-            self.staging_cmd_buffer,
-            &frame.meshlet_instance_buffer,
-            0,
-            meshlet_data,
-        );
 
-        self.device.cmd_fill_buffer(
-            self.staging_cmd_buffer,
-            frame.visibility_buffer.vk_handle(),
-            0,
-            frame.visibility_buffer.size() as u64,
-            1,
-        );
-
-        // Rerecord scene command buffers.
+        // Transition some of the resouces we just made.
         {
             // Start with hzb transition.
             let mut tmp = vec![
@@ -1714,7 +1892,7 @@ impl Renderer {
                         vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
                             | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
                     )
-                    .image(self.depth_images[i].0)
+                    .image(depth_images[i].0)
                     .subresource_range(
                         vk::ImageSubresourceRange::default()
                             .aspect_mask(vk::ImageAspectFlags::DEPTH)
@@ -1728,92 +1906,59 @@ impl Renderer {
                     .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
             }));
 
-            // Queue transitions.
+            /* Write command buffer and queue. */
+            self.device
+                .wait_for_fences(&[self.staging_fence], true, u64::MAX)
+                .unwrap();
+            self.device.reset_fences(&[self.staging_fence]).unwrap();
+
+            self.device
+                .reset_command_buffer(
+                    self.staging_cmd_buffer,
+                    vk::CommandBufferResetFlags::empty(),
+                )
+                .unwrap();
+            self.device
+                .begin_command_buffer(
+                    self.staging_cmd_buffer,
+                    &vk::CommandBufferBeginInfo::default(),
+                )
+                .unwrap();
             self.device.cmd_pipeline_barrier2(
                 self.staging_cmd_buffer,
                 &vk::DependencyInfo::default().image_memory_barriers(&tmp),
-            )
+            );
+            self.device
+                .end_command_buffer(self.staging_cmd_buffer)
+                .unwrap();
+
+            self.device
+                .queue_submit(
+                    self.graphics_queue,
+                    &[vk::SubmitInfo::default().command_buffers(&[self.staging_cmd_buffer])],
+                    self.staging_fence,
+                )
+                .unwrap();
         };
-
-        // Submit (& wait at end of function).
-        self.device
-            .end_command_buffer(self.staging_cmd_buffer)
-            .unwrap();
-        self.device.reset_fences(&[self.staging_fence]).unwrap();
-        self.device
-            .queue_submit(
-                self.graphics_queue,
-                &[vk::SubmitInfo::default().command_buffers(&[self.staging_cmd_buffer])],
-                self.staging_fence,
-            )
-            .unwrap();
-
-        // TODO: this will NOT work with scene regeneration...
-        // We can only regenerate these when the fif is not using them.
-        {
-            /* global_set part: */
-            let global_set_0_info: Box<_> = (0..mipmaps)
-                .into_iter()
-                .map(|i| {
-                    vk::DescriptorImageInfo::default()
-                        .image_view(frame.hzb_build_src_views[i as usize])
-                        .sampler(self.hzb_sampler)
-                        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                })
-                .collect();
-
-            let global_set_1_info: Box<_> = (0..mipmaps)
-                .into_iter()
-                .map(|i| {
-                    vk::DescriptorImageInfo::default()
-                        .image_view(frame.hzb_build_dst_views[i as usize])
-                        .image_layout(vk::ImageLayout::GENERAL)
-                })
-                .collect();
-
-            let mut tmp = vec![
-                vk::WriteDescriptorSet::default()
-                    .dst_set(self.global_set)
-                    .dst_binding(0)
-                    .dst_array_element(2)
-                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                    .descriptor_count(global_set_0_info.len() as u32)
-                    .image_info(&global_set_0_info),
-                vk::WriteDescriptorSet::default()
-                    .dst_set(self.global_set)
-                    .dst_binding(1)
-                    .dst_array_element(0)
-                    .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                    .descriptor_count(global_set_1_info.len() as u32)
-                    .image_info(&global_set_1_info),
-            ];
-
-            /* frame globals part: */
-            let frame_set_info = [vk::DescriptorBufferInfo::default()
-                .buffer(frame.frame_global_buffer.vk_handle())
-                .offset(0)
-                .range(vk::WHOLE_SIZE)];
-
-            tmp.extend((0..MAX_FRAMES_IN_FLIGHT).into_iter().map(|i| {
-                vk::WriteDescriptorSet::default()
-                    .dst_set(self.frame_sets[i])
-                    .dst_binding(0)
-                    .dst_array_element(0)
-                    .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                    .descriptor_count(1)
-                    .buffer_info(&frame_set_info)
-            }));
-
-            /* What a mess */
-            self.device.update_descriptor_sets(&tmp, &[]);
-        }
 
         // Wait for transfer to complete before returning.
         self.device
             .wait_for_fences(&[self.staging_fence], true, u64::MAX)
             .unwrap();
 
-        frame
+        self.swapchain_resources = Some(SwapchainResources {
+            hzb_image,
+            _hzb_alloc: hzb_alloc,
+            _hzb_test_view: hzb_test_view,
+            hzb_build_src_views,
+            _hzb_build_dst_views: hzb_build_dst_views,
+
+            render_finished,
+            sync_primitives,
+            cmd_buffers,
+            depth_images,
+            depth_views,
+        });
     }
 
     pub fn create_object(
@@ -1823,6 +1968,7 @@ impl Renderer {
         scale: f32,
         orientation: Quat,
     ) -> Option<ObjectHandle> {
+        self.scene_resources_dirty = true;
         let handle = ObjectHandle(self.resource_counter);
         self.resource_counter += 1;
         self.objects.insert(

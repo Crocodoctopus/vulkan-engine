@@ -13,7 +13,7 @@ pub(crate) struct Meshlet {
     pub indices: Box<[u8]>,
     pub positions: Box<[[i16; 3]]>,
     pub normals: Box<[[i8; 3]]>,
-    pub texcoords: Box<[[i16; 2]]>,
+    pub _texcoords: Box<[[i16; 2]]>,
 }
 
 pub(crate) fn load_mesh(filename: impl AsRef<Path>) -> Option<(f32, Box<[Meshlet]>)> {
@@ -44,7 +44,7 @@ pub(crate) fn load_mesh(filename: impl AsRef<Path>) -> Option<(f32, Box<[Meshlet
         position: Vec3,
         normal: Vec3,
         uv: Vec2,
-        color: Vec3,
+        _color: Vec3,
     }
 
     impl meshopt::DecodePosition for Vertex {
@@ -95,7 +95,7 @@ pub(crate) fn load_mesh(filename: impl AsRef<Path>) -> Option<(f32, Box<[Meshlet
             position: positions[i],
             normal: normals[i],
             uv: uvs.get(i).cloned().unwrap_or_default(),
-            color: Vec3::splat(1.0),
+            _color: Vec3::splat(1.0),
         })
         .collect();
 
@@ -151,7 +151,7 @@ pub(crate) fn load_mesh(filename: impl AsRef<Path>) -> Option<(f32, Box<[Meshlet
                             .map(|e| e as i8)
                     })
                     .collect(),
-                texcoords: meshlet
+                _texcoords: meshlet
                     .vertices
                     .iter()
                     .map(|&i| {

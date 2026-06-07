@@ -70,6 +70,7 @@ fn main() {
             Quat::from_euler(EulerRot::XYZ, std::f32::consts::PI, 0.0, 0.0),
         )
         .unwrap();
+    let mut bunny_count = 1_u32;
     /*let bunny_obj3 = renderer
     .create_object(
         bunny_mesh,
@@ -117,15 +118,33 @@ fn main() {
                     ..
                 } => {
                     // Skip repeats.
-                    let var = match key {
-                        KeyCode::KeyW => &mut w_down,
-                        KeyCode::KeyA => &mut a_down,
-                        KeyCode::KeyS => &mut s_down,
-                        KeyCode::KeyD => &mut d_down,
-                        KeyCode::KeyQ => &mut q_down,
-                        KeyCode::KeyE => &mut e_down,
-                        _ => return,
-                    };
+	                    let var = match key {
+	                        KeyCode::KeyW => &mut w_down,
+	                        KeyCode::KeyA => &mut a_down,
+	                        KeyCode::KeyS => &mut s_down,
+	                        KeyCode::KeyD => &mut d_down,
+	                        KeyCode::KeyQ => &mut q_down,
+	                        KeyCode::KeyE => &mut e_down,
+	                        KeyCode::KeyZ if state == ElementState::Pressed => {
+	                            let i = bunny_count;
+	                            bunny_count += 1;
+	                            renderer
+	                                .create_object(
+	                                    bunny,
+	                                    Vec3::new(1.0 + 0.55 * i as f32, 0.4, 0.0),
+	                                    2.0,
+	                                    Quat::from_euler(
+	                                        EulerRot::XYZ,
+	                                        std::f32::consts::PI,
+	                                        0.0,
+	                                        0.0,
+	                                    ),
+	                                )
+	                                .unwrap();
+	                            return;
+	                        }
+	                        _ => return,
+	                    };
 
                     match state {
                         ElementState::Pressed => *var = true,
