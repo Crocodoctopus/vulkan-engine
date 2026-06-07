@@ -25,8 +25,24 @@ pub(super) struct Object {
     pub orientation: Quat,
 }
 
+const fn const_max<const N: usize>(values: [usize; N]) -> usize {
+    let mut i = 0;
+    let mut max = 0;
+
+    while i < N {
+      if values[i] > max {
+          max = values[i];
+      }
+      i += 1;
+    }
+
+    max
+}
+
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
-const STARTING_FRAME: usize = MAX_FRAMES_IN_FLIGHT;
+const VISIBILITY_DEPTH: usize = 2;
+const VISIBILITY_BUFFER_COUNT: usize = VISIBILITY_DEPTH + 1;
+const STARTING_FRAME: usize = const_max([MAX_FRAMES_IN_FLIGHT, VISIBILITY_DEPTH]);
 
 /*
 Plan:
@@ -113,7 +129,6 @@ impl SwapchainResources {
 
 /* Resources that need regeneration when object set changes */
 struct SceneResources {
-    visibility_buffer: Buffer<[u32]>,
     indirect_cmd_buffer: Buffer<[vk::DrawIndexedIndirectCommand]>,
     indirect_count_buffer: Buffer<u32>,
 
@@ -125,9 +140,6 @@ struct SceneResources {
 
 impl SceneResources {
     unsafe fn free(self, allocator: &vk_mem::Allocator) {
-        // Almost certainly this is wrong
-        self.visibility_buffer.destroy(&allocator);
-
         self.index_buffer.destroy(&allocator);
         self.object_instance_buffer.destroy(&allocator);
         self.meshlet_instance_buffer.destroy(&allocator);
@@ -191,6 +203,11 @@ pub struct Renderer {
 
     // Used for sequencing stages, and other cross-frame syncing.
     pipeline_semaphore: vk::Semaphore,
+
+    // Visibility is shared across frames; replaced buffers retire once no
+    // submitted frustum copy can reference them.
+    visibility_buffers: [Buffer<[u32]>; VISIBILITY_BUFFER_COUNT],
+    visibility_buffer_retire_list: Vec<(u64, Buffer<[u32]>)>,
 
     // Dirty flags for resource regeneration.
     swapchain_resources_dirty: bool,
@@ -780,6 +797,8 @@ impl Renderer {
                 frame_global_buffers,
 
                 pipeline_semaphore,
+                visibility_buffers: std::array::from_fn(|_| Buffer::null()),
+                visibility_buffer_retire_list: Vec::new(),
 
                 swapchain_resources_dirty: true,
                 scene_resources_dirty: true,
@@ -823,6 +842,25 @@ impl Renderer {
             );
         }
 
+        // Try to clean up old visibility buffers.
+        let completed_stage = unsafe {
+            self.device
+                .get_semaphore_counter_value(self.pipeline_semaphore)
+                .unwrap()
+        };
+        let allocator = &self.allocator;
+        self.visibility_buffer_retire_list
+            .retain_mut(|(retire_after, buffer)| {
+                if completed_stage >= *retire_after {
+                    unsafe {
+                        buffer.take().destroy(allocator);
+                    }
+                    false
+                } else {
+                    true
+                }
+            });
+
         // Attempt to clean old scenes:
         let mut scene_resources = vec![self.scene_resources.pop().unwrap()];
         while let Some(scene) = self.scene_resources.pop() {
@@ -848,7 +886,6 @@ impl Renderer {
         self.scene_resources = scene_resources;
 
         let SceneResources {
-            visibility_buffer,
             indirect_cmd_buffer,
             indirect_count_buffer,
             index_buffer,
@@ -882,6 +919,33 @@ impl Renderer {
         let frame_global_buffer = &self.frame_global_buffers[frame_index];
 
         unsafe {
+            let visibility_index = frame_count % VISIBILITY_BUFFER_COUNT;
+            let last_visibility_index = (frame_count - VISIBILITY_DEPTH) % VISIBILITY_BUFFER_COUNT;
+            if self.visibility_buffers[visibility_index].len() < meshlet_instance_buffer.len() {
+                let old_buffer = std::mem::replace(
+                    &mut self.visibility_buffers[visibility_index],
+                    Buffer::null(),
+                );
+                if !old_buffer.is_null() {
+                    self.visibility_buffer_retire_list.push((
+                        PipelineStage::FrustumCull.done_value(frame_count - 1),
+                        old_buffer,
+                    ));
+                }
+
+                self.visibility_buffers[visibility_index] = Buffer::<[u32]>::new(
+                    &self.allocator,
+                    meshlet_instance_buffer.len(),
+                    vk::BufferUsageFlags::STORAGE_BUFFER
+                        | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+                        | vk::BufferUsageFlags::TRANSFER_SRC
+                        | vk::BufferUsageFlags::TRANSFER_DST,
+                    vk_mem::MemoryUsage::AutoPreferDevice,
+                );
+            }
+            let visibility_buffer = &self.visibility_buffers[visibility_index];
+            let last_visibility_buffer = &self.visibility_buffers[last_visibility_index];
+
             // TODO: keep this here? Its a per-fif variable.
             let depth_view = depth_views[frame_index];
 
@@ -1028,6 +1092,49 @@ impl Renderer {
             });
 
             cmd_buffer_record(&self.device, frustum_cull, |cmd| {
+                // Copy visibility history into the current frame's buffer.
+                let visibility_copy_size =
+                    visibility_buffer.size().min(last_visibility_buffer.size());
+                if visibility_copy_size > 0 {
+                    self.device.cmd_copy_buffer(
+                        cmd,
+                        last_visibility_buffer.vk_handle(),
+                        visibility_buffer.vk_handle(),
+                        &[vk::BufferCopy::default()
+                            .src_offset(0)
+                            .dst_offset(0)
+                            .size(visibility_copy_size as u64)],
+                    );
+                }
+
+                // TMP: start newly appended visibility entries as visible for testing.
+                if visibility_copy_size < visibility_buffer.size() {
+                    self.device.cmd_fill_buffer(
+                        cmd,
+                        visibility_buffer.vk_handle(),
+                        visibility_copy_size as u64,
+                        (visibility_buffer.size() - visibility_copy_size) as u64,
+                        1,
+                    );
+                }
+
+                self.device.cmd_pipeline_barrier2(
+                    cmd,
+                    &vk::DependencyInfo::default().buffer_memory_barriers(&[
+                        vk::BufferMemoryBarrier2::default()
+                            .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+                            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                            .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                            .dst_access_mask(
+                                vk::AccessFlags2::SHADER_STORAGE_READ
+                                    | vk::AccessFlags2::SHADER_STORAGE_WRITE,
+                            )
+                            .buffer(visibility_buffer.vk_handle())
+                            .offset(0)
+                            .size(visibility_buffer.size() as u64),
+                    ]),
+                );
+
                 self.device.cmd_bind_descriptor_sets(
                     cmd,
                     vk::PipelineBindPoint::COMPUTE,
@@ -1370,10 +1477,16 @@ impl Renderer {
                         .command_buffer_infos(&[
                             vk::CommandBufferSubmitInfo::default().command_buffer(frustum_cull)
                         ])
-                        .wait_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
-                            .semaphore(self.pipeline_semaphore)
-                            .value(PipelineStage::FrustumCull.start_value(frame_count))
-                            .stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)])
+                        .wait_semaphore_infos(&[
+                            vk::SemaphoreSubmitInfo::default()
+                                .semaphore(self.pipeline_semaphore)
+                                .value(PipelineStage::FrustumCull.start_value(frame_count))
+                                .stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER),
+                            vk::SemaphoreSubmitInfo::default()
+                                .semaphore(self.pipeline_semaphore)
+                                .value(PipelineStage::FrameEnd.done_value(frame_count - VISIBILITY_DEPTH))
+                                .stage_mask(vk::PipelineStageFlags2::TRANSFER),
+                        ])
                         .signal_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
                             .semaphore(self.pipeline_semaphore)
                             .value(PipelineStage::FrustumCull.done_value(frame_count))
@@ -1514,15 +1627,6 @@ impl Renderer {
             }
         }
 
-        let visibility_buffer = Buffer::<[u32]>::new(
-            &self.allocator,
-            instances,
-            vk::BufferUsageFlags::STORAGE_BUFFER
-                | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
-                | vk::BufferUsageFlags::TRANSFER_DST,
-            vk_mem::MemoryUsage::AutoPreferDevice,
-        );
-
         let index_buffer = Buffer::<[u32]>::new(
             &self.allocator,
             indices.len() as u32,
@@ -1610,14 +1714,6 @@ impl Renderer {
             meshlet_data,
         );
 
-        self.device.cmd_fill_buffer(
-            self.staging_cmd_buffer,
-            visibility_buffer.vk_handle(),
-            0,
-            visibility_buffer.size() as u64,
-            1,
-        );
-
         // Submit (& wait at end of function).
         self.device
             .end_command_buffer(self.staging_cmd_buffer)
@@ -1637,7 +1733,6 @@ impl Renderer {
 
         // Scene is ready, push.
         self.scene_resources.push(SceneResources {
-            visibility_buffer,
             index_buffer,
             object_instance_buffer,
             meshlet_instance_buffer,
