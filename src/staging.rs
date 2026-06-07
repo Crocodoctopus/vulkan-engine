@@ -44,11 +44,11 @@ impl StagingBuffer {
         self.head = self.base;
     }
 
-    pub unsafe fn stage_buffer<T: Clone>(
+    pub unsafe fn stage_buffer<T: Clone, B: ?Sized>(
         &mut self,
         device: &ash::Device,
         cmd_buffer: vk::CommandBuffer,
-        dst: &Buffer<T>,
+        dst: &Buffer<B>,
         offset: u64,
         data: impl IntoIterator<Item = impl Borrow<T>>,
     ) {

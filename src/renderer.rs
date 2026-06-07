@@ -112,14 +112,14 @@ impl SwapchainResources {
 
 /* Resources that need regeneration when object set changes */
 struct SceneResources {
-    visibility_buffer: Buffer<u32>,
-    indirect_cmd_buffer: Buffer<vk::DrawIndexedIndirectCommand>,
+    visibility_buffer: Buffer<[u32]>,
+    indirect_cmd_buffer: Buffer<[vk::DrawIndexedIndirectCommand]>,
     indirect_count_buffer: Buffer<u32>,
 
     /* TODO: These are static after creation */
-    index_buffer: Buffer<u32>,
-    object_instance_buffer: Buffer<GpuObjectInstance>,
-    meshlet_instance_buffer: Buffer<GpuMeshletInstance>,
+    index_buffer: Buffer<[u32]>,
+    object_instance_buffer: Buffer<[GpuObjectInstance]>,
+    meshlet_instance_buffer: Buffer<[GpuMeshletInstance]>,
 }
 
 impl SceneResources {
@@ -171,7 +171,7 @@ pub struct Renderer {
     resource_counter: u32,
     meshes: HashMap<MeshHandle, (f32, Box<[Meshlet]>)>,
     objects: Vec<(ObjectHandle, Object)>,
-    vertex_buffers: HashMap<MeshHandle, Buffer<GpuVertex>>,
+    vertex_buffers: HashMap<MeshHandle, Buffer<[GpuVertex]>>,
 
     /* Staging: */
     staging_buffer: StagingBuffer,
@@ -675,9 +675,8 @@ impl Renderer {
             });
 
             let frame_global_buffers = std::array::from_fn(|_| {
-                Buffer::new(
+                Buffer::<FrameGlobal>::new(
                     &allocator,
-                    1,
                     vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
                     vk_mem::MemoryUsage::AutoPreferDevice,
                 )
@@ -989,7 +988,7 @@ impl Renderer {
                             &vk::BufferDeviceAddressInfo::default()
                                 .buffer(object_instance_buffer.vk_handle()),
                         ),
-                        instances: indirect_cmd_buffer.len,
+                        instances: indirect_cmd_buffer.len(),
                     }],
                 );
                 self.staging_buffer.stage_buffer(
@@ -1443,7 +1442,7 @@ impl Renderer {
         for (id, vertices) in &new_meshes {
             self.vertex_buffers.insert(
                 *id,
-                Buffer::new(
+                Buffer::<[GpuVertex]>::new(
                     &self.allocator,
                     vertices.len() as u32,
                     vk::BufferUsageFlags::VERTEX_BUFFER
@@ -1488,7 +1487,7 @@ impl Renderer {
             }
         }
 
-        let visibility_buffer = Buffer::new(
+        let visibility_buffer = Buffer::<[u32]>::new(
             &self.allocator,
             instances,
             vk::BufferUsageFlags::STORAGE_BUFFER
@@ -1497,14 +1496,14 @@ impl Renderer {
             vk_mem::MemoryUsage::AutoPreferDevice,
         );
 
-        let index_buffer = Buffer::new(
+        let index_buffer = Buffer::<[u32]>::new(
             &self.allocator,
             indices.len() as u32,
             vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
             vk_mem::MemoryUsage::AutoPreferDevice,
         );
 
-        let object_instance_buffer = Buffer::new(
+        let object_instance_buffer = Buffer::<[GpuObjectInstance]>::new(
             &self.allocator,
             self.objects.len() as u32,
             vk::BufferUsageFlags::STORAGE_BUFFER
@@ -1513,7 +1512,7 @@ impl Renderer {
             vk_mem::MemoryUsage::AutoPreferDevice,
         );
 
-        let meshlet_instance_buffer = Buffer::new(
+        let meshlet_instance_buffer = Buffer::<[GpuMeshletInstance]>::new(
             &self.allocator,
             instances,
             vk::BufferUsageFlags::STORAGE_BUFFER
@@ -1522,7 +1521,7 @@ impl Renderer {
             vk_mem::MemoryUsage::AutoPreferDevice,
         );
 
-        let indirect_cmd_buffer = Buffer::new(
+        let indirect_cmd_buffer = Buffer::<[vk::DrawIndexedIndirectCommand]>::new(
             &self.allocator,
             instances,
             vk::BufferUsageFlags::STORAGE_BUFFER
@@ -1531,9 +1530,8 @@ impl Renderer {
             vk_mem::MemoryUsage::AutoPreferDevice,
         );
 
-        let indirect_count_buffer = Buffer::new(
+        let indirect_count_buffer = Buffer::<u32>::new(
             &self.allocator,
-            1,
             vk::BufferUsageFlags::STORAGE_BUFFER
                 | vk::BufferUsageFlags::INDIRECT_BUFFER
                 | vk::BufferUsageFlags::TRANSFER_DST
@@ -1569,12 +1567,12 @@ impl Renderer {
             indices,
         );
         for (id, vertices) in &new_meshes {
-            self.staging_buffer.stage_buffer(
+            self.staging_buffer.stage_buffer::<GpuVertex, [GpuVertex]>(
                 &self.device,
                 self.staging_cmd_buffer,
                 self.vertex_buffers.get(id).unwrap(),
                 0,
-                vertices,
+                vertices.iter(),
             );
         }
         self.staging_buffer.stage_buffer(
