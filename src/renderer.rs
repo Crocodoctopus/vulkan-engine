@@ -17,12 +17,6 @@ pub struct MeshHandle(u32);
 #[derive(Copy, Clone, Hash, Eq, PartialEq, Debug)]
 pub struct ObjectHandle(u32);
 
-#[derive(Copy, Clone, Default, Debug)]
-struct FrameSyncPrimitives {
-    image_available: vk::Semaphore,
-    frame_in_flight: vk::Fence,
-}
-
 #[derive(Debug)]
 pub(super) struct Object {
     pub mesh: MeshHandle,
@@ -49,10 +43,20 @@ enum PipelineStage {
     FrustumCull,
     FirstDraw,
     BuildHzb,
-    COUNT,
+    FrameEnd,
 }
 
-const MAX_PIPELINE_STAGES: usize = PipelineStage::COUNT as usize;
+impl PipelineStage {
+    const COUNT: usize = Self::FrameEnd as usize + 1;
+
+    const fn start_value(self, frame: usize) -> u64 {
+        frame as u64 * Self::COUNT as u64 + self as u64
+    }
+
+    const fn done_value(self, frame: usize) -> u64 {
+        self.start_value(frame) + 1
+    }
+}
 
 /* Resources that need regeneration when Swapchain changes */
 struct SwapchainResources {
@@ -64,8 +68,8 @@ struct SwapchainResources {
     _hzb_build_dst_views: Box<[vk::ImageView]>,
 
     render_finished: Box<[vk::Semaphore]>,
-    sync_primitives: [FrameSyncPrimitives; MAX_FRAMES_IN_FLIGHT],
-    cmd_buffers: [[vk::CommandBuffer; MAX_PIPELINE_STAGES]; MAX_FRAMES_IN_FLIGHT],
+    image_acquired_semaphores: [vk::Semaphore; MAX_FRAMES_IN_FLIGHT],
+    cmd_buffers: [[vk::CommandBuffer; PipelineStage::COUNT]; MAX_FRAMES_IN_FLIGHT],
     depth_images: [(vk::Image, vk_mem::Allocation); MAX_FRAMES_IN_FLIGHT],
     depth_views: [vk::ImageView; MAX_FRAMES_IN_FLIGHT],
 }
@@ -89,9 +93,8 @@ impl SwapchainResources {
         for semaphore in self.render_finished {
             device.destroy_semaphore(semaphore, None);
         }
-        for sync in self.sync_primitives {
-            device.destroy_semaphore(sync.image_available, None);
-            device.destroy_fence(sync.frame_in_flight, None);
+        for semaphore in self.image_acquired_semaphores {
+            device.destroy_semaphore(semaphore, None);
         }
 
         for cmd_buffers in self.cmd_buffers {
@@ -212,6 +215,17 @@ impl Drop for Renderer {
 }
 
 impl Renderer {
+    unsafe fn wait_for_pipeline_stage(&self, frame: usize, stage: PipelineStage) {
+        self.device
+            .wait_semaphores(
+                &vk::SemaphoreWaitInfo::default()
+                    .semaphores(&[self.pipeline_semaphore])
+                    .values(&[stage.start_value(frame)]),
+                u64::MAX,
+            )
+            .unwrap();
+    }
+
     pub fn new(
         cwd: impl AsRef<Path>,
         viewport_w: u32,
@@ -766,18 +780,29 @@ impl Renderer {
         let frame_count = self.frame;
         self.frame += 1;
 
+        // Wait if we have too many frames in flight.
+        if frame_count >= MAX_FRAMES_IN_FLIGHT {
+            unsafe {
+                self.wait_for_pipeline_stage(
+                    frame_count - MAX_FRAMES_IN_FLIGHT + 1,
+                    PipelineStage::DataUpload,
+                );
+            }
+        }
+
         // Attempt to clean old scenes:
         let mut scene_resources = vec![self.scene_resources.pop().unwrap()];
         while let Some(scene) = self.scene_resources.pop() {
-            let swapchain_resources = self.swapchain_resources.as_ref().unwrap();
-
-            let all_signalled =
-                swapchain_resources
-                    .sync_primitives
-                    .iter()
-                    .fold(true, |acc, syncs| unsafe {
-                        acc & self.device.get_fence_status(syncs.frame_in_flight).unwrap()
-                    });
+            let all_signalled = if frame_count == 0 {
+                false
+            } else {
+                unsafe {
+                    self.device
+                        .get_semaphore_counter_value(self.pipeline_semaphore)
+                        .unwrap()
+                        >= PipelineStage::FrameEnd.done_value(frame_count - 1)
+                }
+            };
 
             if all_signalled {
                 unsafe {
@@ -807,18 +832,14 @@ impl Renderer {
             hzb_image,
             hzb_build_src_views,
             render_finished,
-            sync_primitives,
+            image_acquired_semaphores,
             cmd_buffers,
             depth_images,
             depth_views,
             ..
         } = self.swapchain_resources.as_ref().unwrap();
 
-        // Sync primitives associated with this frame.
-        let FrameSyncPrimitives {
-            image_available,
-            frame_in_flight,
-        } = sync_primitives[frame_index];
+        let image_acquired = image_acquired_semaphores[frame_index];
 
         // Command buffer associated with this frame.
         let data_upload = cmd_buffers[frame_index][PipelineStage::DataUpload as usize];
@@ -832,12 +853,6 @@ impl Renderer {
         let frame_global_buffer = &self.frame_global_buffers[frame_index];
 
         unsafe {
-            // Wait for next image to become available.
-            self.device
-                .wait_for_fences(&[frame_in_flight], true, u64::MAX)
-                .unwrap();
-            self.device.reset_fences(&[frame_in_flight]).unwrap();
-
             // TODO: keep this here? Its a per-fif variable.
             let depth_view = depth_views[frame_index];
 
@@ -848,7 +863,7 @@ impl Renderer {
                 .acquire_next_image(
                     self.swapchain.swapchain,
                     u64::MAX,
-                    image_available,
+                    image_acquired,
                     vk::Fence::null(),
                 )
                 .unwrap();
@@ -1304,9 +1319,6 @@ impl Renderer {
             });
 
             // TODO: Submit all queues.
-            let subframe = |frame, subframe: PipelineStage| {
-                frame as u64 * MAX_PIPELINE_STAGES as u64 + subframe as u64
-            };
             self.device
                 .queue_submit2(
                     self.graphics_queue,
@@ -1316,11 +1328,11 @@ impl Renderer {
                         ])
                         .wait_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
                             .semaphore(self.pipeline_semaphore)
-                            .value(subframe(frame_count, PipelineStage::DataUpload))
+                            .value(PipelineStage::DataUpload.start_value(frame_count))
                             .stage_mask(vk::PipelineStageFlags2::TRANSFER)])
                         .signal_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
                             .semaphore(self.pipeline_semaphore)
-                            .value(subframe(frame_count, PipelineStage::DataUpload) + 1)
+                            .value(PipelineStage::DataUpload.done_value(frame_count))
                             .stage_mask(vk::PipelineStageFlags2::TRANSFER)])],
                     vk::Fence::null(),
                 )
@@ -1334,11 +1346,11 @@ impl Renderer {
                         ])
                         .wait_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
                             .semaphore(self.pipeline_semaphore)
-                            .value(subframe(frame_count, PipelineStage::FrustumCull))
+                            .value(PipelineStage::FrustumCull.start_value(frame_count))
                             .stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)])
                         .signal_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
                             .semaphore(self.pipeline_semaphore)
-                            .value(subframe(frame_count, PipelineStage::FrustumCull) + 1)
+                            .value(PipelineStage::FrustumCull.done_value(frame_count))
                             .stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)])],
                     vk::Fence::null(),
                 )
@@ -1352,17 +1364,17 @@ impl Renderer {
                         ])
                         .wait_semaphore_infos(&[
                             vk::SemaphoreSubmitInfo::default()
-                                .semaphore(image_available)
+                                .semaphore(image_acquired)
                                 .stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE),
                             vk::SemaphoreSubmitInfo::default()
                                 .semaphore(self.pipeline_semaphore)
-                                .value(subframe(frame_count, PipelineStage::FirstDraw))
+                                .value(PipelineStage::FirstDraw.start_value(frame_count))
                                 .stage_mask(vk::PipelineStageFlags2::DRAW_INDIRECT),
                         ])
                         .signal_semaphore_infos(&[
                             vk::SemaphoreSubmitInfo::default()
                                 .semaphore(self.pipeline_semaphore)
-                                .value(subframe(frame_count, PipelineStage::FirstDraw) + 1)
+                                .value(PipelineStage::FirstDraw.done_value(frame_count))
                                 .stage_mask(vk::PipelineStageFlags2::BOTTOM_OF_PIPE),
                             vk::SemaphoreSubmitInfo::default()
                                 .semaphore(render_finished)
@@ -1380,13 +1392,13 @@ impl Renderer {
                         ])
                         .wait_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
                             .semaphore(self.pipeline_semaphore)
-                            .value(subframe(frame_count, PipelineStage::BuildHzb))
+                            .value(PipelineStage::BuildHzb.start_value(frame_count))
                             .stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)])
                         .signal_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
                             .semaphore(self.pipeline_semaphore)
-                            .value(subframe(frame_count, PipelineStage::BuildHzb) + 1)
+                            .value(PipelineStage::FrameEnd.done_value(frame_count))
                             .stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)])],
-                    frame_in_flight,
+                    vk::Fence::null(),
                 )
                 .unwrap();
 
@@ -1613,12 +1625,8 @@ impl Renderer {
         // If swapchain resources already exist, in-flight frames may still be
         // using their depth/HZB views through descriptors. Swapchain rebuilds are
         // rare, so wait for every FIF before replacing this resource group.
-        if let Some(swapchain_resources) = &self.swapchain_resources {
-            let fences: [_; MAX_FRAMES_IN_FLIGHT] =
-                std::array::from_fn(|i| swapchain_resources.sync_primitives[i].frame_in_flight);
-            self.device
-                .wait_for_fences(&fences, true, u64::MAX)
-                .unwrap();
+        if self.swapchain_resources.is_some() && self.frame > 0 {
+            self.wait_for_pipeline_stage(self.frame, PipelineStage::DataUpload);
         }
 
         // Free the previous SwapchainResources.
@@ -1728,18 +1736,10 @@ impl Renderer {
             })
             .collect();
 
-        let sync_primitives = std::array::from_fn(|_| FrameSyncPrimitives {
-            image_available: self
-                .device
+        let image_acquired_semaphores = std::array::from_fn(|_| {
+            self.device
                 .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
-                .unwrap(),
-            frame_in_flight: self
-                .device
-                .create_fence(
-                    &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
-                    None,
-                )
-                .unwrap(),
+                .unwrap()
         });
 
         // Per-frame recorded render buffers.
@@ -1749,7 +1749,7 @@ impl Renderer {
                     &vk::CommandBufferAllocateInfo::default()
                         .command_pool(self.cmd_pool)
                         .level(vk::CommandBufferLevel::PRIMARY)
-                        .command_buffer_count(MAX_PIPELINE_STAGES as _),
+                        .command_buffer_count(PipelineStage::COUNT as _),
                 )
                 .unwrap()
                 .try_into()
@@ -1954,7 +1954,7 @@ impl Renderer {
             _hzb_build_dst_views: hzb_build_dst_views,
 
             render_finished,
-            sync_primitives,
+            image_acquired_semaphores,
             cmd_buffers,
             depth_images,
             depth_views,
