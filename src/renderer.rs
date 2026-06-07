@@ -26,6 +26,7 @@ pub(super) struct Object {
 }
 
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
+const STARTING_FRAME: usize = MAX_FRAMES_IN_FLIGHT;
 
 /*
 Plan:
@@ -592,6 +593,41 @@ impl Renderer {
                 )
                 .unwrap();
 
+            // The renderer starts at STARTING_FRAME so the steady-state render path
+            // can read the previous timestamp slot without startup branches.
+            device
+                .begin_command_buffer(staging_cmd_buffer, &vk::CommandBufferBeginInfo::default())
+                .unwrap();
+            device.cmd_reset_query_pool(
+                staging_cmd_buffer,
+                query_pool,
+                0,
+                MAX_FRAMES_IN_FLIGHT as u32 * 2,
+            );
+            for fif in 0..MAX_FRAMES_IN_FLIGHT {
+                device.cmd_write_timestamp(
+                    staging_cmd_buffer,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    query_pool,
+                    2 * fif as u32,
+                );
+                device.cmd_write_timestamp(
+                    staging_cmd_buffer,
+                    vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+                    query_pool,
+                    2 * fif as u32 + 1,
+                );
+            }
+            device.end_command_buffer(staging_cmd_buffer).unwrap();
+            device
+                .queue_submit(
+                    graphics_queue,
+                    &[vk::SubmitInfo::default().command_buffers(&[staging_cmd_buffer])],
+                    vk::Fence::null(),
+                )
+                .unwrap();
+            device.queue_wait_idle(graphics_queue).unwrap();
+
             //
             let global_descriptor_pool = device
                 .create_descriptor_pool(
@@ -631,7 +667,7 @@ impl Renderer {
                     &vk::SemaphoreCreateInfo::default().push_next(
                         &mut vk::SemaphoreTypeCreateInfo::default()
                             .semaphore_type(vk::SemaphoreType::TIMELINE)
-                            .initial_value(0),
+                            .initial_value(PipelineStage::DataUpload.start_value(STARTING_FRAME)),
                     ),
                     None,
                 )
@@ -751,7 +787,7 @@ impl Renderer {
                 swapchain_resources: None,
                 scene_resources: vec![],
 
-                frame: 0,
+                frame: STARTING_FRAME,
                 cam_pos: Vec3::new(0., 0., 3.),
                 cam_rot: <_>::default(),
             }
@@ -780,27 +816,21 @@ impl Renderer {
         self.frame += 1;
 
         // Wait if we have too many frames in flight.
-        if frame_count >= MAX_FRAMES_IN_FLIGHT {
-            unsafe {
-                self.wait_for_pipeline_stage(
-                    frame_count - MAX_FRAMES_IN_FLIGHT + 1,
-                    PipelineStage::DataUpload,
-                );
-            }
+        unsafe {
+            self.wait_for_pipeline_stage(
+                frame_count - MAX_FRAMES_IN_FLIGHT + 1,
+                PipelineStage::DataUpload,
+            );
         }
 
         // Attempt to clean old scenes:
         let mut scene_resources = vec![self.scene_resources.pop().unwrap()];
         while let Some(scene) = self.scene_resources.pop() {
-            let all_signalled = if frame_count == 0 {
-                false
-            } else {
-                unsafe {
-                    self.device
-                        .get_semaphore_counter_value(self.pipeline_semaphore)
-                        .unwrap()
-                        >= PipelineStage::FrameEnd.done_value(frame_count - 1)
-                }
+            let all_signalled = unsafe {
+                self.device
+                    .get_semaphore_counter_value(self.pipeline_semaphore)
+                    .unwrap()
+                    >= PipelineStage::FrameEnd.done_value(frame_count - 1)
             };
 
             if all_signalled {
@@ -872,19 +902,16 @@ impl Renderer {
 
             // Get the previous frame's timestamps.
             let mut data = [0u64; 2];
-            if self.frame > MAX_FRAMES_IN_FLIGHT {
-                self.device
-                    .get_query_pool_results(
-                        self.query_pool,
-                        2 * frame_index as u32,
-                        &mut data,
-                        vk::QueryResultFlags::TYPE_64,
-                    )
-                    .unwrap();
-                let multi =
-                    self.core.physical_device_properties.limits.timestamp_period / 1_000_000.;
-                println!("timestamp: {} ms", multi * (data[1] - data[0]) as f32);
-            }
+            self.device
+                .get_query_pool_results(
+                    self.query_pool,
+                    2 * frame_index as u32,
+                    &mut data,
+                    vk::QueryResultFlags::TYPE_64,
+                )
+                .unwrap();
+            let multi = self.core.physical_device_properties.limits.timestamp_period / 1_000_000.;
+            println!("timestamp: {} ms", multi * (data[1] - data[0]) as f32);
 
             // TODO: Make command buffers better.
             unsafe fn cmd_buffer_record(
