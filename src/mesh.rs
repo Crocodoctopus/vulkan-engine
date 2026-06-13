@@ -20,10 +20,8 @@ pub(crate) fn load_mesh(filename: impl AsRef<Path>) -> Option<(f32, Box<[Meshlet
     let model = {
         use std::io::BufReader;
         let data = std::fs::read(filename.as_ref()).ok()?;
-        let (models, _) = tobj::load_obj_buf(&mut BufReader::new(&data[..]), |_| {
-            Ok((Vec::new(), HashMap::new()))
-        })
-        .unwrap();
+        let (models, _) =
+            tobj::load_obj_buf(&mut BufReader::new(&data[..]), |_| Ok((Vec::new(), HashMap::new()))).unwrap();
         models.into_iter().next()?.mesh
     };
     println!("Model details ({:?}):", filename.as_ref());
@@ -32,13 +30,8 @@ pub(crate) fn load_mesh(filename: impl AsRef<Path>) -> Option<(f32, Box<[Meshlet
     println!("  Normals: {}", model.normals.len());
 
     // Calculate bounds.
-    let scale = model
-        .positions
-        .iter()
-        .tuples()
-        .fold(0f32, |scale, (x, y, z)| {
-            scale.max(x.abs()).max(y.abs()).max(z.abs())
-        });
+    let scale =
+        model.positions.iter().tuples().fold(0f32, |scale, (x, y, z)| scale.max(x.abs()).max(y.abs()).max(z.abs()));
 
     struct Vertex {
         position: Vec3,
@@ -54,22 +47,10 @@ pub(crate) fn load_mesh(filename: impl AsRef<Path>) -> Option<(f32, Box<[Meshlet
     }
 
     let mut indices = model.indices;
-    let positions: Vec<Vec3> = model
-        .positions
-        .chunks_exact(3)
-        .map(Vec3::from_slice)
-        .collect();
-    let uvs: Vec<Vec2> = model
-        .texcoords
-        .chunks_exact(2)
-        .map(Vec2::from_slice)
-        .collect();
+    let positions: Vec<Vec3> = model.positions.chunks_exact(3).map(Vec3::from_slice).collect();
+    let uvs: Vec<Vec2> = model.texcoords.chunks_exact(2).map(Vec2::from_slice).collect();
     let normals: Vec<Vec3> = if !model.normals.is_empty() {
-        model
-            .normals
-            .chunks_exact(3)
-            .map(Vec3::from_slice)
-            .collect()
+        model.normals.chunks_exact(3).map(Vec3::from_slice).collect()
     } else {
         // Normals dont exist, and are constructed here:
         let mut normals = vec![Vec3::ZERO; positions.len()];
@@ -110,10 +91,7 @@ pub(crate) fn load_mesh(filename: impl AsRef<Path>) -> Option<(f32, Box<[Meshlet
 
     let adapter = meshopt::VertexDataAdapter {
         reader: std::io::Cursor::new(unsafe {
-            std::slice::from_raw_parts(
-                vertices.as_ptr() as *const u8,
-                size_of::<Vertex>() * vertices.len(),
-            )
+            std::slice::from_raw_parts(vertices.as_ptr() as *const u8, size_of::<Vertex>() * vertices.len())
         }),
         vertex_count: vertices.len(),
         vertex_stride: size_of::<Vertex>(),
@@ -136,29 +114,17 @@ pub(crate) fn load_mesh(filename: impl AsRef<Path>) -> Option<(f32, Box<[Meshlet
                 positions: meshlet
                     .vertices
                     .iter()
-                    .map(|&i| {
-                        (vertices[i as usize].position / scale * 32767.)
-                            .to_array()
-                            .map(|e| e as i16)
-                    })
+                    .map(|&i| (vertices[i as usize].position / scale * 32767.).to_array().map(|e| e as i16))
                     .collect(),
                 normals: meshlet
                     .vertices
                     .iter()
-                    .map(|&i| {
-                        (vertices[i as usize].normal * 127.)
-                            .to_array()
-                            .map(|e| e as i8)
-                    })
+                    .map(|&i| (vertices[i as usize].normal * 127.).to_array().map(|e| e as i8))
                     .collect(),
                 _texcoords: meshlet
                     .vertices
                     .iter()
-                    .map(|&i| {
-                        (vertices[i as usize].uv * 32767.)
-                            .to_array()
-                            .map(|e| e as i16)
-                    })
+                    .map(|&i| (vertices[i as usize].uv * 32767.).to_array().map(|e| e as i16))
                     .collect(),
             }
         })

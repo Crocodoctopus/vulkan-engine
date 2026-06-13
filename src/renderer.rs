@@ -87,10 +87,9 @@ impl PipelineStage {
 struct SwapchainResources {
     /* TODO: Currently, only 1 FIF can use these, so we only need 1 */
     hzb_image: vk::Image,
-    _hzb_alloc: vk_mem::Allocation,
-    _hzb_test_view: vk::ImageView,
+    hzb_alloc: vk_mem::Allocation,
     hzb_build_src_views: Box<[vk::ImageView]>,
-    _hzb_build_dst_views: Box<[vk::ImageView]>,
+    hzb_build_dst_views: Box<[vk::ImageView]>,
     hzb_set: vk::DescriptorSet,
 
     render_finished: Box<[vk::Semaphore]>,
@@ -109,10 +108,9 @@ impl SwapchainResources {
     ) -> vk::DescriptorSet {
         let Self {
             hzb_image,
-            mut _hzb_alloc,
-            _hzb_test_view,
+            mut hzb_alloc,
             hzb_build_src_views,
-            _hzb_build_dst_views,
+            hzb_build_dst_views,
             hzb_set,
             render_finished,
             image_acquired_semaphores,
@@ -121,14 +119,13 @@ impl SwapchainResources {
             depth_views,
         } = self;
 
-        device.destroy_image_view(_hzb_test_view, None);
         for view in hzb_build_src_views {
             device.destroy_image_view(view, None);
         }
-        for view in _hzb_build_dst_views {
+        for view in hzb_build_dst_views {
             device.destroy_image_view(view, None);
         }
-        allocator.destroy_image(hzb_image, &mut _hzb_alloc);
+        allocator.destroy_image(hzb_image, &mut hzb_alloc);
 
         for semaphore in render_finished {
             device.destroy_semaphore(semaphore, None);
@@ -194,7 +191,7 @@ pub struct Renderer {
 
     /* Desciptor set layouts: */
     _global_set_layout: vk::DescriptorSetLayout,
-    _hzb_set_layout: vk::DescriptorSetLayout,
+    hzb_set_layout: vk::DescriptorSetLayout,
     _frame_set_layout: vk::DescriptorSetLayout,
 
     /* Pipelines: */
@@ -219,7 +216,7 @@ pub struct Renderer {
 
     /* Scene: */
     // Bindless set of all image views.
-    _global_descriptor_pool: vk::DescriptorPool,
+    global_descriptor_pool: vk::DescriptorPool,
     _descriptor_pools: [vk::DescriptorPool; MAX_FRAMES_IN_FLIGHT],
 
     hzb_sampler: vk::Sampler,
@@ -251,10 +248,7 @@ pub struct Renderer {
 
 impl Drop for Renderer {
     fn drop(&mut self) {
-        panic!(
-            "{} dropped implicitly; call explicit renderer shutdown before drop",
-            std::any::type_name::<Self>()
-        );
+        panic!("{} dropped implicitly; call explicit renderer shutdown before drop", std::any::type_name::<Self>());
     }
 }
 
@@ -295,9 +289,7 @@ impl Renderer {
 
             // Create logical device and its associated queues.
             let (device, graphics_queue, present_queue) = {
-                let features = vk::PhysicalDeviceFeatures::default()
-                    .multi_draw_indirect(true)
-                    .shader_int16(true);
+                let features = vk::PhysicalDeviceFeatures::default().multi_draw_indirect(true).shader_int16(true);
                 let extensions = device_extensions.map(|x: &CStr| x.as_ptr());
 
                 let device = {
@@ -319,9 +311,8 @@ impl Renderer {
                         .runtime_descriptor_array(true)
                         .timeline_semaphore(true);
 
-                    let mut vk13features = vk::PhysicalDeviceVulkan13Features::default()
-                        .dynamic_rendering(true)
-                        .synchronization2(true);
+                    let mut vk13features =
+                        vk::PhysicalDeviceVulkan13Features::default().dynamic_rendering(true).synchronization2(true);
 
                     let priority = [1.0];
 
@@ -337,9 +328,7 @@ impl Renderer {
                         .enabled_extension_names(&extensions)
                         .enabled_features(&features);
 
-                    instance
-                        .create_device(physical_device, &device_cinfo, None)
-                        .unwrap()
+                    instance.create_device(physical_device, &device_cinfo, None).unwrap()
                 };
 
                 // Extract queues.
@@ -350,8 +339,7 @@ impl Renderer {
             };
 
             // AMD memory allocator.
-            let mut allocator_cinfo =
-                vk_mem::AllocatorCreateInfo::new(&instance, &device, physical_device);
+            let mut allocator_cinfo = vk_mem::AllocatorCreateInfo::new(&instance, &device, physical_device);
             allocator_cinfo.flags |= vk_mem::AllocatorCreateFlags::BUFFER_DEVICE_ADDRESS;
             let allocator = vk_mem::Allocator::new(allocator_cinfo).unwrap();
 
@@ -364,15 +352,10 @@ impl Renderer {
             let global_set_layout = device
                 .create_descriptor_set_layout(
                     &vk::DescriptorSetLayoutCreateInfo::default()
-                        .push_next(
-                            &mut vk::DescriptorSetLayoutBindingFlagsCreateInfo::default()
-                                .binding_flags(&[
-                                    vk::DescriptorBindingFlags::PARTIALLY_BOUND
-                                        | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
-                                    vk::DescriptorBindingFlags::PARTIALLY_BOUND
-                                        | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
-                                ]),
-                        )
+                        .push_next(&mut vk::DescriptorSetLayoutBindingFlagsCreateInfo::default().binding_flags(&[
+                            vk::DescriptorBindingFlags::PARTIALLY_BOUND | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
+                            vk::DescriptorBindingFlags::PARTIALLY_BOUND | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
+                        ]))
                         .bindings(&[
                             vk::DescriptorSetLayoutBinding::default()
                                 .binding(0)
@@ -393,15 +376,10 @@ impl Renderer {
             let hzb_set_layout = device
                 .create_descriptor_set_layout(
                     &vk::DescriptorSetLayoutCreateInfo::default()
-                        .push_next(
-                            &mut vk::DescriptorSetLayoutBindingFlagsCreateInfo::default()
-                                .binding_flags(&[
-                                    vk::DescriptorBindingFlags::PARTIALLY_BOUND
-                                        | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
-                                    vk::DescriptorBindingFlags::PARTIALLY_BOUND
-                                        | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
-                                ]),
-                        )
+                        .push_next(&mut vk::DescriptorSetLayoutBindingFlagsCreateInfo::default().binding_flags(&[
+                            vk::DescriptorBindingFlags::PARTIALLY_BOUND | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
+                            vk::DescriptorBindingFlags::PARTIALLY_BOUND | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
+                        ]))
                         .bindings(&[
                             vk::DescriptorSetLayoutBinding::default()
                                 .binding(0)
@@ -469,14 +447,14 @@ impl Renderer {
                 let pipeline = device
                     .create_compute_pipelines(
                         vk::PipelineCache::default(),
-                        &[vk::ComputePipelineCreateInfo::default()
-                            .layout(pipeline_layout)
-                            .stage(
+                        &[
+                            vk::ComputePipelineCreateInfo::default().layout(pipeline_layout).stage(
                                 vk::PipelineShaderStageCreateInfo::default()
                                     .stage(vk::ShaderStageFlags::COMPUTE)
                                     .name(c"main")
                                     .module(comp_shader),
-                            )],
+                            ),
+                        ],
                         None,
                     )
                     .unwrap()
@@ -493,8 +471,7 @@ impl Renderer {
             let (render_pipeline, render_pipeline_layout) = {
                 let pipeline_layout = device
                     .create_pipeline_layout(
-                        &vk::PipelineLayoutCreateInfo::default()
-                            .set_layouts(&[global_set_layout, frame_set_layout]),
+                        &vk::PipelineLayoutCreateInfo::default().set_layouts(&[global_set_layout, frame_set_layout]),
                         None,
                     )
                     .unwrap();
@@ -539,10 +516,7 @@ impl Renderer {
                                     }])
                                     .scissors(&[vk::Rect2D {
                                         offset: vk::Offset2D { x: 0, y: 0 },
-                                        extent: vk::Extent2D {
-                                            width: viewport_w,
-                                            height: viewport_h,
-                                        },
+                                        extent: vk::Extent2D { width: viewport_w, height: viewport_h },
                                     }]),
                             )
                             .rasterization_state(
@@ -561,13 +535,11 @@ impl Renderer {
                                     .rasterization_samples(vk::SampleCountFlags::TYPE_1),
                             )
                             .color_blend_state(
-                                &vk::PipelineColorBlendStateCreateInfo::default()
-                                    .logic_op_enable(false)
-                                    .attachments(&[
-                                        vk::PipelineColorBlendAttachmentState::default()
-                                            .color_write_mask(vk::ColorComponentFlags::RGBA)
-                                            .blend_enable(false),
-                                    ]),
+                                &vk::PipelineColorBlendStateCreateInfo::default().logic_op_enable(false).attachments(
+                                    &[vk::PipelineColorBlendAttachmentState::default()
+                                        .color_write_mask(vk::ColorComponentFlags::RGBA)
+                                        .blend_enable(false)],
+                                ),
                             )
                             .depth_stencil_state(
                                 &vk::PipelineDepthStencilStateCreateInfo::default()
@@ -595,12 +567,12 @@ impl Renderer {
 
                 let pipeline_layout = device
                     .create_pipeline_layout(
-                        &vk::PipelineLayoutCreateInfo::default()
-                            .set_layouts(&[hzb_set_layout])
-                            .push_constant_ranges(&[vk::PushConstantRange::default()
+                        &vk::PipelineLayoutCreateInfo::default().set_layouts(&[hzb_set_layout]).push_constant_ranges(
+                            &[vk::PushConstantRange::default()
                                 .stage_flags(vk::ShaderStageFlags::COMPUTE)
                                 .offset(0)
-                                .size(size_of::<BuildHzbPushConstants>() as u32)]),
+                                .size(size_of::<BuildHzbPushConstants>() as u32)],
+                        ),
                         None,
                     )
                     .unwrap();
@@ -608,14 +580,14 @@ impl Renderer {
                 let pipeline = device
                     .create_compute_pipelines(
                         vk::PipelineCache::default(),
-                        &[vk::ComputePipelineCreateInfo::default()
-                            .layout(pipeline_layout)
-                            .stage(
+                        &[
+                            vk::ComputePipelineCreateInfo::default().layout(pipeline_layout).stage(
                                 vk::PipelineShaderStageCreateInfo::default()
                                     .stage(vk::ShaderStageFlags::COMPUTE)
                                     .name(c"main")
                                     .module(comp_shader),
-                            )],
+                            ),
+                        ],
                         None,
                     )
                     .unwrap()
@@ -651,17 +623,12 @@ impl Renderer {
                 .unwrap()[0];
 
             let staging_fence = device
-                .create_fence(
-                    &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
-                    None,
-                )
+                .create_fence(&vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED), None)
                 .unwrap();
 
             // The renderer starts at STARTING_FRAME so the steady-state render path
             // can read the previous timestamp slot without startup branches.
-            device
-                .begin_command_buffer(staging_cmd_buffer, &vk::CommandBufferBeginInfo::default())
-                .unwrap();
+            device.begin_command_buffer(staging_cmd_buffer, &vk::CommandBufferBeginInfo::default()).unwrap();
             profiler.bootstrap_queries(&device, staging_cmd_buffer);
             device.end_command_buffer(staging_cmd_buffer).unwrap();
             device
@@ -797,7 +764,7 @@ impl Renderer {
                 cmd_pool,
 
                 _global_set_layout: global_set_layout,
-                _hzb_set_layout: hzb_set_layout,
+                hzb_set_layout,
                 _frame_set_layout: frame_set_layout,
 
                 frustum_cull_pipeline_layout,
@@ -817,7 +784,7 @@ impl Renderer {
                 staging_cmd_buffer,
                 staging_fence,
 
-                _global_descriptor_pool: global_descriptor_pool,
+                global_descriptor_pool,
                 _descriptor_pools: descriptor_pools,
 
                 hzb_sampler,
@@ -865,38 +832,28 @@ impl Renderer {
 
         // Wait if we have too many frames in flight.
         unsafe {
-            self.wait_for_pipeline_stage(
-                frame_count - MAX_FRAMES_IN_FLIGHT + 1,
-                PipelineStage::DataUpload,
-            );
+            self.wait_for_pipeline_stage(frame_count - MAX_FRAMES_IN_FLIGHT + 1, PipelineStage::DataUpload);
         }
 
         // Try to clean up old visibility buffers.
-        let completed_stage = unsafe {
-            self.device
-                .get_semaphore_counter_value(self.pipeline_semaphore)
-                .unwrap()
-        };
+        let completed_stage = unsafe { self.device.get_semaphore_counter_value(self.pipeline_semaphore).unwrap() };
         let allocator = &self.allocator;
-        self.visibility_buffer_retire_list
-            .retain_mut(|(retire_after, buffer)| {
-                if completed_stage >= *retire_after {
-                    unsafe {
-                        buffer.take().destroy(allocator);
-                    }
-                    false
-                } else {
-                    true
+        self.visibility_buffer_retire_list.retain_mut(|(retire_after, buffer)| {
+            if completed_stage >= *retire_after {
+                unsafe {
+                    buffer.take().destroy(allocator);
                 }
-            });
+                false
+            } else {
+                true
+            }
+        });
 
         // Attempt to clean old scenes:
         let mut scene_resources = vec![self.scene_resources.pop().unwrap()];
         while let Some(scene) = self.scene_resources.pop() {
             let all_signalled = unsafe {
-                self.device
-                    .get_semaphore_counter_value(self.pipeline_semaphore)
-                    .unwrap()
+                self.device.get_semaphore_counter_value(self.pipeline_semaphore).unwrap()
                     >= PipelineStage::FrameEnd.done_value(frame_count - 1)
             };
 
@@ -953,15 +910,10 @@ impl Renderer {
             let visibility_index = frame_count % VISIBILITY_BUFFER_COUNT;
             let last_visibility_index = (frame_count - VISIBILITY_DEPTH) % VISIBILITY_BUFFER_COUNT;
             if self.visibility_buffers[visibility_index].len() < meshlet_instance_buffer.len() {
-                let old_buffer = std::mem::replace(
-                    &mut self.visibility_buffers[visibility_index],
-                    Buffer::null(),
-                );
+                let old_buffer = std::mem::replace(&mut self.visibility_buffers[visibility_index], Buffer::null());
                 if !old_buffer.is_null() {
-                    self.visibility_buffer_retire_list.push((
-                        PipelineStage::FrustumCull.done_value(frame_count - 1),
-                        old_buffer,
-                    ));
+                    self.visibility_buffer_retire_list
+                        .push((PipelineStage::FrustumCull.done_value(frame_count - 1), old_buffer));
                 }
 
                 self.visibility_buffers[visibility_index] = Buffer::<[u32]>::new(
@@ -984,12 +936,7 @@ impl Renderer {
             let (image_index, _) = self
                 .swapchain
                 .swapchain_device
-                .acquire_next_image(
-                    self.swapchain.swapchain,
-                    u64::MAX,
-                    image_acquired,
-                    vk::Fence::null(),
-                )
+                .acquire_next_image(self.swapchain.swapchain, u64::MAX, image_acquired, vk::Fence::null())
                 .unwrap();
             let render_finished = render_finished[image_index as usize];
             let swapchain_image = self.swapchain.images[image_index as usize];
@@ -1010,12 +957,8 @@ impl Renderer {
                 cmd: vk::CommandBuffer,
                 f: impl FnOnce(vk::CommandBuffer),
             ) {
-                device
-                    .reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())
-                    .unwrap();
-                device
-                    .begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())
-                    .unwrap();
+                device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).unwrap();
+                device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
 
                 if stage as usize == 0 {
                     profiler.reset_frame(device, cmd, frame_index);
@@ -1056,8 +999,7 @@ impl Renderer {
                     // Upload global descriptor data & object data.
                     let projection = Mat4::perspective_infinite_rh(
                         std::f32::consts::FRAC_PI_6,
-                        self.core.surface_extent.width as f32
-                            / self.core.surface_extent.height as f32,
+                        self.core.surface_extent.width as f32 / self.core.surface_extent.height as f32,
                         0.1,
                     );
 
@@ -1074,13 +1016,7 @@ impl Renderer {
                     // Upload scene data.
                     self.staging_buffer.reset();
 
-                    self.staging_buffer.stage_buffer(
-                        &self.device,
-                        cmd,
-                        &object_instance_buffer,
-                        0,
-                        object_data,
-                    );
+                    self.staging_buffer.stage_buffer(&self.device, cmd, &object_instance_buffer, 0, object_data);
 
                     self.staging_buffer.stage_buffer(
                         &self.device,
@@ -1097,35 +1033,24 @@ impl Renderer {
                             light_color: Vec4::new(1.0, 1.0, 1.0, 1.0),
                             frustum,
                             meshlet_visibility_buffer: self.device.get_buffer_device_address(
-                                &vk::BufferDeviceAddressInfo::default()
-                                    .buffer(visibility_buffer.vk_handle()),
+                                &vk::BufferDeviceAddressInfo::default().buffer(visibility_buffer.vk_handle()),
                             ),
                             draw_count_buffer: self.device.get_buffer_device_address(
-                                &vk::BufferDeviceAddressInfo::default()
-                                    .buffer(indirect_count_buffer.vk_handle()),
+                                &vk::BufferDeviceAddressInfo::default().buffer(indirect_count_buffer.vk_handle()),
                             ),
                             meshlet_buffer: self.device.get_buffer_device_address(
-                                &vk::BufferDeviceAddressInfo::default()
-                                    .buffer(meshlet_instance_buffer.vk_handle()),
+                                &vk::BufferDeviceAddressInfo::default().buffer(meshlet_instance_buffer.vk_handle()),
                             ),
                             draw_cmd_buffer: self.device.get_buffer_device_address(
-                                &vk::BufferDeviceAddressInfo::default()
-                                    .buffer(indirect_cmd_buffer.vk_handle()),
+                                &vk::BufferDeviceAddressInfo::default().buffer(indirect_cmd_buffer.vk_handle()),
                             ),
                             object_buffer: self.device.get_buffer_device_address(
-                                &vk::BufferDeviceAddressInfo::default()
-                                    .buffer(object_instance_buffer.vk_handle()),
+                                &vk::BufferDeviceAddressInfo::default().buffer(object_instance_buffer.vk_handle()),
                             ),
                             instances: indirect_cmd_buffer.len(),
                         }],
                     );
-                    self.staging_buffer.stage_buffer(
-                        &self.device,
-                        cmd,
-                        indirect_count_buffer,
-                        0,
-                        [0u32],
-                    );
+                    self.staging_buffer.stage_buffer(&self.device, cmd, indirect_count_buffer, 0, [0u32]);
                 },
             );
 
@@ -1137,17 +1062,13 @@ impl Renderer {
                 frustum_cull,
                 |cmd| {
                     // Copy visibility history into the current frame's buffer.
-                    let visibility_copy_size =
-                        visibility_buffer.size().min(last_visibility_buffer.size());
+                    let visibility_copy_size = visibility_buffer.size().min(last_visibility_buffer.size());
                     if visibility_copy_size > 0 {
                         self.device.cmd_copy_buffer(
                             cmd,
                             last_visibility_buffer.vk_handle(),
                             visibility_buffer.vk_handle(),
-                            &[vk::BufferCopy::default()
-                                .src_offset(0)
-                                .dst_offset(0)
-                                .size(visibility_copy_size as u64)],
+                            &[vk::BufferCopy::default().src_offset(0).dst_offset(0).size(visibility_copy_size as u64)],
                         );
                     }
 
@@ -1164,19 +1085,16 @@ impl Renderer {
 
                     self.device.cmd_pipeline_barrier2(
                         cmd,
-                        &vk::DependencyInfo::default().buffer_memory_barriers(&[
-                            vk::BufferMemoryBarrier2::default()
-                                .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
-                                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                                .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                                .dst_access_mask(
-                                    vk::AccessFlags2::SHADER_STORAGE_READ
-                                        | vk::AccessFlags2::SHADER_STORAGE_WRITE,
-                                )
-                                .buffer(visibility_buffer.vk_handle())
-                                .offset(0)
-                                .size(visibility_buffer.size() as u64),
-                        ]),
+                        &vk::DependencyInfo::default().buffer_memory_barriers(&[vk::BufferMemoryBarrier2::default()
+                            .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+                            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                            .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                            .dst_access_mask(
+                                vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE,
+                            )
+                            .buffer(visibility_buffer.vk_handle())
+                            .offset(0)
+                            .size(visibility_buffer.size() as u64)]),
                     );
 
                     self.device.cmd_bind_descriptor_sets(
@@ -1188,328 +1106,272 @@ impl Renderer {
                         &[],
                     );
 
-                    self.device.cmd_bind_pipeline(
-                        cmd,
-                        vk::PipelineBindPoint::COMPUTE,
-                        self.frustum_cull_pipeline,
-                    );
+                    self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.frustum_cull_pipeline);
 
-                    self.device
-                        .cmd_dispatch(cmd, meshlet_instance_buffer.len().div_ceil(64), 1, 1);
+                    self.device.cmd_dispatch(cmd, meshlet_instance_buffer.len().div_ceil(64), 1, 1);
                 },
             );
 
-            cmd_buffer_record(
-                &self.device,
-                &self.profiler,
-                frame_index,
-                PipelineStage::FirstDraw,
-                first_draw,
-                |cmd| {
-                    self.device.cmd_pipeline_barrier2(
-                        cmd,
-                        &vk::DependencyInfo::default().image_memory_barriers(&[
-                            // Convert VK_IMAGE_LAYOUT_UNDEFINED -> VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL.
-                            vk::ImageMemoryBarrier2::default()
-                                .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
-                                .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-                                .image(swapchain_image)
-                                .subresource_range(
-                                    vk::ImageSubresourceRange::default()
-                                        .aspect_mask(vk::ImageAspectFlags::COLOR)
-                                        .base_mip_level(0)
-                                        .level_count(1)
-                                        .base_array_layer(0)
-                                        .layer_count(1),
-                                )
-                                .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
-                                .old_layout(vk::ImageLayout::UNDEFINED)
-                                .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
-                        ]),
-                    );
-
-                    // Use dynamic rendering.
-                    self.device.cmd_begin_rendering(
-                        cmd,
-                        &vk::RenderingInfo::default()
-                            .render_area(vk::Rect2D {
-                                offset: vk::Offset2D { x: 0, y: 0 },
-                                extent: vk::Extent2D {
-                                    width: self.core.surface_extent.width,
-                                    height: self.core.surface_extent.height,
-                                },
-                            })
-                            .layer_count(1)
-                            .depth_attachment(
-                                &vk::RenderingAttachmentInfo::default()
-                                    .image_view(depth_view)
-                                    .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
-                                    .load_op(vk::AttachmentLoadOp::CLEAR)
-                                    .store_op(vk::AttachmentStoreOp::STORE)
-                                    .clear_value(vk::ClearValue {
-                                        depth_stencil: vk::ClearDepthStencilValue {
-                                            depth: 1.0,
-                                            stencil: 0,
-                                        },
-                                    }),
+            cmd_buffer_record(&self.device, &self.profiler, frame_index, PipelineStage::FirstDraw, first_draw, |cmd| {
+                self.device.cmd_pipeline_barrier2(
+                    cmd,
+                    &vk::DependencyInfo::default().image_memory_barriers(&[
+                        // Convert VK_IMAGE_LAYOUT_UNDEFINED -> VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL.
+                        vk::ImageMemoryBarrier2::default()
+                            .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
+                            .dst_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                            .image(swapchain_image)
+                            .subresource_range(
+                                vk::ImageSubresourceRange::default()
+                                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                    .base_mip_level(0)
+                                    .level_count(1)
+                                    .base_array_layer(0)
+                                    .layer_count(1),
                             )
-                            .color_attachments(&[vk::RenderingAttachmentInfo::default()
-                                .image_view(swapchain_view)
-                                .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                            .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                            .old_layout(vk::ImageLayout::UNDEFINED)
+                            .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
+                    ]),
+                );
+
+                // Use dynamic rendering.
+                self.device.cmd_begin_rendering(
+                    cmd,
+                    &vk::RenderingInfo::default()
+                        .render_area(vk::Rect2D {
+                            offset: vk::Offset2D { x: 0, y: 0 },
+                            extent: vk::Extent2D {
+                                width: self.core.surface_extent.width,
+                                height: self.core.surface_extent.height,
+                            },
+                        })
+                        .layer_count(1)
+                        .depth_attachment(
+                            &vk::RenderingAttachmentInfo::default()
+                                .image_view(depth_view)
+                                .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
                                 .load_op(vk::AttachmentLoadOp::CLEAR)
                                 .store_op(vk::AttachmentStoreOp::STORE)
                                 .clear_value(vk::ClearValue {
-                                    color: vk::ClearColorValue {
-                                        float32: [0.0, 0.0, 0.0, 1.0],
-                                    },
-                                })]),
-                    );
+                                    depth_stencil: vk::ClearDepthStencilValue { depth: 1.0, stencil: 0 },
+                                }),
+                        )
+                        .color_attachments(&[vk::RenderingAttachmentInfo::default()
+                            .image_view(swapchain_view)
+                            .image_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                            .load_op(vk::AttachmentLoadOp::CLEAR)
+                            .store_op(vk::AttachmentStoreOp::STORE)
+                            .clear_value(vk::ClearValue {
+                                color: vk::ClearColorValue { float32: [0.0, 0.0, 0.0, 1.0] },
+                            })]),
+                );
 
-                    // Begin draw calls.
+                // Begin draw calls.
+                self.device.cmd_bind_descriptor_sets(
+                    cmd,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.render_pipeline_layout,
+                    0,
+                    &[global_set, frame_set],
+                    &[],
+                );
+
+                self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.render_pipeline);
+
+                self.device.cmd_bind_index_buffer(cmd, index_buffer.vk_handle(), 0, vk::IndexType::UINT32);
+
+                self.device.cmd_draw_indexed_indirect_count(
+                    cmd,
+                    indirect_cmd_buffer.vk_handle(),
+                    0,
+                    indirect_count_buffer.vk_handle(),
+                    0,
+                    meshlet_instance_buffer.len(),
+                    size_of::<vk::DrawIndexedIndirectCommand>() as u32,
+                );
+
+                self.device.cmd_end_rendering(cmd);
+
+                // Transition swapchain image to present.
+                self.device.cmd_pipeline_barrier2(
+                    cmd,
+                    &vk::DependencyInfo::default().image_memory_barriers(&[
+                        // Convert VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL -> VK_IMAGE_LAYOUT_PRESENT_SRC_KHR.
+                        vk::ImageMemoryBarrier2::default()
+                            .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
+                            .dst_stage_mask(vk::PipelineStageFlags2::BOTTOM_OF_PIPE)
+                            .image(swapchain_image)
+                            .subresource_range(
+                                vk::ImageSubresourceRange::default()
+                                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                    .base_mip_level(0)
+                                    .level_count(1)
+                                    .base_array_layer(0)
+                                    .layer_count(1),
+                            )
+                            .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
+                            .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
+                            .new_layout(vk::ImageLayout::PRESENT_SRC_KHR),
+                    ]),
+                );
+            });
+
+            cmd_buffer_record(&self.device, &self.profiler, frame_index, PipelineStage::BuildHzb, build_hzb, |cmd| {
+                self.device.cmd_pipeline_barrier2(
+                    cmd,
+                    &vk::DependencyInfo::default().image_memory_barriers(&[
+                        // Prepare the HZB for writing.
+                        vk::ImageMemoryBarrier2::default()
+                            .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                            .src_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                            .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                            .dst_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
+                            .image(*hzb_image)
+                            .subresource_range(
+                                vk::ImageSubresourceRange::default()
+                                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                    .base_mip_level(0)
+                                    .level_count(vk::REMAINING_MIP_LEVELS)
+                                    .base_array_layer(0)
+                                    .layer_count(1),
+                            )
+                            .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                            .new_layout(vk::ImageLayout::GENERAL),
+                        // Prepare the depth buffer for sampling @ first HZB reduction.
+                        vk::ImageMemoryBarrier2::default()
+                            .src_stage_mask(
+                                vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                                    | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+                            )
+                            .src_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
+                            .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                            .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                            .image(depth_images[frame_index].0)
+                            .subresource_range(
+                                vk::ImageSubresourceRange::default()
+                                    .aspect_mask(vk::ImageAspectFlags::DEPTH)
+                                    .base_mip_level(0)
+                                    .level_count(1)
+                                    .base_array_layer(0)
+                                    .layer_count(1),
+                            )
+                            .old_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
+                            .new_layout(vk::ImageLayout::DEPTH_READ_ONLY_OPTIMAL),
+                    ]),
+                );
+
+                let build_hzb = |src: u32, dst: u32| {
+                    let pc = BuildHzbPushConstants { src, dst };
+
                     self.device.cmd_bind_descriptor_sets(
                         cmd,
-                        vk::PipelineBindPoint::GRAPHICS,
-                        self.render_pipeline_layout,
+                        vk::PipelineBindPoint::COMPUTE,
+                        self.build_hzb_pipeline_layout,
                         0,
-                        &[global_set, frame_set],
+                        &[hzb_set],
                         &[],
                     );
 
-                    self.device.cmd_bind_pipeline(
-                        cmd,
-                        vk::PipelineBindPoint::GRAPHICS,
-                        self.render_pipeline,
-                    );
+                    self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.build_hzb_pipeline);
 
-                    self.device.cmd_bind_index_buffer(
+                    self.device.cmd_push_constants(
                         cmd,
-                        index_buffer.vk_handle(),
+                        self.build_hzb_pipeline_layout,
+                        vk::ShaderStageFlags::COMPUTE,
                         0,
-                        vk::IndexType::UINT32,
+                        std::slice::from_raw_parts(
+                            (&pc as *const BuildHzbPushConstants) as *const u8,
+                            std::mem::size_of::<BuildHzbPushConstants>(),
+                        ),
                     );
 
-                    self.device.cmd_draw_indexed_indirect_count(
-                        cmd,
-                        indirect_cmd_buffer.vk_handle(),
-                        0,
-                        indirect_count_buffer.vk_handle(),
-                        0,
-                        meshlet_instance_buffer.len(),
-                        size_of::<vk::DrawIndexedIndirectCommand>() as u32,
-                    );
-
-                    self.device.cmd_end_rendering(cmd);
-
-                    // Transition swapchain image to present.
-                    self.device.cmd_pipeline_barrier2(
-                        cmd,
-                        &vk::DependencyInfo::default().image_memory_barriers(&[
-                            // Convert VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL -> VK_IMAGE_LAYOUT_PRESENT_SRC_KHR.
-                            vk::ImageMemoryBarrier2::default()
-                                .src_stage_mask(vk::PipelineStageFlags2::COLOR_ATTACHMENT_OUTPUT)
-                                .dst_stage_mask(vk::PipelineStageFlags2::BOTTOM_OF_PIPE)
-                                .image(swapchain_image)
-                                .subresource_range(
-                                    vk::ImageSubresourceRange::default()
-                                        .aspect_mask(vk::ImageAspectFlags::COLOR)
-                                        .base_mip_level(0)
-                                        .level_count(1)
-                                        .base_array_layer(0)
-                                        .layer_count(1),
-                                )
-                                .src_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
-                                .old_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)
-                                .new_layout(vk::ImageLayout::PRESENT_SRC_KHR),
-                        ]),
-                    );
-                },
-            );
-
-            cmd_buffer_record(
-                &self.device,
-                &self.profiler,
-                frame_index,
-                PipelineStage::BuildHzb,
-                build_hzb,
-                |cmd| {
-                    self.device.cmd_pipeline_barrier2(
-                        cmd,
-                        &vk::DependencyInfo::default().image_memory_barriers(&[
-                            // Prepare the HZB for writing.
-                            vk::ImageMemoryBarrier2::default()
-                                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                                .src_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                                .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                                .dst_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
-                                .image(*hzb_image)
-                                .subresource_range(
-                                    vk::ImageSubresourceRange::default()
-                                        .aspect_mask(vk::ImageAspectFlags::COLOR)
-                                        .base_mip_level(0)
-                                        .level_count(vk::REMAINING_MIP_LEVELS)
-                                        .base_array_layer(0)
-                                        .layer_count(1),
-                                )
-                                .old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                                .new_layout(vk::ImageLayout::GENERAL),
-                            // Prepare the depth buffer for sampling @ first HZB reduction.
-                            vk::ImageMemoryBarrier2::default()
-                                .src_stage_mask(
-                                    vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
-                                        | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-                                )
-                                .src_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
-                                .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                                .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                                .image(depth_images[frame_index].0)
-                                .subresource_range(
-                                    vk::ImageSubresourceRange::default()
-                                        .aspect_mask(vk::ImageAspectFlags::DEPTH)
-                                        .base_mip_level(0)
-                                        .level_count(1)
-                                        .base_array_layer(0)
-                                        .layer_count(1),
-                                )
-                                .old_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
-                                .new_layout(vk::ImageLayout::DEPTH_READ_ONLY_OPTIMAL),
-                        ]),
-                    );
-
-                    let build_hzb = |src: u32, dst: u32| {
-                        let pc = BuildHzbPushConstants { src, dst };
-
-                        self.device.cmd_bind_descriptor_sets(
-                            cmd,
-                            vk::PipelineBindPoint::COMPUTE,
-                            self.build_hzb_pipeline_layout,
-                            0,
-                            &[hzb_set],
-                            &[],
-                        );
-
-                        self.device.cmd_bind_pipeline(
-                            cmd,
-                            vk::PipelineBindPoint::COMPUTE,
-                            self.build_hzb_pipeline,
-                        );
-
-                        self.device.cmd_push_constants(
-                            cmd,
-                            self.build_hzb_pipeline_layout,
-                            vk::ShaderStageFlags::COMPUTE,
-                            0,
-                            std::slice::from_raw_parts(
-                                (&pc as *const BuildHzbPushConstants) as *const u8,
-                                std::mem::size_of::<BuildHzbPushConstants>(),
-                            ),
-                        );
-
-                        let w = self
-                            .core
-                            .surface_extent
-                            .width
-                            .div_ceil(2)
-                            .checked_shr(dst)
-                            .unwrap_or(0)
-                            .max(1)
-                            .div_ceil(8);
-                        let h = self
-                            .core
-                            .surface_extent
-                            .height
-                            .div_ceil(2)
-                            .checked_shr(dst)
-                            .unwrap_or(0)
-                            .max(1)
-                            .div_ceil(8);
-                        self.device.cmd_dispatch(cmd, w, h, 1);
-
-                        self.device.cmd_pipeline_barrier2(
-                            cmd,
-                            &vk::DependencyInfo::default().image_memory_barriers(&[
-                                vk::ImageMemoryBarrier2::default()
-                                    .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                                    .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
-                                    .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                                    .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                                    .image(*hzb_image)
-                                    .subresource_range(
-                                        vk::ImageSubresourceRange::default()
-                                            .aspect_mask(vk::ImageAspectFlags::COLOR)
-                                            .base_mip_level(dst)
-                                            .level_count(1)
-                                            .base_array_layer(0)
-                                            .layer_count(1),
-                                    )
-                                    .old_layout(vk::ImageLayout::GENERAL)
-                                    .new_layout(vk::ImageLayout::GENERAL),
-                            ]),
-                        );
-                    };
-
-                    // For the first compute, the src view is the depth buffer, which
-                    // depends on the depth buffer.
-                    build_hzb(frame_index as u32, 0);
-
-                    // The rest are standard.
-                    let mips = hzb_build_src_views.len();
-                    for i in 0..mips - 1 {
-                        build_hzb(2 + i as u32, 1 + i as u32);
-                    }
+                    let w = self.core.surface_extent.width.div_ceil(2).checked_shr(dst).unwrap_or(0).max(1).div_ceil(8);
+                    let h =
+                        self.core.surface_extent.height.div_ceil(2).checked_shr(dst).unwrap_or(0).max(1).div_ceil(8);
+                    self.device.cmd_dispatch(cmd, w, h, 1);
 
                     self.device.cmd_pipeline_barrier2(
                         cmd,
-                        &vk::DependencyInfo::default().image_memory_barriers(&[
-                            // Transition HZB back to read after all reductions.
-                            vk::ImageMemoryBarrier2::default()
-                                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                                .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
-                                .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                                .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                                .image(*hzb_image)
-                                .subresource_range(
-                                    vk::ImageSubresourceRange::default()
-                                        .aspect_mask(vk::ImageAspectFlags::COLOR)
-                                        .base_mip_level(0)
-                                        .level_count(vk::REMAINING_MIP_LEVELS)
-                                        .base_array_layer(0)
-                                        .layer_count(1),
-                                )
-                                .old_layout(vk::ImageLayout::GENERAL)
-                                .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
-                            // Transition the depth buffer back to depth attachment.
-                            vk::ImageMemoryBarrier2::default()
-                                .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                                .src_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                                .dst_stage_mask(
-                                    vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
-                                        | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
-                                )
-                                .dst_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
-                                .image(depth_images[frame_index].0)
-                                .subresource_range(
-                                    vk::ImageSubresourceRange::default()
-                                        .aspect_mask(vk::ImageAspectFlags::DEPTH)
-                                        .base_mip_level(0)
-                                        .level_count(1)
-                                        .base_array_layer(0)
-                                        .layer_count(1),
-                                )
-                                .old_layout(vk::ImageLayout::DEPTH_READ_ONLY_OPTIMAL)
-                                .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL),
-                        ]),
+                        &vk::DependencyInfo::default().image_memory_barriers(&[vk::ImageMemoryBarrier2::default()
+                            .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                            .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
+                            .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                            .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                            .image(*hzb_image)
+                            .subresource_range(
+                                vk::ImageSubresourceRange::default()
+                                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                    .base_mip_level(dst)
+                                    .level_count(1)
+                                    .base_array_layer(0)
+                                    .layer_count(1),
+                            )
+                            .old_layout(vk::ImageLayout::GENERAL)
+                            .new_layout(vk::ImageLayout::GENERAL)]),
                     );
-                },
-            );
+                };
+
+                // For the first compute, the src view is the depth buffer, which
+                // depends on the depth buffer.
+                build_hzb(frame_index as u32, 0);
+
+                // The rest are standard.
+                let mips = hzb_build_src_views.len();
+                for i in 0..mips - 1 {
+                    build_hzb(2 + i as u32, 1 + i as u32);
+                }
+
+                self.device.cmd_pipeline_barrier2(
+                    cmd,
+                    &vk::DependencyInfo::default().image_memory_barriers(&[
+                        // Transition HZB back to read after all reductions.
+                        vk::ImageMemoryBarrier2::default()
+                            .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                            .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
+                            .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                            .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                            .image(*hzb_image)
+                            .subresource_range(
+                                vk::ImageSubresourceRange::default()
+                                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                    .base_mip_level(0)
+                                    .level_count(vk::REMAINING_MIP_LEVELS)
+                                    .base_array_layer(0)
+                                    .layer_count(1),
+                            )
+                            .old_layout(vk::ImageLayout::GENERAL)
+                            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+                        // Transition the depth buffer back to depth attachment.
+                        vk::ImageMemoryBarrier2::default()
+                            .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                            .src_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                            .dst_stage_mask(
+                                vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
+                                    | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+                            )
+                            .dst_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
+                            .image(depth_images[frame_index].0)
+                            .subresource_range(
+                                vk::ImageSubresourceRange::default()
+                                    .aspect_mask(vk::ImageAspectFlags::DEPTH)
+                                    .base_mip_level(0)
+                                    .level_count(1)
+                                    .base_array_layer(0)
+                                    .layer_count(1),
+                            )
+                            .old_layout(vk::ImageLayout::DEPTH_READ_ONLY_OPTIMAL)
+                            .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL),
+                    ]),
+                );
+            });
 
             // TODO: Submit all queues.
             self.device
                 .queue_submit2(
                     self.graphics_queue,
                     &[vk::SubmitInfo2::default()
-                        .command_buffer_infos(&[
-                            vk::CommandBufferSubmitInfo::default().command_buffer(data_upload)
-                        ])
+                        .command_buffer_infos(&[vk::CommandBufferSubmitInfo::default().command_buffer(data_upload)])
                         .wait_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
                             .semaphore(self.pipeline_semaphore)
                             .value(PipelineStage::DataUpload.start_value(frame_count))
@@ -1525,9 +1387,7 @@ impl Renderer {
                 .queue_submit2(
                     self.graphics_queue,
                     &[vk::SubmitInfo2::default()
-                        .command_buffer_infos(&[
-                            vk::CommandBufferSubmitInfo::default().command_buffer(frustum_cull)
-                        ])
+                        .command_buffer_infos(&[vk::CommandBufferSubmitInfo::default().command_buffer(frustum_cull)])
                         .wait_semaphore_infos(&[
                             vk::SemaphoreSubmitInfo::default()
                                 .semaphore(self.pipeline_semaphore)
@@ -1535,10 +1395,7 @@ impl Renderer {
                                 .stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER),
                             vk::SemaphoreSubmitInfo::default()
                                 .semaphore(self.pipeline_semaphore)
-                                .value(
-                                    PipelineStage::FrameEnd
-                                        .done_value(frame_count - VISIBILITY_DEPTH),
-                                )
+                                .value(PipelineStage::FrameEnd.done_value(frame_count - VISIBILITY_DEPTH))
                                 .stage_mask(vk::PipelineStageFlags2::TRANSFER),
                         ])
                         .signal_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
@@ -1552,9 +1409,7 @@ impl Renderer {
                 .queue_submit2(
                     self.graphics_queue,
                     &[vk::SubmitInfo2::default()
-                        .command_buffer_infos(&[
-                            vk::CommandBufferSubmitInfo::default().command_buffer(first_draw)
-                        ])
+                        .command_buffer_infos(&[vk::CommandBufferSubmitInfo::default().command_buffer(first_draw)])
                         .wait_semaphore_infos(&[
                             vk::SemaphoreSubmitInfo::default()
                                 .semaphore(image_acquired)
@@ -1580,9 +1435,7 @@ impl Renderer {
                 .queue_submit2(
                     self.graphics_queue,
                     &[vk::SubmitInfo2::default()
-                        .command_buffer_infos(&[
-                            vk::CommandBufferSubmitInfo::default().command_buffer(build_hzb)
-                        ])
+                        .command_buffer_infos(&[vk::CommandBufferSubmitInfo::default().command_buffer(build_hzb)])
                         .wait_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
                             .semaphore(self.pipeline_semaphore)
                             .value(PipelineStage::BuildHzb.start_value(frame_count))
@@ -1724,33 +1577,15 @@ impl Renderer {
             vk_mem::MemoryUsage::AutoPreferDevice,
         );
 
-        self.device
-            .wait_for_fences(&[self.staging_fence], true, u64::MAX)
-            .unwrap();
+        self.device.wait_for_fences(&[self.staging_fence], true, u64::MAX).unwrap();
         self.device.reset_fences(&[self.staging_fence]).unwrap();
 
-        self.device
-            .reset_command_buffer(
-                self.staging_cmd_buffer,
-                vk::CommandBufferResetFlags::empty(),
-            )
-            .unwrap();
-        self.device
-            .begin_command_buffer(
-                self.staging_cmd_buffer,
-                &vk::CommandBufferBeginInfo::default(),
-            )
-            .unwrap();
+        self.device.reset_command_buffer(self.staging_cmd_buffer, vk::CommandBufferResetFlags::empty()).unwrap();
+        self.device.begin_command_buffer(self.staging_cmd_buffer, &vk::CommandBufferBeginInfo::default()).unwrap();
 
         // Upload.
         self.staging_buffer.reset();
-        self.staging_buffer.stage_buffer(
-            &self.device,
-            self.staging_cmd_buffer,
-            &index_buffer,
-            0,
-            indices,
-        );
+        self.staging_buffer.stage_buffer(&self.device, self.staging_cmd_buffer, &index_buffer, 0, indices);
         for (id, vertices) in &new_meshes {
             self.staging_buffer.stage_buffer::<GpuVertex, [GpuVertex]>(
                 &self.device,
@@ -1769,9 +1604,7 @@ impl Renderer {
         );
 
         // Submit (& wait at end of function).
-        self.device
-            .end_command_buffer(self.staging_cmd_buffer)
-            .unwrap();
+        self.device.end_command_buffer(self.staging_cmd_buffer).unwrap();
         self.device
             .queue_submit(
                 self.graphics_queue,
@@ -1781,9 +1614,7 @@ impl Renderer {
             .unwrap();
 
         // Wait for transfer to complete before returning.
-        self.device
-            .wait_for_fences(&[self.staging_fence], true, u64::MAX)
-            .unwrap();
+        self.device.wait_for_fences(&[self.staging_fence], true, u64::MAX).unwrap();
 
         // Scene is ready, push.
         self.scene_resources.push(SceneResources {
@@ -1796,84 +1627,63 @@ impl Renderer {
     }
 
     unsafe fn rebuild_swapchain(&mut self) {
-        // If swapchain resources already exist, in-flight frames may still be
-        // using their depth/HZB views through descriptors. Swapchain rebuilds are
-        // rare, so wait for every FIF before replacing this resource group.
+        use vk_mem::Alloc;
+
+        // Swapchain rebuilds are fairly rare, and fundamentally experience intrusive, so for the sake of simplicity,
+        // we're going to wait until the pipeline is caught up to now (IE, there are no FIF) before rebuilding.
         if self.swapchain_resources.is_some() && self.frame > 0 {
             self.wait_for_pipeline_stage(self.frame, PipelineStage::DataUpload);
         }
 
-        use vk_mem::Alloc;
-        let hzb_set = if let Some(swapchain_resources) = self.swapchain_resources.take() {
-            swapchain_resources.free(&self.device, &self.allocator, self.cmd_pool)
-        } else {
+        // Attempt to take and free the current swapchain resources.
+        let hzb_set_opt = self.swapchain_resources.take().map(|r| r.free(&self.device, &self.allocator, self.cmd_pool));
+
+        // Extract or create the swapchain resources' descriptor set.
+        // TODO: Should we build this here...?
+        let hzb_set = hzb_set_opt.unwrap_or_else(|| {
             self.device
                 .allocate_descriptor_sets(
                     &vk::DescriptorSetAllocateInfo::default()
-                        .descriptor_pool(self._global_descriptor_pool)
-                        .set_layouts(&[self._hzb_set_layout]),
+                        .descriptor_pool(self.global_descriptor_pool)
+                        .set_layouts(&[self.hzb_set_layout]),
                 )
                 .unwrap()[0]
-        };
+        });
 
+        // TODO: Eventually, we will want variable resolutions.
         let vk::Extent2D { width, height, .. } = self.core.surface_extent;
         if width > MAX_HZB_DIMENSION || height > MAX_HZB_DIMENSION {
-            panic!(
-                "HZB/occlusion descriptor set only supports up to 8k; got {}x{}",
-                width, height
-            );
+            panic!("HZB/occlusion descriptor set only supports up to {MAX_HZB_DIMENSION}; got {width}x{height}");
         }
-        let hzb_width = width.div_ceil(2);
-        let hzb_height = height.div_ceil(2);
+
+        // Calculate hzb dimensions for later.
+        let hzb_width = width.div_ceil(2); // div2 for half resolution
+        let hzb_height = height.div_ceil(2); // ..
         let mipmaps = u32::max(hzb_width, hzb_height).ilog2() + 1;
 
         if mipmaps > MAX_HZB_MIPS {
-            panic!(
-                "HZB mip chain exceeds reserved descriptor range: {} mips > {}",
-                mipmaps, MAX_HZB_MIPS
-            );
+            panic!("HZB mip chain exceeds reserved descriptor range: {mipmaps} mips > {MAX_HZB_MIPS}");
         }
+
+        /* Build the HZB images and image views: */
+
         let (hzb_image, hzb_alloc) = self
             .allocator
             .create_image(
                 &vk::ImageCreateInfo::default()
                     .image_type(vk::ImageType::TYPE_2D)
-                    .extent(vk::Extent3D {
-                        width: hzb_width,
-                        height: hzb_height,
-                        depth: 1,
-                    })
+                    .extent(vk::Extent3D { width: hzb_width, height: hzb_height, depth: 1 })
                     .mip_levels(mipmaps)
                     .array_layers(1)
                     .samples(vk::SampleCountFlags::TYPE_1)
                     .format(vk::Format::R32_SFLOAT)
                     .usage(
-                        vk::ImageUsageFlags::TRANSFER_DST
-                            | vk::ImageUsageFlags::SAMPLED
-                            | vk::ImageUsageFlags::STORAGE,
+                        vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::STORAGE,
                     ),
                 &vk_mem::AllocationCreateInfo {
                     required_flags: vk::MemoryPropertyFlags::DEVICE_LOCAL,
                     ..Default::default()
                 },
-            )
-            .unwrap();
-
-        let hzb_test_view = self
-            .device
-            .create_image_view(
-                &vk::ImageViewCreateInfo::default()
-                    .image(hzb_image)
-                    .view_type(vk::ImageViewType::TYPE_2D)
-                    .format(vk::Format::R32_SFLOAT)
-                    .subresource_range(vk::ImageSubresourceRange {
-                        aspect_mask: vk::ImageAspectFlags::COLOR,
-                        base_mip_level: 0,
-                        level_count: vk::REMAINING_MIP_LEVELS,
-                        base_array_layer: 0,
-                        layer_count: 1,
-                    }),
-                None,
             )
             .unwrap();
 
@@ -1923,18 +1733,11 @@ impl Renderer {
 
         let render_finished = (0..self.swapchain.images.len())
             .into_iter()
-            .map(|_| {
-                self.device
-                    .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
-                    .unwrap()
-            })
+            .map(|_| self.device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).unwrap())
             .collect();
 
-        let image_acquired_semaphores = std::array::from_fn(|_| {
-            self.device
-                .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
-                .unwrap()
-        });
+        let image_acquired_semaphores =
+            std::array::from_fn(|_| self.device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).unwrap());
 
         // Per-frame recorded render buffers.
         let cmd_buffers = std::array::from_fn(|_| {
@@ -1967,10 +1770,7 @@ impl Renderer {
                         .array_layers(1)
                         .samples(vk::SampleCountFlags::TYPE_1)
                         .format(vk::Format::D32_SFLOAT)
-                        .usage(
-                            vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
-                                | vk::ImageUsageFlags::SAMPLED,
-                        ),
+                        .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED),
                     &vk_mem::AllocationCreateInfo {
                         required_flags: vk::MemoryPropertyFlags::DEVICE_LOCAL,
                         ..Default::default()
@@ -2011,9 +1811,7 @@ impl Renderer {
         let hzb_dst_infos: Box<_> = hzb_build_dst_views
             .iter()
             .map(|&image_view| {
-                vk::DescriptorImageInfo::default()
-                    .image_view(image_view)
-                    .image_layout(vk::ImageLayout::GENERAL)
+                vk::DescriptorImageInfo::default().image_view(image_view).image_layout(vk::ImageLayout::GENERAL)
             })
             .collect();
 
@@ -2083,8 +1881,7 @@ impl Renderer {
                 vk::ImageMemoryBarrier2::default()
                     .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
                     .dst_stage_mask(
-                        vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS
-                            | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
+                        vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
                     )
                     .image(depth_images[i].0)
                     .subresource_range(
@@ -2101,30 +1898,16 @@ impl Renderer {
             }));
 
             /* Write command buffer and queue. */
-            self.device
-                .wait_for_fences(&[self.staging_fence], true, u64::MAX)
-                .unwrap();
+            self.device.wait_for_fences(&[self.staging_fence], true, u64::MAX).unwrap();
             self.device.reset_fences(&[self.staging_fence]).unwrap();
 
-            self.device
-                .reset_command_buffer(
-                    self.staging_cmd_buffer,
-                    vk::CommandBufferResetFlags::empty(),
-                )
-                .unwrap();
-            self.device
-                .begin_command_buffer(
-                    self.staging_cmd_buffer,
-                    &vk::CommandBufferBeginInfo::default(),
-                )
-                .unwrap();
+            self.device.reset_command_buffer(self.staging_cmd_buffer, vk::CommandBufferResetFlags::empty()).unwrap();
+            self.device.begin_command_buffer(self.staging_cmd_buffer, &vk::CommandBufferBeginInfo::default()).unwrap();
             self.device.cmd_pipeline_barrier2(
                 self.staging_cmd_buffer,
                 &vk::DependencyInfo::default().image_memory_barriers(&tmp),
             );
-            self.device
-                .end_command_buffer(self.staging_cmd_buffer)
-                .unwrap();
+            self.device.end_command_buffer(self.staging_cmd_buffer).unwrap();
 
             self.device
                 .queue_submit(
@@ -2136,16 +1919,13 @@ impl Renderer {
         };
 
         // Wait for transfer to complete before returning.
-        self.device
-            .wait_for_fences(&[self.staging_fence], true, u64::MAX)
-            .unwrap();
+        self.device.wait_for_fences(&[self.staging_fence], true, u64::MAX).unwrap();
 
         self.swapchain_resources = Some(SwapchainResources {
             hzb_image,
-            _hzb_alloc: hzb_alloc,
-            _hzb_test_view: hzb_test_view,
+            hzb_alloc,
             hzb_build_src_views,
-            _hzb_build_dst_views: hzb_build_dst_views,
+            hzb_build_dst_views,
             hzb_set,
 
             render_finished,
@@ -2166,15 +1946,7 @@ impl Renderer {
         self.scene_resources_dirty = true;
         let handle = ObjectHandle(self.resource_counter);
         self.resource_counter += 1;
-        self.objects.push((
-            handle,
-            Object {
-                mesh,
-                position,
-                scale,
-                orientation,
-            },
-        ));
+        self.objects.push((handle, Object { mesh, position, scale, orientation }));
         Some(handle)
     }
 

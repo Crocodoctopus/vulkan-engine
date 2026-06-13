@@ -33,18 +33,15 @@ impl Core {
         let entry = ash::Entry::load().expect("Failed to load vulkan functions.");
 
         let instance = {
-            let required_extensions =
-                ash_window::enumerate_required_extensions(raw_display_handle).unwrap();
+            let required_extensions = ash_window::enumerate_required_extensions(raw_display_handle).unwrap();
             let extensions = [
                 required_extensions,
                 &instance_extensions.map(|x: &CStr| x.as_ptr()),
             ]
             .concat();
 
-            let driver_api_version = entry
-                .try_enumerate_instance_version()
-                .unwrap_or(None)
-                .unwrap_or(vk::API_VERSION_1_0);
+            let driver_api_version =
+                entry.try_enumerate_instance_version().unwrap_or(None).unwrap_or(vk::API_VERSION_1_0);
             let app_info = vk::ApplicationInfo::default()
                 .application_name(c"Raytrace")
                 .api_version(driver_api_version.min(vk::API_VERSION_1_3));
@@ -53,9 +50,7 @@ impl Core {
                 .application_info(&app_info)
                 .enabled_layer_names(&layers)
                 .enabled_extension_names(&extensions);
-            entry
-                .create_instance(&instance_cinfo, None)
-                .expect("Failed to create vulkan instance.")
+            entry.create_instance(&instance_cinfo, None).expect("Failed to create vulkan instance.")
         };
 
         // Find first descrete GPU.
@@ -82,14 +77,8 @@ impl Core {
         let physical_device_properties = instance.get_physical_device_properties(physical_device);
 
         let surface_instance = khr::surface::Instance::new(&entry, &instance);
-        let surface = ash_window::create_surface(
-            &entry,
-            &instance,
-            raw_display_handle,
-            raw_window_handle,
-            None,
-        )
-        .unwrap();
+        let surface =
+            ash_window::create_surface(&entry, &instance, raw_display_handle, raw_window_handle, None).unwrap();
 
         let surface_format = surface_instance
             .get_physical_device_surface_formats(physical_device, surface)
@@ -97,9 +86,8 @@ impl Core {
             .into_iter()
             .next()
             .unwrap();
-        let surface_capabilities = surface_instance
-            .get_physical_device_surface_capabilities(physical_device, surface)
-            .unwrap();
+        let surface_capabilities =
+            surface_instance.get_physical_device_surface_capabilities(physical_device, surface).unwrap();
 
         // Find a queue family that is capable of both present and graphics commands.
         let queue_family_index = instance
@@ -140,10 +128,7 @@ impl Core {
             surface,
             surface_format,
             surface_capabilities,
-            surface_extent: vk::Extent2D {
-                width: viewport_w,
-                height: viewport_h,
-            },
+            surface_extent: vk::Extent2D { width: viewport_w, height: viewport_h },
         }
     }
 }

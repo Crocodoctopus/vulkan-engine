@@ -42,9 +42,7 @@ fn main() {
 
     let cwd = std::env::current_dir().unwrap();
     let mut renderer = Renderer::new(cwd, viewport_w, viewport_h, &window);
-    let viking_room = renderer
-        .load_mesh("resources/models/viking_room.obj")
-        .unwrap();
+    let viking_room = renderer.load_mesh("resources/models/viking_room.obj").unwrap();
     let sphere = renderer.load_mesh("resources/models/sphere.obj").unwrap();
     let bunny = renderer.load_mesh("resources/models/bunny.obj").unwrap();
     let _obj0 = renderer
@@ -56,12 +54,7 @@ fn main() {
         )
         .unwrap();
     let _obj1 = renderer
-        .create_object(
-            sphere,
-            Vec3::new(0.0, 0.0, 0.0),
-            0.05,
-            Quat::from_euler(EulerRot::XYZ, 0.0, 0.0, 0.0),
-        )
+        .create_object(sphere, Vec3::new(0.0, 0.0, 0.0), 0.05, Quat::from_euler(EulerRot::XYZ, 0.0, 0.0, 0.0))
         .unwrap();
     let _obj2 = renderer
         .create_object(
@@ -99,20 +92,14 @@ fn main() {
         #[allow(deprecated)]
         let _status = event_loop.pump_events(Some(std::time::Duration::ZERO), |event, _| {
             match event {
-                Event::WindowEvent {
-                    event: WindowEvent::CloseRequested,
-                    ..
-                } => exit = true,
+                Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => exit = true,
 
                 Event::WindowEvent {
                     event:
                         WindowEvent::KeyboardInput {
                             event:
                                 KeyEvent {
-                                    physical_key: PhysicalKey::Code(key),
-                                    state,
-                                    repeat: false,
-                                    ..
+                                    physical_key: PhysicalKey::Code(key), state, repeat: false, ..
                                 },
                             ..
                         },
@@ -134,12 +121,7 @@ fn main() {
                                     bunny,
                                     Vec3::new(1.0 + 0.55 * i as f32, 0.4, 0.0),
                                     2.0,
-                                    Quat::from_euler(
-                                        EulerRot::XYZ,
-                                        std::f32::consts::PI,
-                                        0.0,
-                                        0.0,
-                                    ),
+                                    Quat::from_euler(EulerRot::XYZ, std::f32::consts::PI, 0.0, 0.0),
                                 )
                                 .unwrap();
                             return;

@@ -29,10 +29,7 @@ impl Swapchain {
                     .min_image_count(swapchain_image_count)
                     .image_format(surface_format.format)
                     .image_color_space(surface_format.color_space)
-                    .image_extent(vk::Extent2D {
-                        width: surface_extent.width,
-                        height: surface_extent.height,
-                    })
+                    .image_extent(vk::Extent2D { width: surface_extent.width, height: surface_extent.height })
                     .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
                     .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
                     .pre_transform(surface_capabilities.current_transform)
@@ -45,10 +42,7 @@ impl Swapchain {
             .unwrap();
 
         // Create image views.
-        let images = swapchain_device
-            .get_swapchain_images(swapchain)
-            .unwrap()
-            .into_boxed_slice();
+        let images = swapchain_device.get_swapchain_images(swapchain).unwrap().into_boxed_slice();
         let color_views = (0..images.len())
             .into_iter()
             .map(|i| {
@@ -71,11 +65,6 @@ impl Swapchain {
             })
             .collect();
 
-        Swapchain {
-            swapchain_device,
-            swapchain,
-            images,
-            views: color_views,
-        }
+        Swapchain { swapchain_device, swapchain, images, views: color_views }
     }
 }

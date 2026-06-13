@@ -1,0 +1,12 @@
+max_width = 120
+use_small_heuristics = "Max"
+fn_call_width = 120
+chain_width = 120
+binop_separator = "Front"
+struct_lit_width = 60
+array_width = 60
+comment_width = 120
+wrap_comments = true
+hard_tabs = false
+tab_spaces = 4
+newline_style = "Unix"

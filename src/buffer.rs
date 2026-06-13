@@ -12,10 +12,7 @@ pub(crate) struct Buffer<T: ?Sized> {
 impl<T: ?Sized> Drop for Buffer<T> {
     fn drop(&mut self) {
         if self.alloc.is_some() {
-            panic!(
-                "Active {} dropped implicitly",
-                std::any::type_name::<Self>()
-            );
+            panic!("Active {} dropped implicitly", std::any::type_name::<Self>());
         }
     }
 }
@@ -68,13 +65,8 @@ impl<T> Buffer<T> {
         unsafe {
             let (buffer, alloc) = allocator
                 .create_buffer(
-                    &vk::BufferCreateInfo::default()
-                        .size(size_of::<T>() as u64)
-                        .usage(vk_usage),
-                    &vk_mem::AllocationCreateInfo {
-                        usage: vma_usage,
-                        ..Default::default()
-                    },
+                    &vk::BufferCreateInfo::default().size(size_of::<T>() as u64).usage(vk_usage),
+                    &vk_mem::AllocationCreateInfo { usage: vma_usage, ..Default::default() },
                 )
                 .unwrap();
 
@@ -103,13 +95,8 @@ impl<T> Buffer<[T]> {
         unsafe {
             let (buffer, alloc) = allocator
                 .create_buffer(
-                    &vk::BufferCreateInfo::default()
-                        .size(len as u64 * size_of::<T>() as u64)
-                        .usage(vk_usage),
-                    &vk_mem::AllocationCreateInfo {
-                        usage: vma_usage,
-                        ..Default::default()
-                    },
+                    &vk::BufferCreateInfo::default().size(len as u64 * size_of::<T>() as u64).usage(vk_usage),
+                    &vk_mem::AllocationCreateInfo { usage: vma_usage, ..Default::default() },
                 )
                 .unwrap();
 

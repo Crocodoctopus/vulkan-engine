@@ -23,8 +23,7 @@ impl StagingBuffer {
                     flags: vk_mem::AllocationCreateFlags::MAPPED
                         | vk_mem::AllocationCreateFlags::HOST_ACCESS_SEQUENTIAL_WRITE,
                     usage: vk_mem::MemoryUsage::AutoPreferHost,
-                    required_flags: vk::MemoryPropertyFlags::HOST_VISIBLE
-                        | vk::MemoryPropertyFlags::HOST_COHERENT,
+                    required_flags: vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
                     ..Default::default()
                 },
             )
@@ -32,12 +31,7 @@ impl StagingBuffer {
 
         let map = allocator.map_memory(&mut alloc).unwrap();
 
-        Self {
-            buffer,
-            alloc,
-            base: map,
-            head: map,
-        }
+        Self { buffer, alloc, base: map, head: map }
     }
 
     pub unsafe fn reset(&mut self) {
