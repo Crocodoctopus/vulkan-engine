@@ -45,6 +45,13 @@ const VISIBILITY_DEPTH: usize = 2;
 const VISIBILITY_BUFFER_COUNT: usize = VISIBILITY_DEPTH + 1;
 const STARTING_FRAME: usize = const_max([MAX_FRAMES_IN_FLIGHT, VISIBILITY_DEPTH]);
 
+// Dedicated HZB/occlusion descriptor set.
+const MAX_HZB_DIMENSION: u32 = 8192;
+const MAX_HZB_MIPS: u32 = MAX_HZB_DIMENSION.div_ceil(2).ilog2() + 1;
+const HZB_DEPTH_IMAGE_CAPACITY: u32 = MAX_FRAMES_IN_FLIGHT as u32;
+const HZB_SAMPLED_IMAGE_CAPACITY: u32 = HZB_DEPTH_IMAGE_CAPACITY + MAX_HZB_MIPS;
+const HZB_STORAGE_IMAGE_CAPACITY: u32 = MAX_HZB_MIPS;
+
 /*
 Plan:
 0) Data upload
@@ -84,6 +91,7 @@ struct SwapchainResources {
     _hzb_test_view: vk::ImageView,
     hzb_build_src_views: Box<[vk::ImageView]>,
     _hzb_build_dst_views: Box<[vk::ImageView]>,
+    hzb_set: vk::DescriptorSet,
 
     render_finished: Box<[vk::Semaphore]>,
     image_acquired_semaphores: [vk::Semaphore; MAX_FRAMES_IN_FLIGHT],
@@ -94,37 +102,53 @@ struct SwapchainResources {
 
 impl SwapchainResources {
     unsafe fn free(
-        mut self,
+        self,
         device: &ash::Device,
         allocator: &vk_mem::Allocator,
         cmd_pool: vk::CommandPool,
-    ) {
-        device.destroy_image_view(self._hzb_test_view, None);
-        for view in self.hzb_build_src_views {
+    ) -> vk::DescriptorSet {
+        let Self {
+            hzb_image,
+            mut _hzb_alloc,
+            _hzb_test_view,
+            hzb_build_src_views,
+            _hzb_build_dst_views,
+            hzb_set,
+            render_finished,
+            image_acquired_semaphores,
+            cmd_buffers,
+            depth_images,
+            depth_views,
+        } = self;
+
+        device.destroy_image_view(_hzb_test_view, None);
+        for view in hzb_build_src_views {
             device.destroy_image_view(view, None);
         }
-        for view in self._hzb_build_dst_views {
+        for view in _hzb_build_dst_views {
             device.destroy_image_view(view, None);
         }
-        allocator.destroy_image(self.hzb_image, &mut self._hzb_alloc);
+        allocator.destroy_image(hzb_image, &mut _hzb_alloc);
 
-        for semaphore in self.render_finished {
+        for semaphore in render_finished {
             device.destroy_semaphore(semaphore, None);
         }
-        for semaphore in self.image_acquired_semaphores {
+        for semaphore in image_acquired_semaphores {
             device.destroy_semaphore(semaphore, None);
         }
 
-        for cmd_buffers in self.cmd_buffers {
+        for cmd_buffers in cmd_buffers {
             device.free_command_buffers(cmd_pool, &cmd_buffers);
         }
 
-        for view in self.depth_views {
+        for view in depth_views {
             device.destroy_image_view(view, None);
         }
-        for (image, mut alloc) in self.depth_images {
+        for (image, mut alloc) in depth_images {
             allocator.destroy_image(image, &mut alloc);
         }
+
+        hzb_set
     }
 }
 
@@ -170,6 +194,7 @@ pub struct Renderer {
 
     /* Desciptor set layouts: */
     _global_set_layout: vk::DescriptorSetLayout,
+    _hzb_set_layout: vk::DescriptorSetLayout,
     _frame_set_layout: vk::DescriptorSetLayout,
 
     /* Pipelines: */
@@ -365,6 +390,35 @@ impl Renderer {
                 )
                 .unwrap();
 
+            let hzb_set_layout = device
+                .create_descriptor_set_layout(
+                    &vk::DescriptorSetLayoutCreateInfo::default()
+                        .push_next(
+                            &mut vk::DescriptorSetLayoutBindingFlagsCreateInfo::default()
+                                .binding_flags(&[
+                                    vk::DescriptorBindingFlags::PARTIALLY_BOUND
+                                        | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
+                                    vk::DescriptorBindingFlags::PARTIALLY_BOUND
+                                        | vk::DescriptorBindingFlags::UPDATE_AFTER_BIND,
+                                ]),
+                        )
+                        .bindings(&[
+                            vk::DescriptorSetLayoutBinding::default()
+                                .binding(0)
+                                .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                                .descriptor_count(HZB_SAMPLED_IMAGE_CAPACITY)
+                                .stage_flags(vk::ShaderStageFlags::ALL),
+                            vk::DescriptorSetLayoutBinding::default()
+                                .binding(1)
+                                .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                                .descriptor_count(HZB_STORAGE_IMAGE_CAPACITY)
+                                .stage_flags(vk::ShaderStageFlags::ALL),
+                        ])
+                        .flags(vk::DescriptorSetLayoutCreateFlags::UPDATE_AFTER_BIND_POOL),
+                    None,
+                )
+                .unwrap();
+
             // Descriptor set layout for per-frame globals.
             let frame_set_layout = device
                 .create_descriptor_set_layout(
@@ -542,7 +596,7 @@ impl Renderer {
                 let pipeline_layout = device
                     .create_pipeline_layout(
                         &vk::PipelineLayoutCreateInfo::default()
-                            .set_layouts(&[global_set_layout])
+                            .set_layouts(&[hzb_set_layout])
                             .push_constant_ranges(&[vk::PushConstantRange::default()
                                 .stage_flags(vk::ShaderStageFlags::COMPUTE)
                                 .offset(0)
@@ -626,12 +680,12 @@ impl Renderer {
                         .pool_sizes(&[
                             vk::DescriptorPoolSize::default()
                                 .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                                .descriptor_count(1024),
+                                .descriptor_count(1024 + HZB_SAMPLED_IMAGE_CAPACITY),
                             vk::DescriptorPoolSize::default()
                                 .ty(vk::DescriptorType::STORAGE_IMAGE)
-                                .descriptor_count(1024),
+                                .descriptor_count(1024 + HZB_STORAGE_IMAGE_CAPACITY),
                         ])
-                        .max_sets(1)
+                        .max_sets(2)
                         .flags(vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND),
                     None,
                 )
@@ -743,6 +797,7 @@ impl Renderer {
                 cmd_pool,
 
                 _global_set_layout: global_set_layout,
+                _hzb_set_layout: hzb_set_layout,
                 _frame_set_layout: frame_set_layout,
 
                 frustum_cull_pipeline_layout,
@@ -876,8 +931,10 @@ impl Renderer {
             cmd_buffers,
             depth_images,
             depth_views,
+            hzb_set,
             ..
         } = self.swapchain_resources.as_ref().unwrap();
+        let hzb_set = *hzb_set;
 
         let image_acquired = image_acquired_semaphores[frame_index];
 
@@ -1326,7 +1383,7 @@ impl Renderer {
                             vk::PipelineBindPoint::COMPUTE,
                             self.build_hzb_pipeline_layout,
                             0,
-                            &[global_set],
+                            &[hzb_set],
                             &[],
                         );
 
@@ -1746,16 +1803,36 @@ impl Renderer {
             self.wait_for_pipeline_stage(self.frame, PipelineStage::DataUpload);
         }
 
-        // Free the previous SwapchainResources.
-        if let Some(swapchain_resources) = self.swapchain_resources.take() {
-            swapchain_resources.free(&self.device, &self.allocator, self.cmd_pool);
-        }
-
         use vk_mem::Alloc;
+        let hzb_set = if let Some(swapchain_resources) = self.swapchain_resources.take() {
+            swapchain_resources.free(&self.device, &self.allocator, self.cmd_pool)
+        } else {
+            self.device
+                .allocate_descriptor_sets(
+                    &vk::DescriptorSetAllocateInfo::default()
+                        .descriptor_pool(self._global_descriptor_pool)
+                        .set_layouts(&[self._hzb_set_layout]),
+                )
+                .unwrap()[0]
+        };
+
         let vk::Extent2D { width, height, .. } = self.core.surface_extent;
+        if width > MAX_HZB_DIMENSION || height > MAX_HZB_DIMENSION {
+            panic!(
+                "HZB/occlusion descriptor set only supports up to 8k; got {}x{}",
+                width, height
+            );
+        }
         let hzb_width = width.div_ceil(2);
         let hzb_height = height.div_ceil(2);
         let mipmaps = u32::max(hzb_width, hzb_height).ilog2() + 1;
+
+        if mipmaps > MAX_HZB_MIPS {
+            panic!(
+                "HZB mip chain exceeds reserved descriptor range: {} mips > {}",
+                mipmaps, MAX_HZB_MIPS
+            );
+        }
         let (hzb_image, hzb_alloc) = self
             .allocator
             .create_image(
@@ -1956,21 +2033,21 @@ impl Renderer {
         self.device.update_descriptor_sets(
             &[
                 vk::WriteDescriptorSet::default()
-                    .dst_set(self.global_set)
+                    .dst_set(hzb_set)
                     .dst_binding(0)
                     .dst_array_element(0)
                     .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                     .descriptor_count(depth_infos.len() as u32)
                     .image_info(&depth_infos),
                 vk::WriteDescriptorSet::default()
-                    .dst_set(self.global_set)
+                    .dst_set(hzb_set)
                     .dst_binding(0)
-                    .dst_array_element(depth_infos.len() as u32)
+                    .dst_array_element(MAX_FRAMES_IN_FLIGHT as u32)
                     .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
                     .descriptor_count(hzb_src_infos.len() as u32)
                     .image_info(&hzb_src_infos),
                 vk::WriteDescriptorSet::default()
-                    .dst_set(self.global_set)
+                    .dst_set(hzb_set)
                     .dst_binding(1)
                     .dst_array_element(0)
                     .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
@@ -2069,6 +2146,7 @@ impl Renderer {
             _hzb_test_view: hzb_test_view,
             hzb_build_src_views,
             _hzb_build_dst_views: hzb_build_dst_views,
+            hzb_set,
 
             render_finished,
             image_acquired_semaphores,
