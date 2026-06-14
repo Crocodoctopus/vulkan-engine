@@ -44,7 +44,7 @@ fn main() {
     let mut renderer = Renderer::new(cwd, viewport_w, viewport_h, &window);
     let viking_room = renderer.load_mesh("resources/models/viking_room.obj").unwrap();
     let sphere = renderer.load_mesh("resources/models/sphere.obj").unwrap();
-    let bunny = renderer.load_mesh("resources/models/bunny.obj").unwrap();
+    let bunny = renderer.load_mesh("resources/models/bunny2.obj").unwrap();
     let _obj0 = renderer
         .create_object(
             viking_room,

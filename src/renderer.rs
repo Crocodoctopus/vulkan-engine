@@ -40,6 +40,20 @@ const fn const_max<const N: usize>(values: [usize; N]) -> usize {
     max
 }
 
+const fn const_min<const N: usize>(values: [usize; N]) -> usize {
+    let mut i = 0;
+    let mut min = usize::MAX;
+
+    while i < N {
+        if values[i] < min {
+            min = values[i];
+        }
+        i += 1;
+    }
+
+    min
+}
+
 pub(crate) const MAX_FRAMES_IN_FLIGHT: usize = 2;
 const VISIBILITY_DEPTH: usize = 2;
 const VISIBILITY_BUFFER_COUNT: usize = VISIBILITY_DEPTH + 1;
@@ -48,9 +62,11 @@ const STARTING_FRAME: usize = const_max([MAX_FRAMES_IN_FLIGHT, VISIBILITY_DEPTH]
 // Dedicated HZB/occlusion descriptor set.
 const MAX_HZB_DIMENSION: u32 = 8192;
 const MAX_HZB_MIPS: u32 = MAX_HZB_DIMENSION.div_ceil(2).ilog2() + 1;
-const HZB_DEPTH_IMAGE_CAPACITY: u32 = MAX_FRAMES_IN_FLIGHT as u32;
-const HZB_SAMPLED_IMAGE_CAPACITY: u32 = HZB_DEPTH_IMAGE_CAPACITY + MAX_HZB_MIPS;
+const HZB_SAMPLED_IMAGE_CAPACITY: u32 = 1 + MAX_HZB_MIPS;
 const HZB_STORAGE_IMAGE_CAPACITY: u32 = MAX_HZB_MIPS;
+
+// The maximum number of FIF that can be in the BuildHzb of OcclusionCull phase of the pipeline.
+const MAX_HZB_IN_FLIGHT: usize = const_min([MAX_FRAMES_IN_FLIGHT, VISIBILITY_DEPTH]);
 
 /*
 Plan:
@@ -83,14 +99,14 @@ impl PipelineStage {
     }
 }
 
-/* Resources that need regeneration when Swapchain changes */
 struct SwapchainResources {
-    /* TODO: Currently, only 1 FIF can use these, so we only need 1 */
-    hzb_image: vk::Image,
-    hzb_alloc: vk_mem::Allocation,
-    hzb_build_src_views: Box<[vk::ImageView]>,
-    hzb_build_dst_views: Box<[vk::ImageView]>,
-    hzb_set: vk::DescriptorSet,
+    // HZB is per-frame scratch, but the ring only needs to be large enough to
+    // cover the live visibility window.
+    hzb_images: [vk::Image; MAX_HZB_IN_FLIGHT],
+    hzb_allocs: [vk_mem::Allocation; MAX_HZB_IN_FLIGHT],
+    hzb_build_src_views: [Box<[vk::ImageView]>; MAX_HZB_IN_FLIGHT],
+    hzb_build_dst_views: [Box<[vk::ImageView]>; MAX_HZB_IN_FLIGHT],
+    hzb_sets: [vk::DescriptorSet; MAX_HZB_IN_FLIGHT],
 
     render_finished: Box<[vk::Semaphore]>,
     image_acquired_semaphores: [vk::Semaphore; MAX_FRAMES_IN_FLIGHT],
@@ -100,18 +116,20 @@ struct SwapchainResources {
 }
 
 impl SwapchainResources {
+    const HZB_SLOT_COUNT: usize = MAX_HZB_IN_FLIGHT;
+
     unsafe fn free(
         self,
         device: &ash::Device,
         allocator: &vk_mem::Allocator,
         cmd_pool: vk::CommandPool,
-    ) -> vk::DescriptorSet {
+    ) -> [vk::DescriptorSet; MAX_HZB_IN_FLIGHT] {
         let Self {
-            hzb_image,
-            mut hzb_alloc,
+            hzb_images,
+            mut hzb_allocs,
             hzb_build_src_views,
             hzb_build_dst_views,
-            hzb_set,
+            hzb_sets,
             render_finished,
             image_acquired_semaphores,
             cmd_buffers,
@@ -119,13 +137,15 @@ impl SwapchainResources {
             depth_views,
         } = self;
 
-        for view in hzb_build_src_views {
-            device.destroy_image_view(view, None);
+        for slot in 0..Self::HZB_SLOT_COUNT {
+            for view in hzb_build_src_views[slot].iter().copied() {
+                device.destroy_image_view(view, None);
+            }
+            for view in hzb_build_dst_views[slot].iter().copied() {
+                device.destroy_image_view(view, None);
+            }
+            allocator.destroy_image(hzb_images[slot], &mut hzb_allocs[slot]);
         }
-        for view in hzb_build_dst_views {
-            device.destroy_image_view(view, None);
-        }
-        allocator.destroy_image(hzb_image, &mut hzb_alloc);
 
         for semaphore in render_finished {
             device.destroy_semaphore(semaphore, None);
@@ -145,7 +165,7 @@ impl SwapchainResources {
             allocator.destroy_image(image, &mut alloc);
         }
 
-        hzb_set
+        hzb_sets
     }
 }
 
@@ -611,7 +631,7 @@ impl Renderer {
                 .unwrap();
 
             // Staging data.
-            let staging_buffer = StagingBuffer::new(10000000, &allocator);
+            let staging_buffer = StagingBuffer::new(64 * 1024 * 1024, &allocator);
 
             let staging_cmd_buffer = device
                 .allocate_command_buffers(
@@ -647,12 +667,14 @@ impl Renderer {
                         .pool_sizes(&[
                             vk::DescriptorPoolSize::default()
                                 .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                                .descriptor_count(1024 + HZB_SAMPLED_IMAGE_CAPACITY),
-                            vk::DescriptorPoolSize::default()
-                                .ty(vk::DescriptorType::STORAGE_IMAGE)
-                                .descriptor_count(1024 + HZB_STORAGE_IMAGE_CAPACITY),
+                                .descriptor_count(
+                                    1024 + (SwapchainResources::HZB_SLOT_COUNT as u32 * HZB_SAMPLED_IMAGE_CAPACITY),
+                                ),
+                            vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_IMAGE).descriptor_count(
+                                1024 + (SwapchainResources::HZB_SLOT_COUNT as u32 * HZB_STORAGE_IMAGE_CAPACITY),
+                            ),
                         ])
-                        .max_sets(2)
+                        .max_sets(1 + SwapchainResources::HZB_SLOT_COUNT as u32)
                         .flags(vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND),
                     None,
                 )
@@ -881,19 +903,22 @@ impl Renderer {
         } = self.scene_resources.last_mut().unwrap();
 
         let SwapchainResources {
-            hzb_image,
+            hzb_images,
             hzb_build_src_views,
+            hzb_sets,
             render_finished,
             image_acquired_semaphores,
             cmd_buffers,
             depth_images,
             depth_views,
-            hzb_set,
             ..
         } = self.swapchain_resources.as_ref().unwrap();
-        let hzb_set = *hzb_set;
 
         let image_acquired = image_acquired_semaphores[frame_index];
+        let hzb_slot = frame_count % SwapchainResources::HZB_SLOT_COUNT;
+        let hzb_image = hzb_images[hzb_slot];
+        let hzb_set = hzb_sets[hzb_slot];
+        let hzb_build_src_views = &hzb_build_src_views[hzb_slot];
 
         // Command buffer associated with this frame.
         let data_upload = cmd_buffers[frame_index][PipelineStage::DataUpload as usize];
@@ -931,6 +956,19 @@ impl Renderer {
 
             // TODO: keep this here? Its a per-fif variable.
             let depth_view = depth_views[frame_index];
+            self.device.update_descriptor_sets(
+                &[vk::WriteDescriptorSet::default()
+                    .dst_set(hzb_set)
+                    .dst_binding(0)
+                    .dst_array_element(0)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .descriptor_count(1)
+                    .image_info(&[vk::DescriptorImageInfo::default()
+                        .image_view(depth_view)
+                        .sampler(self.hzb_sampler)
+                        .image_layout(vk::ImageLayout::DEPTH_READ_ONLY_OPTIMAL)])],
+                &[],
+            );
 
             //
             let (image_index, _) = self
@@ -1227,7 +1265,7 @@ impl Renderer {
                             .src_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
                             .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
                             .dst_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
-                            .image(*hzb_image)
+                            .image(hzb_image)
                             .subresource_range(
                                 vk::ImageSubresourceRange::default()
                                     .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -1298,7 +1336,7 @@ impl Renderer {
                             .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
                             .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
                             .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                            .image(*hzb_image)
+                            .image(hzb_image)
                             .subresource_range(
                                 vk::ImageSubresourceRange::default()
                                     .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -1314,12 +1352,12 @@ impl Renderer {
 
                 // For the first compute, the src view is the depth buffer, which
                 // depends on the depth buffer.
-                build_hzb(frame_index as u32, 0);
+                build_hzb(0, 0);
 
                 // The rest are standard.
                 let mips = hzb_build_src_views.len();
                 for i in 0..mips - 1 {
-                    build_hzb(2 + i as u32, 1 + i as u32);
+                    build_hzb(1 + i as u32, 1 + i as u32);
                 }
 
                 self.device.cmd_pipeline_barrier2(
@@ -1331,7 +1369,7 @@ impl Renderer {
                             .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
                             .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
                             .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                            .image(*hzb_image)
+                            .image(hzb_image)
                             .subresource_range(
                                 vk::ImageSubresourceRange::default()
                                     .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -1636,19 +1674,21 @@ impl Renderer {
         }
 
         // Attempt to take and free the current swapchain resources.
-        let hzb_set_opt = self.swapchain_resources.take().map(|r| r.free(&self.device, &self.allocator, self.cmd_pool));
-
-        // Extract or create the swapchain resources' descriptor set.
-        // TODO: Should we build this here...?
-        let hzb_set = hzb_set_opt.unwrap_or_else(|| {
-            self.device
-                .allocate_descriptor_sets(
-                    &vk::DescriptorSetAllocateInfo::default()
-                        .descriptor_pool(self.global_descriptor_pool)
-                        .set_layouts(&[self.hzb_set_layout]),
-                )
-                .unwrap()[0]
-        });
+        let hzb_sets = self
+            .swapchain_resources
+            .take()
+            .map(|r| r.free(&self.device, &self.allocator, self.cmd_pool))
+            .unwrap_or_else(|| {
+                self.device
+                    .allocate_descriptor_sets(
+                        &vk::DescriptorSetAllocateInfo::default()
+                            .descriptor_pool(self.global_descriptor_pool)
+                            .set_layouts(&[self.hzb_set_layout; SwapchainResources::HZB_SLOT_COUNT]),
+                    )
+                    .unwrap()
+                    .try_into()
+                    .unwrap()
+            });
 
         // TODO: Eventually, we will want variable resolutions.
         let vk::Extent2D { width, height, .. } = self.core.surface_extent;
@@ -1666,70 +1706,84 @@ impl Renderer {
         }
 
         /* Build the HZB images and image views: */
+        let mut hzb_allocs: [Option<vk_mem::Allocation>; SwapchainResources::HZB_SLOT_COUNT] =
+            std::array::from_fn(|_| None);
+        let hzb_images = std::array::from_fn(|slot| {
+            let (hzb_image, hzb_alloc) = self
+                .allocator
+                .create_image(
+                    &vk::ImageCreateInfo::default()
+                        .image_type(vk::ImageType::TYPE_2D)
+                        .extent(vk::Extent3D { width: hzb_width, height: hzb_height, depth: 1 })
+                        .mip_levels(mipmaps)
+                        .array_layers(1)
+                        .samples(vk::SampleCountFlags::TYPE_1)
+                        .format(vk::Format::R32_SFLOAT)
+                        .usage(
+                            vk::ImageUsageFlags::TRANSFER_DST
+                                | vk::ImageUsageFlags::SAMPLED
+                                | vk::ImageUsageFlags::STORAGE,
+                        ),
+                    &vk_mem::AllocationCreateInfo {
+                        required_flags: vk::MemoryPropertyFlags::DEVICE_LOCAL,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            hzb_allocs[slot] = Some(hzb_alloc);
+            hzb_image
+        });
+        let hzb_allocs = hzb_allocs.map(|alloc| alloc.unwrap());
 
-        let (hzb_image, hzb_alloc) = self
-            .allocator
-            .create_image(
-                &vk::ImageCreateInfo::default()
-                    .image_type(vk::ImageType::TYPE_2D)
-                    .extent(vk::Extent3D { width: hzb_width, height: hzb_height, depth: 1 })
-                    .mip_levels(mipmaps)
-                    .array_layers(1)
-                    .samples(vk::SampleCountFlags::TYPE_1)
-                    .format(vk::Format::R32_SFLOAT)
-                    .usage(
-                        vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::STORAGE,
-                    ),
-                &vk_mem::AllocationCreateInfo {
-                    required_flags: vk::MemoryPropertyFlags::DEVICE_LOCAL,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
+        let hzb_build_src_views = std::array::from_fn(|slot| {
+            (0..mipmaps)
+                .into_iter()
+                .map(|level| {
+                    self.device
+                        .create_image_view(
+                            &vk::ImageViewCreateInfo::default()
+                                .image(hzb_images[slot])
+                                .view_type(vk::ImageViewType::TYPE_2D)
+                                .format(vk::Format::R32_SFLOAT)
+                                .subresource_range(vk::ImageSubresourceRange {
+                                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                                    base_mip_level: level,
+                                    level_count: 1,
+                                    base_array_layer: 0,
+                                    layer_count: 1,
+                                }),
+                            None,
+                        )
+                        .unwrap()
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice()
+        });
 
-        let hzb_build_src_views: Box<[vk::ImageView]> = (0..mipmaps)
-            .into_iter()
-            .map(|level| {
-                self.device
-                    .create_image_view(
-                        &vk::ImageViewCreateInfo::default()
-                            .image(hzb_image)
-                            .view_type(vk::ImageViewType::TYPE_2D)
-                            .format(vk::Format::R32_SFLOAT)
-                            .subresource_range(vk::ImageSubresourceRange {
-                                aspect_mask: vk::ImageAspectFlags::COLOR,
-                                base_mip_level: level,
-                                level_count: 1,
-                                base_array_layer: 0,
-                                layer_count: 1,
-                            }),
-                        None,
-                    )
-                    .unwrap()
-            })
-            .collect();
-
-        let hzb_build_dst_views: Box<[vk::ImageView]> = (0..mipmaps)
-            .into_iter()
-            .map(|level| {
-                self.device
-                    .create_image_view(
-                        &vk::ImageViewCreateInfo::default()
-                            .image(hzb_image)
-                            .view_type(vk::ImageViewType::TYPE_2D)
-                            .format(vk::Format::R32_SFLOAT)
-                            .subresource_range(vk::ImageSubresourceRange {
-                                aspect_mask: vk::ImageAspectFlags::COLOR,
-                                base_mip_level: level,
-                                level_count: 1,
-                                base_array_layer: 0,
-                                layer_count: 1,
-                            }),
-                        None,
-                    )
-                    .unwrap()
-            })
-            .collect();
+        let hzb_build_dst_views = std::array::from_fn(|slot| {
+            (0..mipmaps)
+                .into_iter()
+                .map(|level| {
+                    self.device
+                        .create_image_view(
+                            &vk::ImageViewCreateInfo::default()
+                                .image(hzb_images[slot])
+                                .view_type(vk::ImageViewType::TYPE_2D)
+                                .format(vk::Format::R32_SFLOAT)
+                                .subresource_range(vk::ImageSubresourceRange {
+                                    aspect_mask: vk::ImageAspectFlags::COLOR,
+                                    base_mip_level: level,
+                                    level_count: 1,
+                                    base_array_layer: 0,
+                                    layer_count: 1,
+                                }),
+                            None,
+                        )
+                        .unwrap()
+                })
+                .collect::<Vec<_>>()
+                .into_boxed_slice()
+        });
 
         let render_finished = (0..self.swapchain.images.len())
             .into_iter()
@@ -1798,83 +1852,81 @@ impl Renderer {
                 .unwrap()
         });
 
-        let hzb_src_infos: Box<_> = hzb_build_src_views
-            .iter()
-            .map(|&image_view| {
-                vk::DescriptorImageInfo::default()
-                    .image_view(image_view)
-                    .sampler(self.hzb_sampler)
-                    .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-            })
-            .collect();
+        // Write descriptors for each HZB scratch slot.
+        for slot in 0..SwapchainResources::HZB_SLOT_COUNT {
+            let hzb_src_infos: Box<_> = hzb_build_src_views[slot]
+                .iter()
+                .map(|&image_view| {
+                    vk::DescriptorImageInfo::default()
+                        .image_view(image_view)
+                        .sampler(self.hzb_sampler)
+                        .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                })
+                .collect();
 
-        let hzb_dst_infos: Box<_> = hzb_build_dst_views
-            .iter()
-            .map(|&image_view| {
-                vk::DescriptorImageInfo::default().image_view(image_view).image_layout(vk::ImageLayout::GENERAL)
-            })
-            .collect();
+            let hzb_dst_infos: Box<_> = hzb_build_dst_views[slot]
+                .iter()
+                .map(|&image_view| {
+                    vk::DescriptorImageInfo::default().image_view(image_view).image_layout(vk::ImageLayout::GENERAL)
+                })
+                .collect();
 
-        let depth_infos = [
-            vk::DescriptorImageInfo::default()
-                .image_view(depth_views[0])
+            let depth_info = [vk::DescriptorImageInfo::default()
+                .image_view(depth_views[slot % MAX_FRAMES_IN_FLIGHT])
                 .sampler(self.hzb_sampler)
-                .image_layout(vk::ImageLayout::DEPTH_READ_ONLY_OPTIMAL),
-            vk::DescriptorImageInfo::default()
-                .image_view(depth_views[1])
-                .sampler(self.hzb_sampler)
-                .image_layout(vk::ImageLayout::DEPTH_READ_ONLY_OPTIMAL),
-        ];
+                .image_layout(vk::ImageLayout::DEPTH_READ_ONLY_OPTIMAL)];
 
-        // Write the depth buffers to index 0 & 1, followed by HZB mips.
-        // This is safe because all FIF are done.
-        self.device.update_descriptor_sets(
-            &[
-                vk::WriteDescriptorSet::default()
-                    .dst_set(hzb_set)
-                    .dst_binding(0)
-                    .dst_array_element(0)
-                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                    .descriptor_count(depth_infos.len() as u32)
-                    .image_info(&depth_infos),
-                vk::WriteDescriptorSet::default()
-                    .dst_set(hzb_set)
-                    .dst_binding(0)
-                    .dst_array_element(MAX_FRAMES_IN_FLIGHT as u32)
-                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                    .descriptor_count(hzb_src_infos.len() as u32)
-                    .image_info(&hzb_src_infos),
-                vk::WriteDescriptorSet::default()
-                    .dst_set(hzb_set)
-                    .dst_binding(1)
-                    .dst_array_element(0)
-                    .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-                    .descriptor_count(hzb_dst_infos.len() as u32)
-                    .image_info(&hzb_dst_infos),
-            ],
-            &[],
-        );
+            self.device.update_descriptor_sets(
+                &[
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(hzb_sets[slot])
+                        .dst_binding(0)
+                        .dst_array_element(0)
+                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .descriptor_count(depth_info.len() as u32)
+                        .image_info(&depth_info),
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(hzb_sets[slot])
+                        .dst_binding(0)
+                        .dst_array_element(1)
+                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .descriptor_count(hzb_src_infos.len() as u32)
+                        .image_info(&hzb_src_infos),
+                    vk::WriteDescriptorSet::default()
+                        .dst_set(hzb_sets[slot])
+                        .dst_binding(1)
+                        .dst_array_element(0)
+                        .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
+                        .descriptor_count(hzb_dst_infos.len() as u32)
+                        .image_info(&hzb_dst_infos),
+                ],
+                &[],
+            );
+        }
 
         // Transition some of the resouces we just made.
         {
             // Start with hzb transition.
-            let mut tmp = vec![
-                vk::ImageMemoryBarrier2::default()
-                    .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
-                    .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                    .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                    .image(hzb_image)
-                    .subresource_range(
-                        vk::ImageSubresourceRange::default()
-                            .aspect_mask(vk::ImageAspectFlags::COLOR)
-                            .base_mip_level(0)
-                            .level_count(vk::REMAINING_MIP_LEVELS)
-                            .base_array_layer(0)
-                            .layer_count(1),
-                    )
-                    .old_layout(vk::ImageLayout::UNDEFINED)
-                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
-            ];
+            let mut tmp = Vec::with_capacity(SwapchainResources::HZB_SLOT_COUNT + MAX_FRAMES_IN_FLIGHT);
+            for slot in 0..SwapchainResources::HZB_SLOT_COUNT {
+                tmp.push(
+                    vk::ImageMemoryBarrier2::default()
+                        .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
+                        .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                        .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                        .image(hzb_images[slot])
+                        .subresource_range(
+                            vk::ImageSubresourceRange::default()
+                                .aspect_mask(vk::ImageAspectFlags::COLOR)
+                                .base_mip_level(0)
+                                .level_count(vk::REMAINING_MIP_LEVELS)
+                                .base_array_layer(0)
+                                .layer_count(1),
+                        )
+                        .old_layout(vk::ImageLayout::UNDEFINED)
+                        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+                );
+            }
 
             // Add depth transitions.
             tmp.extend((0..MAX_FRAMES_IN_FLIGHT).into_iter().map(|i| {
@@ -1922,11 +1974,11 @@ impl Renderer {
         self.device.wait_for_fences(&[self.staging_fence], true, u64::MAX).unwrap();
 
         self.swapchain_resources = Some(SwapchainResources {
-            hzb_image,
-            hzb_alloc,
+            hzb_images,
+            hzb_allocs,
             hzb_build_src_views,
             hzb_build_dst_views,
-            hzb_set,
+            hzb_sets,
 
             render_finished,
             image_acquired_semaphores,
