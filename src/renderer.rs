@@ -837,7 +837,6 @@ impl Renderer {
             unsafe {
                 self.rebuild_swapchain();
             }
-            println!("SwapchainResource regenerated!");
         }
 
         if self.scene_resources_dirty {
@@ -845,7 +844,6 @@ impl Renderer {
             unsafe {
                 self.rebuild_scene();
             }
-            println!("SceneResource regenerated!");
         }
 
         let frame_index = self.frame % MAX_FRAMES_IN_FLIGHT;
@@ -1546,6 +1544,7 @@ impl Renderer {
         let mut indices = vec![];
         let mut meshlet_data = vec![];
         let mut instances = 0u32;
+        let mut triangle_count = 0usize;
         let mut first_index = 0;
         for (i, (_, object)) in self.objects.iter().enumerate() {
             // Get associated mesh and index offset.
@@ -1560,6 +1559,7 @@ impl Renderer {
 
             // Mesh data.
             for meshlet in mesh {
+                triangle_count += meshlet.indices.len() / 3;
                 meshlet_data.push(GpuMeshletInstance {
                     center: Vec3::from(meshlet.center),
                     radius: meshlet.radius,
@@ -1575,6 +1575,17 @@ impl Renderer {
                 instances += 1;
             }
         }
+
+        let object_count = self.objects.len();
+        let meshlet_count = instances as usize;
+        let new_mesh_count = new_meshes.len();
+        let index_upload_bytes = indices.len() * std::mem::size_of::<u32>();
+        let vertex_upload_bytes = new_meshes
+            .iter()
+            .map(|(_, vertices)| vertices.len() * std::mem::size_of::<GpuVertex>())
+            .sum::<usize>();
+        let meshlet_upload_bytes = meshlet_data.len() * std::mem::size_of::<GpuMeshletInstance>();
+        let total_upload_bytes = index_upload_bytes + vertex_upload_bytes + meshlet_upload_bytes;
 
         let index_buffer = Buffer::<[u32]>::new(
             &self.allocator,
@@ -1666,6 +1677,18 @@ impl Renderer {
             indirect_cmd_buffer,
             indirect_count_buffer,
         });
+
+        println!(
+            "New scene pushed:\n  objects={}\n  meshlets={}\n  triangles={}\n  new_meshes={}\n  upload={} bytes\n  indices={} bytes\n  vertices={} bytes\n  meshlets={} bytes",
+            object_count,
+            meshlet_count,
+            triangle_count,
+            new_mesh_count,
+            total_upload_bytes,
+            index_upload_bytes,
+            vertex_upload_bytes,
+            meshlet_upload_bytes,
+        );
     }
 
     unsafe fn rebuild_swapchain(&mut self) {
@@ -1990,6 +2013,8 @@ impl Renderer {
             depth_images,
             depth_views,
         });
+
+        println!("SwapchainResource rebuilt!");
     }
 
     pub fn create_object(
