@@ -21,16 +21,17 @@ mod swapchain;
 
 use crate::renderer::*;
 use glam::*;
-use winit::dpi::PhysicalSize;
-use winit::event::{ElementState, Event, KeyEvent, WindowEvent};
-use winit::event_loop::EventLoop;
+use winit::dpi::{PhysicalPosition, PhysicalSize};
+use winit::event::{DeviceEvent, ElementState, Event, KeyEvent, WindowEvent};
+use winit::event_loop::{DeviceEvents, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::Window;
+use winit::window::{CursorGrabMode, Window};
 
 fn main() {
     // Create window.
     let (viewport_w, viewport_h) = (1080_u32, 720_u32);
     let mut event_loop = EventLoop::new().expect("Could not create window event loop.");
+    event_loop.listen_device_events(DeviceEvents::Always);
     #[allow(deprecated)]
     let window = event_loop
         .create_window(
@@ -39,6 +40,10 @@ fn main() {
                 .with_inner_size(PhysicalSize::new(viewport_w, viewport_h)),
         )
         .expect("Could not create window.");
+    window.set_cursor_visible(false);
+    let center = PhysicalPosition::new(viewport_w as f64 * 0.5, viewport_h as f64 * 0.5);
+    let _ = window.set_cursor_grab(CursorGrabMode::Locked).or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
+    let _ = window.set_cursor_position(center);
 
     let cwd = std::env::current_dir().unwrap();
     let mut renderer = Renderer::new(cwd, viewport_w, viewport_h, &window);
@@ -83,16 +88,20 @@ fn main() {
     let mut a_down = false;
     let mut s_down = false;
     let mut d_down = false;
-    let mut q_down = false;
-    let mut e_down = false;
     loop {
         // Input.
         let mut exit = false;
+        let mut mouse_dx = 0.0_f64;
+        let mut mouse_dy = 0.0_f64;
         use winit::platform::pump_events::EventLoopExtPumpEvents;
         #[allow(deprecated)]
         let _status = event_loop.pump_events(Some(std::time::Duration::ZERO), |event, _| {
             match event {
                 Event::WindowEvent { event: WindowEvent::CloseRequested, .. } => exit = true,
+                Event::DeviceEvent { event: DeviceEvent::MouseMotion { delta }, .. } => {
+                    mouse_dx += delta.0;
+                    mouse_dy += delta.1;
+                }
 
                 Event::WindowEvent {
                     event:
@@ -111,8 +120,6 @@ fn main() {
                         KeyCode::KeyA => &mut a_down,
                         KeyCode::KeyS => &mut s_down,
                         KeyCode::KeyD => &mut d_down,
-                        KeyCode::KeyQ => &mut q_down,
-                        KeyCode::KeyE => &mut e_down,
                         KeyCode::KeyZ if state == ElementState::Pressed => {
                             let i = bunny_count;
                             bunny_count += 1;
@@ -140,6 +147,14 @@ fn main() {
             }
         });
 
+        if mouse_dx != 0.0 || mouse_dy != 0.0 {
+            renderer.cam_rot[0] += mouse_dx as f32 * 0.0025;
+            renderer.cam_rot[1] += mouse_dy as f32 * 0.0025;
+            renderer.cam_rot[1] = renderer
+                .cam_rot[1]
+                .clamp(-std::f32::consts::FRAC_PI_2 + 0.001, std::f32::consts::FRAC_PI_2 - 0.001);
+        }
+
         if exit {
             break;
         }
@@ -157,29 +172,21 @@ fn main() {
             renderer.cam_pos.x += dt * renderer.cam_rot[0].sin();
         }
 
-        // Turn left.
-        if a_down && !d_down {
-            renderer.cam_rot[0] -= dt;
-        }
-        // Turn right.
-        if !a_down && d_down {
-            renderer.cam_rot[0] += dt;
-        }
-
         // Strafe left.
-        if e_down && !q_down {
-            renderer.cam_pos.x += dt * renderer.cam_rot[0].cos();
-            renderer.cam_pos.z += dt * renderer.cam_rot[0].sin();
-        }
-        // Strafe right.
-        if !e_down && q_down {
+        if a_down && !d_down {
             renderer.cam_pos.x -= dt * renderer.cam_rot[0].cos();
             renderer.cam_pos.z -= dt * renderer.cam_rot[0].sin();
+        }
+        // Strafe right.
+        if !a_down && d_down {
+            renderer.cam_pos.x += dt * renderer.cam_rot[0].cos();
+            renderer.cam_pos.z += dt * renderer.cam_rot[0].sin();
         }
 
         //cam_vr = cam_vr.clamp(-FRAC_PI_2, FRAC_PI_2);
 
         renderer.render(time);
+        let _ = window.set_cursor_position(center);
 
         //timestamp += 16666;
         time += 0.016666 * 0.1;

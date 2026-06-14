@@ -1041,7 +1041,11 @@ impl Renderer {
                         0.1,
                     );
 
-                    let p = Vec3::new(self.cam_rot[0].sin(), 0., -self.cam_rot[0].cos());
+                    let p = Vec3::new(
+                        self.cam_rot[0].sin() * self.cam_rot[1].cos(),
+                        self.cam_rot[1].sin(),
+                        -self.cam_rot[0].cos() * self.cam_rot[1].cos(),
+                    );
                     let view = Mat4::look_to_rh(self.cam_pos, p, Vec3::new(0., 1., 0.));
 
                     // Frustum plane data.
