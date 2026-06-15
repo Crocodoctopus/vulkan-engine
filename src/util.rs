@@ -1,41 +1,67 @@
-pub struct Map2<K, V> {
-    free_keys: Vec<K>,
-    values: Vec<Option<V>>,
+pub const fn const_max<const N: usize>(values: [usize; N]) -> usize {
+    let mut i = 0;
+    let mut max = 0;
+
+    while i < N {
+        if values[i] > max {
+            max = values[i];
+        }
+        i += 1;
+    }
+
+    max
 }
 
-impl<K: TryFrom<usize> + Into<usize> + Copy + std::fmt::Debug, V> Map2<K, V> {
-    pub fn new() -> Self {
-        Self {
-            free_keys: Vec::new(),
-            values: Vec::new(),
+pub const fn const_min<const N: usize>(values: [usize; N]) -> usize {
+    let mut i = 0;
+    let mut min = usize::MAX;
+
+    while i < N {
+        if values[i] < min {
+            min = values[i];
+        }
+        i += 1;
+    }
+
+    min
+}
+
+pub fn format_usize_commas(value: usize) -> String {
+    let s = value.to_string();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+
+    let mut first_group = s.len() % 3;
+    if first_group == 0 && !s.is_empty() {
+        first_group = 3;
+    }
+
+    if !s.is_empty() {
+        out.push_str(&s[..first_group]);
+        let mut i = first_group;
+        while i < s.len() {
+            out.push(',');
+            out.push_str(&s[i..i + 3]);
+            i += 3;
         }
     }
 
-    pub fn insert(&mut self, value: V) -> Result<K, V> {
-        if let Some(key) = self.free_keys.pop() {
-            match std::mem::replace(&mut self.values[key.into()], Some(value)) {
-                None => Ok(key),
-                Some(value) => Err(value),
-            }
-        } else {
-            self.values.push(Some(value));
-            Ok(K::try_from(self.values.len() - 1).expect(""))
-        }
+    out
+}
+
+pub fn format_bytes(bytes: usize) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+
+    let mut value = bytes as f64;
+    let mut unit = 0usize;
+
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
     }
 
-    pub fn get(&self, key: K) -> Option<&V> {
-        self.values.get(key.into())?.as_ref()
-    }
-
-    pub fn get_mut(&mut self, key: K) -> Option<&mut V> {
-        self.values.get_mut(key.into())?.as_mut()
-    }
-
-    pub fn remove(&mut self, key: K) -> Option<V> {
-        let out = std::mem::take(&mut self.values[key.into()]);
-        if out.is_some() {
-            self.free_keys.push(key);
-        }
-        out
+    if unit == 0 {
+        format!("{bytes} {}", UNITS[unit])
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
     }
 }

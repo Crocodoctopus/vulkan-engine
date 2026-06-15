@@ -7,6 +7,7 @@ pub(crate) struct Buffer<T: ?Sized> {
     pub buffer: vk::Buffer,
     pub alloc: Option<vk_mem::Allocation>,
     pub len: u32,
+    pub size_bytes: u64,
 }
 
 impl<T: ?Sized> Drop for Buffer<T> {
@@ -25,6 +26,7 @@ impl<T: ?Sized> Buffer<T> {
             buffer: vk::Buffer::null(),
             alloc: None,
             len: 0,
+            size_bytes: 0,
         }
     }
 
@@ -41,6 +43,7 @@ impl<T: ?Sized> Buffer<T> {
             phantom: self.phantom,
             buffer: self.buffer,
             len: self.len,
+            size_bytes: self.size_bytes,
             alloc: self.alloc.take(),
         }
     }
@@ -52,6 +55,10 @@ impl<T: ?Sized> Buffer<T> {
             }
         }
         std::mem::forget(self);
+    }
+
+    pub(crate) fn size(&self) -> usize {
+        self.size_bytes as usize
     }
 }
 
@@ -75,12 +82,9 @@ impl<T> Buffer<T> {
                 buffer,
                 alloc: Some(alloc),
                 len: 1,
+                size_bytes: size_of::<T>() as u64,
             }
         }
-    }
-
-    pub(crate) fn size(&self) -> usize {
-        size_of::<T>()
     }
 }
 
@@ -105,16 +109,13 @@ impl<T> Buffer<[T]> {
                 buffer,
                 alloc: Some(alloc),
                 len,
+                size_bytes: len as u64 * size_of::<T>() as u64,
             }
         }
     }
 
     pub(crate) fn len(&self) -> u32 {
         self.len
-    }
-
-    pub(crate) fn size(&self) -> usize {
-        self.len as usize * size_of::<T>()
     }
 
     pub(crate) fn stride(&self) -> u32 {

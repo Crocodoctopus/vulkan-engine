@@ -18,6 +18,7 @@ mod profiling;
 mod renderer;
 mod staging;
 mod swapchain;
+mod util;
 
 use crate::renderer::*;
 use glam::*;
@@ -42,7 +43,8 @@ fn main() {
         .expect("Could not create window.");
     window.set_cursor_visible(false);
     let center = PhysicalPosition::new(viewport_w as f64 * 0.5, viewport_h as f64 * 0.5);
-    let _ = window.set_cursor_grab(CursorGrabMode::Locked).or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
+    let _ =
+        window.set_cursor_grab(CursorGrabMode::Locked).or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined));
     let _ = window.set_cursor_position(center);
 
     let cwd = std::env::current_dir().unwrap();
@@ -150,9 +152,8 @@ fn main() {
         if mouse_dx != 0.0 || mouse_dy != 0.0 {
             renderer.cam_rot[0] += mouse_dx as f32 * 0.0025;
             renderer.cam_rot[1] += mouse_dy as f32 * 0.0025;
-            renderer.cam_rot[1] = renderer
-                .cam_rot[1]
-                .clamp(-std::f32::consts::FRAC_PI_2 + 0.001, std::f32::consts::FRAC_PI_2 - 0.001);
+            renderer.cam_rot[1] =
+                renderer.cam_rot[1].clamp(-std::f32::consts::FRAC_PI_2 + 0.001, std::f32::consts::FRAC_PI_2 - 0.001);
         }
 
         if exit {

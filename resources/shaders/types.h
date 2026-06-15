@@ -28,10 +28,6 @@ layout (buffer_reference, std430) readonly buffer ObjectInstanceBuffer {
     ObjectInstance data[];
 };
 
-layout (buffer_reference, std430) buffer DrawCountBuffer {
-    uint counter;
-};
-
 struct VkDrawIndexedIndirectCommand {
     uint index_count;
     uint instance_count;
@@ -60,6 +56,8 @@ layout (buffer_reference, std430) readonly buffer MeshletInstanceBuffer {
 };
 
 layout (buffer_reference, std430) writeonly buffer DrawCmdBuffer {
+    // Counter prefix for vkCmdDrawIndexedIndirectCount; commands start immediately after it.
+    uint len;
     VkDrawIndexedIndirectCommand data[];
 };
 
@@ -80,7 +78,6 @@ struct FrameGlobal {
     vec4 frustum;
 
     MeshletVisibilityBuffer meshlet_visibility_buffer;
-    DrawCountBuffer draw_count_buffer;
     MeshletInstanceBuffer meshlet_buffer;
     DrawCmdBuffer draw_cmd_buffer;
     ObjectInstanceBuffer object_buffer;

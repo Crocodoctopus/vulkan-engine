@@ -1,5 +1,64 @@
 use ash::vk;
+use encase::ArrayLength;
 use glam::*;
+
+#[derive(Clone, Copy, Debug, Default, encase::ShaderType)]
+pub(super) struct GpuDrawIndexedIndirectCommand {
+    pub index_count: u32,
+    pub instance_count: u32,
+    pub first_index: u32,
+    pub vertex_offset: i32,
+    pub first_instance: u32,
+}
+
+#[derive(Clone, Debug, Default, encase::ShaderType)]
+pub(super) struct GpuDrawCommandBuffer {
+    pub len: ArrayLength,
+    #[shader(align(4), size(runtime))]
+    pub data: Vec<GpuDrawIndexedIndirectCommand>,
+}
+
+impl GpuDrawCommandBuffer {
+    pub const LEN_OFFSET: u64 = <Self as encase::ShaderType>::METADATA.offset(0);
+    pub const DATA_OFFSET: u64 = <Self as encase::ShaderType>::METADATA.offset(1);
+
+    pub fn new(data: impl IntoIterator<Item = GpuDrawIndexedIndirectCommand>) -> Self {
+        Self { len: ArrayLength, data: data.into_iter().collect() }
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        {
+            let mut buffer = encase::StorageBuffer::new(&mut bytes);
+            buffer.write(&self).unwrap();
+        }
+        bytes
+    }
+}
+
+impl From<Vec<GpuDrawIndexedIndirectCommand>> for GpuDrawCommandBuffer {
+    fn from(data: Vec<GpuDrawIndexedIndirectCommand>) -> Self {
+        Self::new(data)
+    }
+}
+
+impl<const N: usize> From<[GpuDrawIndexedIndirectCommand; N]> for GpuDrawCommandBuffer {
+    fn from(data: [GpuDrawIndexedIndirectCommand; N]) -> Self {
+        Self::new(data)
+    }
+}
+
+impl From<&[GpuDrawIndexedIndirectCommand]> for GpuDrawCommandBuffer {
+    fn from(data: &[GpuDrawIndexedIndirectCommand]) -> Self {
+        Self::new(data.iter().copied())
+    }
+}
+
+impl FromIterator<GpuDrawIndexedIndirectCommand> for GpuDrawCommandBuffer {
+    fn from_iter<T: IntoIterator<Item = GpuDrawIndexedIndirectCommand>>(iter: T) -> Self {
+        Self::new(iter)
+    }
+}
 
 #[derive(Copy, Clone, Debug)]
 #[repr(C)]
@@ -18,7 +77,6 @@ pub(super) struct FrameGlobal {
     pub frustum: Vec4,
 
     pub meshlet_visibility_buffer: vk::DeviceAddress,
-    pub draw_count_buffer: vk::DeviceAddress,
     pub meshlet_buffer: vk::DeviceAddress,
     pub draw_cmd_buffer: vk::DeviceAddress,
     pub object_buffer: vk::DeviceAddress,
@@ -59,11 +117,4 @@ pub(super) struct GpuVertex {
     pub position: [i16; 3],
     pub uv: [i16; 2],
     pub normal: [i8; 3],
-}
-
-#[derive(Clone, Debug, Default)]
-#[repr(C)]
-pub(super) struct BuildHzbPushConstants {
-    pub src: u32,
-    pub dst: u32,
 }

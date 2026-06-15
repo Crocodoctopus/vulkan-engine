@@ -143,7 +143,7 @@ impl PipelineProfiler {
             let total_ms = self.total_accum_ms * scale;
 
             println!(
-                "timestamp: real={total_ms:.4}ms (sum={sum_ms:.4}ms)\n  upload={data_upload_ms:.4}ms\n  frustum={frustum_cull_ms:.4}ms\n  draw={first_draw_ms:.4}ms\n  hzb={build_hzb_ms:.4}ms"
+                "timestamp: real = {total_ms:.4}ms (sum = {sum_ms:.4}ms)\n  upload = {data_upload_ms:.4}ms\n  frustum = {frustum_cull_ms:.4}ms\n  draw = {first_draw_ms:.4}ms\n  hzb = {build_hzb_ms:.4}ms"
             );
 
             self.stage_accum_ms = [0.0; PipelineStage::FrameEnd as usize];

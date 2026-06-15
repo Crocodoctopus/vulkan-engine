@@ -67,6 +67,6 @@ void main() {
     // meshlet id for debug coloring, but it can be repurposed by render.vert.
     cmd.first_instance = meshlet_id;
 
-    const uint i = atomicAdd(frame_global.draw_count_buffer.counter, 1);
+    const uint i = atomicAdd(frame_global.draw_cmd_buffer.len, 1);
     frame_global.draw_cmd_buffer.data[i] = cmd;
 }

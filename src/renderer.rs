@@ -5,6 +5,7 @@ use crate::mesh::{Meshlet, load_mesh};
 use crate::profiling::PipelineProfiler;
 use crate::staging::StagingBuffer;
 use crate::swapchain::Swapchain;
+use crate::util::{const_max, const_min, format_bytes, format_usize_commas};
 use ash::vk;
 use glam::*;
 use std::collections::HashMap;
@@ -24,34 +25,6 @@ pub(super) struct Object {
     pub position: Vec3,
     pub scale: f32,
     pub orientation: Quat,
-}
-
-const fn const_max<const N: usize>(values: [usize; N]) -> usize {
-    let mut i = 0;
-    let mut max = 0;
-
-    while i < N {
-        if values[i] > max {
-            max = values[i];
-        }
-        i += 1;
-    }
-
-    max
-}
-
-const fn const_min<const N: usize>(values: [usize; N]) -> usize {
-    let mut i = 0;
-    let mut min = usize::MAX;
-
-    while i < N {
-        if values[i] < min {
-            min = values[i];
-        }
-        i += 1;
-    }
-
-    min
 }
 
 pub(crate) const MAX_FRAMES_IN_FLIGHT: usize = 2;
@@ -75,7 +48,7 @@ Plan:
 2) render (only visible)
 3) build_hzb
 4) occlusion_cull
-5) render (new vibile)
+5) render (new visible)
 */
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(usize)]
@@ -104,6 +77,7 @@ struct SwapchainResources {
     // cover the live visibility window.
     hzb_images: [vk::Image; MAX_HZB_IN_FLIGHT],
     hzb_allocs: [vk_mem::Allocation; MAX_HZB_IN_FLIGHT],
+    hzb_build_depth_views: [vk::ImageView; MAX_HZB_IN_FLIGHT],
     hzb_build_src_views: [Box<[vk::ImageView]>; MAX_HZB_IN_FLIGHT],
     hzb_build_dst_views: [Box<[vk::ImageView]>; MAX_HZB_IN_FLIGHT],
     hzb_sets: [vk::DescriptorSet; MAX_HZB_IN_FLIGHT],
@@ -127,6 +101,7 @@ impl SwapchainResources {
         let Self {
             hzb_images,
             mut hzb_allocs,
+            hzb_build_depth_views,
             hzb_build_src_views,
             hzb_build_dst_views,
             hzb_sets,
@@ -138,6 +113,7 @@ impl SwapchainResources {
         } = self;
 
         for slot in 0..Self::HZB_SLOT_COUNT {
+            device.destroy_image_view(hzb_build_depth_views[slot], None);
             for view in hzb_build_src_views[slot].iter().copied() {
                 device.destroy_image_view(view, None);
             }
@@ -171,8 +147,7 @@ impl SwapchainResources {
 
 /* Resources that need regeneration when object set changes */
 struct SceneResources {
-    indirect_cmd_buffer: Buffer<[vk::DrawIndexedIndirectCommand]>,
-    indirect_count_buffer: Buffer<u32>,
+    indirect_cmd_buffer: Buffer<[u8]>,
 
     /* TODO: These are static after creation */
     index_buffer: Buffer<[u32]>,
@@ -186,7 +161,6 @@ impl SceneResources {
         self.object_instance_buffer.destroy(&allocator);
         self.meshlet_instance_buffer.destroy(&allocator);
         self.indirect_cmd_buffer.destroy(&allocator);
-        self.indirect_count_buffer.destroy(&allocator);
     }
 }
 
@@ -586,27 +560,22 @@ impl Renderer {
                 let comp_shader = create_shader_module(include_bytes!("build_hzb.comp.spirv"));
 
                 let pipeline_layout = device
-                    .create_pipeline_layout(
-                        &vk::PipelineLayoutCreateInfo::default().set_layouts(&[hzb_set_layout]).push_constant_ranges(
-                            &[vk::PushConstantRange::default()
-                                .stage_flags(vk::ShaderStageFlags::COMPUTE)
-                                .offset(0)
-                                .size(size_of::<BuildHzbPushConstants>() as u32)],
-                        ),
-                        None,
-                    )
+                    .create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&[hzb_set_layout]), None)
                     .unwrap();
 
                 let pipeline = device
                     .create_compute_pipelines(
                         vk::PipelineCache::default(),
                         &[
-                            vk::ComputePipelineCreateInfo::default().layout(pipeline_layout).stage(
-                                vk::PipelineShaderStageCreateInfo::default()
-                                    .stage(vk::ShaderStageFlags::COMPUTE)
-                                    .name(c"main")
-                                    .module(comp_shader),
-                            ),
+                            vk::ComputePipelineCreateInfo::default()
+                                .flags(vk::PipelineCreateFlags::DISPATCH_BASE)
+                                .layout(pipeline_layout)
+                                .stage(
+                                    vk::PipelineShaderStageCreateInfo::default()
+                                        .stage(vk::ShaderStageFlags::COMPUTE)
+                                        .name(c"main")
+                                        .module(comp_shader),
+                                ),
                         ],
                         None,
                     )
@@ -893,7 +862,6 @@ impl Renderer {
 
         let SceneResources {
             indirect_cmd_buffer,
-            indirect_count_buffer,
             index_buffer,
             object_instance_buffer,
             meshlet_instance_buffer,
@@ -902,13 +870,13 @@ impl Renderer {
 
         let SwapchainResources {
             hzb_images,
+            depth_views,
             hzb_build_src_views,
             hzb_sets,
             render_finished,
             image_acquired_semaphores,
             cmd_buffers,
             depth_images,
-            depth_views,
             ..
         } = self.swapchain_resources.as_ref().unwrap();
 
@@ -952,7 +920,7 @@ impl Renderer {
             let visibility_buffer = &self.visibility_buffers[visibility_index];
             let last_visibility_buffer = &self.visibility_buffers[last_visibility_index];
 
-            // TODO: keep this here? Its a per-fif variable.
+            // TODO: keep this here? It's a per-FIF variable.
             let depth_view = depth_views[frame_index];
             self.device.update_descriptor_sets(
                 &[vk::WriteDescriptorSet::default()
@@ -1056,9 +1024,15 @@ impl Renderer {
                     // Upload scene data.
                     self.staging_buffer.reset();
 
-                    self.staging_buffer.stage_buffer(&self.device, cmd, &object_instance_buffer, 0, object_data);
+                    self.staging_buffer.stage(
+                        &self.device,
+                        cmd,
+                        &object_instance_buffer,
+                        0,
+                        object_data.collect::<Vec<_>>(),
+                    );
 
-                    self.staging_buffer.stage_buffer(
+                    self.staging_buffer.stage(
                         &self.device,
                         cmd,
                         frame_global_buffer,
@@ -1075,9 +1049,6 @@ impl Renderer {
                             meshlet_visibility_buffer: self.device.get_buffer_device_address(
                                 &vk::BufferDeviceAddressInfo::default().buffer(visibility_buffer.vk_handle()),
                             ),
-                            draw_count_buffer: self.device.get_buffer_device_address(
-                                &vk::BufferDeviceAddressInfo::default().buffer(indirect_count_buffer.vk_handle()),
-                            ),
                             meshlet_buffer: self.device.get_buffer_device_address(
                                 &vk::BufferDeviceAddressInfo::default().buffer(meshlet_instance_buffer.vk_handle()),
                             ),
@@ -1087,10 +1058,16 @@ impl Renderer {
                             object_buffer: self.device.get_buffer_device_address(
                                 &vk::BufferDeviceAddressInfo::default().buffer(object_instance_buffer.vk_handle()),
                             ),
-                            instances: indirect_cmd_buffer.len(),
+                            instances: meshlet_instance_buffer.len(),
                         }],
                     );
-                    self.staging_buffer.stage_buffer(&self.device, cmd, indirect_count_buffer, 0, [0u32]);
+                    self.device.cmd_fill_buffer(
+                        cmd,
+                        indirect_cmd_buffer.vk_handle(),
+                        GpuDrawCommandBuffer::LEN_OFFSET,
+                        std::mem::size_of::<u32>() as u64,
+                        0,
+                    );
                 },
             );
 
@@ -1137,6 +1114,20 @@ impl Renderer {
                             .size(visibility_buffer.size() as u64)]),
                     );
 
+                    self.device.cmd_pipeline_barrier2(
+                        cmd,
+                        &vk::DependencyInfo::default().buffer_memory_barriers(&[vk::BufferMemoryBarrier2::default()
+                            .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+                            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                            .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                            .dst_access_mask(
+                                vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE,
+                            )
+                            .buffer(indirect_cmd_buffer.vk_handle())
+                            .offset(0)
+                            .size(indirect_cmd_buffer.size() as u64)]),
+                    );
+
                     self.device.cmd_bind_descriptor_sets(
                         cmd,
                         vk::PipelineBindPoint::COMPUTE,
@@ -1173,6 +1164,18 @@ impl Renderer {
                             .old_layout(vk::ImageLayout::UNDEFINED)
                             .new_layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL),
                     ]),
+                );
+
+                self.device.cmd_pipeline_barrier2(
+                    cmd,
+                    &vk::DependencyInfo::default().buffer_memory_barriers(&[vk::BufferMemoryBarrier2::default()
+                        .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                        .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
+                        .dst_stage_mask(vk::PipelineStageFlags2::DRAW_INDIRECT)
+                        .dst_access_mask(vk::AccessFlags2::INDIRECT_COMMAND_READ)
+                        .buffer(indirect_cmd_buffer.vk_handle())
+                        .offset(0)
+                        .size(indirect_cmd_buffer.size() as u64)]),
                 );
 
                 // Use dynamic rendering.
@@ -1224,9 +1227,9 @@ impl Renderer {
                 self.device.cmd_draw_indexed_indirect_count(
                     cmd,
                     indirect_cmd_buffer.vk_handle(),
-                    0,
-                    indirect_count_buffer.vk_handle(),
-                    0,
+                    GpuDrawCommandBuffer::DATA_OFFSET,
+                    indirect_cmd_buffer.vk_handle(),
+                    GpuDrawCommandBuffer::LEN_OFFSET,
                     meshlet_instance_buffer.len(),
                     size_of::<vk::DrawIndexedIndirectCommand>() as u32,
                 );
@@ -1301,9 +1304,7 @@ impl Renderer {
                     ]),
                 );
 
-                let build_hzb = |src: u32, dst: u32| {
-                    let pc = BuildHzbPushConstants { src, dst };
-
+                let build_hzb = |level: u32| {
                     self.device.cmd_bind_descriptor_sets(
                         cmd,
                         vk::PipelineBindPoint::COMPUTE,
@@ -1315,21 +1316,10 @@ impl Renderer {
 
                     self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.build_hzb_pipeline);
 
-                    self.device.cmd_push_constants(
-                        cmd,
-                        self.build_hzb_pipeline_layout,
-                        vk::ShaderStageFlags::COMPUTE,
-                        0,
-                        std::slice::from_raw_parts(
-                            (&pc as *const BuildHzbPushConstants) as *const u8,
-                            std::mem::size_of::<BuildHzbPushConstants>(),
-                        ),
-                    );
-
-                    let w = self.core.surface_extent.width.div_ceil(2).checked_shr(dst).unwrap_or(0).max(1).div_ceil(8);
+                    let w = self.core.surface_extent.width.div_ceil(2).checked_shr(level).unwrap_or(0).max(1).div_ceil(8);
                     let h =
-                        self.core.surface_extent.height.div_ceil(2).checked_shr(dst).unwrap_or(0).max(1).div_ceil(8);
-                    self.device.cmd_dispatch(cmd, w, h, 1);
+                        self.core.surface_extent.height.div_ceil(2).checked_shr(level).unwrap_or(0).max(1).div_ceil(8);
+                    self.device.cmd_dispatch_base(cmd, 0, 0, level, w, h, 1);
 
                     self.device.cmd_pipeline_barrier2(
                         cmd,
@@ -1342,7 +1332,7 @@ impl Renderer {
                             .subresource_range(
                                 vk::ImageSubresourceRange::default()
                                     .aspect_mask(vk::ImageAspectFlags::COLOR)
-                                    .base_mip_level(dst)
+                                    .base_mip_level(level)
                                     .level_count(1)
                                     .base_array_layer(0)
                                     .layer_count(1),
@@ -1354,12 +1344,9 @@ impl Renderer {
 
                 // For the first compute, the src view is the depth buffer, which
                 // depends on the depth buffer.
-                build_hzb(0, 0);
-
-                // The rest are standard.
-                let mips = hzb_build_src_views.len();
-                for i in 0..mips - 1 {
-                    build_hzb(1 + i as u32, 1 + i as u32);
+                let mips = hzb_build_src_views.len() as u32;
+                for level in 0..mips {
+                    build_hzb(level);
                 }
 
                 self.device.cmd_pipeline_barrier2(
@@ -1576,16 +1563,27 @@ impl Renderer {
             }
         }
 
+        // Print some information about the scene.
+        // TODO: Move this to the end?
         let object_count = self.objects.len();
         let meshlet_count = instances as usize;
         let new_mesh_count = new_meshes.len();
         let index_upload_bytes = indices.len() * std::mem::size_of::<u32>();
-        let vertex_upload_bytes = new_meshes
-            .iter()
-            .map(|(_, vertices)| vertices.len() * std::mem::size_of::<GpuVertex>())
-            .sum::<usize>();
+        let vertex_upload_bytes =
+            new_meshes.iter().map(|(_, vertices)| vertices.len() * std::mem::size_of::<GpuVertex>()).sum::<usize>();
         let meshlet_upload_bytes = meshlet_data.len() * std::mem::size_of::<GpuMeshletInstance>();
         let total_upload_bytes = index_upload_bytes + vertex_upload_bytes + meshlet_upload_bytes;
+        println!(
+            "New scene data:\n  objects = {}\n  meshlets = {}\n  triangles = {}\n  new_meshes = {}\n  upload = {}\n  indices = {}\n  vertices = {}\n  meshlets = {}",
+            format_usize_commas(object_count),
+            format_usize_commas(meshlet_count),
+            format_usize_commas(triangle_count),
+            format_usize_commas(new_mesh_count),
+            format_bytes(total_upload_bytes),
+            format_bytes(index_upload_bytes),
+            format_bytes(vertex_upload_bytes),
+            format_bytes(meshlet_upload_bytes),
+        );
 
         let index_buffer = Buffer::<[u32]>::new(
             &self.allocator,
@@ -1612,17 +1610,13 @@ impl Renderer {
             vk_mem::MemoryUsage::AutoPreferDevice,
         );
 
-        let indirect_cmd_buffer = Buffer::<[vk::DrawIndexedIndirectCommand]>::new(
+        let indirect_cmd_bytes = GpuDrawCommandBuffer::new(
+            std::iter::repeat(GpuDrawIndexedIndirectCommand::default()).take(instances as usize),
+        )
+        .into_bytes();
+        let indirect_cmd_buffer = Buffer::<[u8]>::new(
             &self.allocator,
-            instances,
-            vk::BufferUsageFlags::STORAGE_BUFFER
-                | vk::BufferUsageFlags::INDIRECT_BUFFER
-                | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-            vk_mem::MemoryUsage::AutoPreferDevice,
-        );
-
-        let indirect_count_buffer = Buffer::<u32>::new(
-            &self.allocator,
+            indirect_cmd_bytes.len() as u32,
             vk::BufferUsageFlags::STORAGE_BUFFER
                 | vk::BufferUsageFlags::INDIRECT_BUFFER
                 | vk::BufferUsageFlags::TRANSFER_DST
@@ -1638,22 +1632,23 @@ impl Renderer {
 
         // Upload.
         self.staging_buffer.reset();
-        self.staging_buffer.stage_buffer(&self.device, self.staging_cmd_buffer, &index_buffer, 0, indices);
+        self.staging_buffer.stage(&self.device, self.staging_cmd_buffer, &index_buffer, 0, indices);
         for (id, vertices) in &new_meshes {
-            self.staging_buffer.stage_buffer::<GpuVertex, [GpuVertex]>(
+            self.staging_buffer.stage(
                 &self.device,
                 self.staging_cmd_buffer,
                 self.vertex_buffers.get(id).unwrap(),
                 0,
-                vertices.iter(),
+                vertices.as_ref(),
             );
         }
-        self.staging_buffer.stage_buffer(
+        self.staging_buffer.stage(&self.device, self.staging_cmd_buffer, &meshlet_instance_buffer, 0, meshlet_data);
+        self.staging_buffer.stage_bytes(
             &self.device,
             self.staging_cmd_buffer,
-            &meshlet_instance_buffer,
+            &indirect_cmd_buffer,
             0,
-            meshlet_data,
+            &indirect_cmd_bytes,
         );
 
         // Submit (& wait at end of function).
@@ -1675,20 +1670,7 @@ impl Renderer {
             object_instance_buffer,
             meshlet_instance_buffer,
             indirect_cmd_buffer,
-            indirect_count_buffer,
         });
-
-        println!(
-            "New scene pushed:\n  objects={}\n  meshlets={}\n  triangles={}\n  new_meshes={}\n  upload={} bytes\n  indices={} bytes\n  vertices={} bytes\n  meshlets={} bytes",
-            object_count,
-            meshlet_count,
-            triangle_count,
-            new_mesh_count,
-            total_upload_bytes,
-            index_upload_bytes,
-            vertex_upload_bytes,
-            meshlet_upload_bytes,
-        );
     }
 
     unsafe fn rebuild_swapchain(&mut self) {
@@ -1879,6 +1861,12 @@ impl Renderer {
                 .unwrap()
         });
 
+        debug_assert!(SwapchainResources::HZB_SLOT_COUNT <= MAX_FRAMES_IN_FLIGHT);
+        let hzb_build_depth_views = std::array::from_fn(|slot| {
+            debug_assert!(slot < depth_views.len());
+            depth_views[slot]
+        });
+
         // Write descriptors for each HZB scratch slot.
         for slot in 0..SwapchainResources::HZB_SLOT_COUNT {
             let hzb_src_infos: Box<_> = hzb_build_src_views[slot]
@@ -1899,7 +1887,7 @@ impl Renderer {
                 .collect();
 
             let depth_info = [vk::DescriptorImageInfo::default()
-                .image_view(depth_views[slot % MAX_FRAMES_IN_FLIGHT])
+                .image_view(hzb_build_depth_views[slot])
                 .sampler(self.hzb_sampler)
                 .image_layout(vk::ImageLayout::DEPTH_READ_ONLY_OPTIMAL)];
 
@@ -2003,6 +1991,7 @@ impl Renderer {
         self.swapchain_resources = Some(SwapchainResources {
             hzb_images,
             hzb_allocs,
+            hzb_build_depth_views,
             hzb_build_src_views,
             hzb_build_dst_views,
             hzb_sets,
