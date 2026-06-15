@@ -202,6 +202,8 @@ pub struct Renderer {
     meshes: HashMap<MeshHandle, (f32, Box<[Meshlet]>)>,
     objects: Vec<(ObjectHandle, Object)>,
     vertex_buffers: HashMap<MeshHandle, Buffer<[GpuVertex]>>,
+    // Canonical packed meshlet start index for each object.
+    visibility_index_cache: HashMap<ObjectHandle, u32>,
 
     /* Staging: */
     staging_buffer: StagingBuffer,
@@ -560,23 +562,24 @@ impl Renderer {
                 let comp_shader = create_shader_module(include_bytes!("build_hzb.comp.spirv"));
 
                 let pipeline_layout = device
-                    .create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&[hzb_set_layout]), None)
+                    .create_pipeline_layout(
+                        &vk::PipelineLayoutCreateInfo::default().set_layouts(&[hzb_set_layout]),
+                        None,
+                    )
                     .unwrap();
 
                 let pipeline = device
                     .create_compute_pipelines(
                         vk::PipelineCache::default(),
-                        &[
-                            vk::ComputePipelineCreateInfo::default()
-                                .flags(vk::PipelineCreateFlags::DISPATCH_BASE)
-                                .layout(pipeline_layout)
-                                .stage(
-                                    vk::PipelineShaderStageCreateInfo::default()
-                                        .stage(vk::ShaderStageFlags::COMPUTE)
-                                        .name(c"main")
-                                        .module(comp_shader),
-                                ),
-                        ],
+                        &[vk::ComputePipelineCreateInfo::default()
+                            .flags(vk::PipelineCreateFlags::DISPATCH_BASE)
+                            .layout(pipeline_layout)
+                            .stage(
+                                vk::PipelineShaderStageCreateInfo::default()
+                                    .stage(vk::ShaderStageFlags::COMPUTE)
+                                    .name(c"main")
+                                    .module(comp_shader),
+                            )],
                         None,
                     )
                     .unwrap()
@@ -770,6 +773,7 @@ impl Renderer {
                 meshes: HashMap::new(),
                 objects: Vec::new(),
                 vertex_buffers: HashMap::new(),
+                visibility_index_cache: HashMap::new(),
 
                 staging_buffer,
                 staging_cmd_buffer,
@@ -897,29 +901,12 @@ impl Renderer {
         let frame_set = self.frame_sets[frame_index];
         let frame_global_buffer = &self.frame_global_buffers[frame_index];
 
+        // Visibility information.
+        let visibility_buffer = &self.visibility_buffers[frame_count % VISIBILITY_BUFFER_COUNT];
+        let last_visibility_buffer =
+            &self.visibility_buffers[(frame_count - VISIBILITY_DEPTH) % VISIBILITY_BUFFER_COUNT];
+
         unsafe {
-            let visibility_index = frame_count % VISIBILITY_BUFFER_COUNT;
-            let last_visibility_index = (frame_count - VISIBILITY_DEPTH) % VISIBILITY_BUFFER_COUNT;
-            if self.visibility_buffers[visibility_index].len() < meshlet_instance_buffer.len() {
-                let old_buffer = std::mem::replace(&mut self.visibility_buffers[visibility_index], Buffer::null());
-                if !old_buffer.is_null() {
-                    self.visibility_buffer_retire_list
-                        .push((PipelineStage::FrustumCull.done_value(frame_count - 1), old_buffer));
-                }
-
-                self.visibility_buffers[visibility_index] = Buffer::<[u32]>::new(
-                    &self.allocator,
-                    meshlet_instance_buffer.len(),
-                    vk::BufferUsageFlags::STORAGE_BUFFER
-                        | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
-                        | vk::BufferUsageFlags::TRANSFER_SRC
-                        | vk::BufferUsageFlags::TRANSFER_DST,
-                    vk_mem::MemoryUsage::AutoPreferDevice,
-                );
-            }
-            let visibility_buffer = &self.visibility_buffers[visibility_index];
-            let last_visibility_buffer = &self.visibility_buffers[last_visibility_index];
-
             // TODO: keep this here? It's a per-FIF variable.
             let depth_view = depth_views[frame_index];
             self.device.update_descriptor_sets(
@@ -1316,7 +1303,8 @@ impl Renderer {
 
                     self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.build_hzb_pipeline);
 
-                    let w = self.core.surface_extent.width.div_ceil(2).checked_shr(level).unwrap_or(0).max(1).div_ceil(8);
+                    let w =
+                        self.core.surface_extent.width.div_ceil(2).checked_shr(level).unwrap_or(0).max(1).div_ceil(8);
                     let h =
                         self.core.surface_extent.height.div_ceil(2).checked_shr(level).unwrap_or(0).max(1).div_ceil(8);
                     self.device.cmd_dispatch_base(cmd, 0, 0, level, w, h, 1);
@@ -1490,6 +1478,8 @@ impl Renderer {
     }
 
     unsafe fn rebuild_scene(&mut self) {
+        let old_visibility_index_cache = self.visibility_index_cache.clone();
+
         // Generate vertex data for newly added meshes.
         let new_meshes: HashMap<MeshHandle, Box<[GpuVertex]>> = self
             .meshes
@@ -1530,12 +1520,17 @@ impl Renderer {
         // Generate index and meshlet data for object set.
         let mut indices = vec![];
         let mut meshlet_data = vec![];
+        let mut new_visibility_index_cache = HashMap::with_capacity(self.objects.len());
+        let mut object_meshlet_counts = HashMap::with_capacity(self.objects.len());
         let mut instances = 0u32;
         let mut triangle_count = 0usize;
         let mut first_index = 0;
-        for (i, (_, object)) in self.objects.iter().enumerate() {
+        for (i, (handle, object)) in self.objects.iter().enumerate() {
             // Get associated mesh and index offset.
             let mesh = &self.meshes.get(&object.mesh).unwrap().1;
+            let meshlet_start = instances;
+            new_visibility_index_cache.insert(*handle, meshlet_start);
+            object_meshlet_counts.insert(*handle, mesh.len() as u32);
 
             // Indices.
             let mut offset = 0u32;
@@ -1624,6 +1619,26 @@ impl Renderer {
             vk_mem::MemoryUsage::AutoPreferDevice,
         );
 
+        let visibility_stride = std::mem::size_of::<u32>() as u64;
+        let old_visibility_buffers =
+            std::mem::replace(&mut self.visibility_buffers, std::array::from_fn(|_| Buffer::null()));
+        let mut new_visibility_buffers = std::array::from_fn(|_| Buffer::null());
+        for slot in 0..VISIBILITY_BUFFER_COUNT {
+            new_visibility_buffers[slot] = if instances > 0 {
+                Buffer::<[u32]>::new(
+                    &self.allocator,
+                    instances,
+                    vk::BufferUsageFlags::STORAGE_BUFFER
+                        | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+                        | vk::BufferUsageFlags::TRANSFER_SRC
+                        | vk::BufferUsageFlags::TRANSFER_DST,
+                    vk_mem::MemoryUsage::AutoPreferDevice,
+                )
+            } else {
+                Buffer::null()
+            };
+        }
+
         self.device.wait_for_fences(&[self.staging_fence], true, u64::MAX).unwrap();
         self.device.reset_fences(&[self.staging_fence]).unwrap();
 
@@ -1651,6 +1666,49 @@ impl Renderer {
             &indirect_cmd_bytes,
         );
 
+        for slot in 0..VISIBILITY_BUFFER_COUNT {
+            let new_buffer = &new_visibility_buffers[slot];
+            if new_buffer.is_null() {
+                continue;
+            }
+
+            self.device.cmd_fill_buffer(
+                self.staging_cmd_buffer,
+                new_buffer.vk_handle(),
+                0,
+                new_buffer.size() as u64,
+                1,
+            );
+
+            let old_buffer = &old_visibility_buffers[slot];
+            if old_buffer.is_null() {
+                continue;
+            }
+
+            for (handle, old_start) in &old_visibility_index_cache {
+                let Some(new_start) = new_visibility_index_cache.get(handle).copied() else {
+                    continue;
+                };
+                let Some(meshlet_count) = object_meshlet_counts.get(handle).copied() else {
+                    continue;
+                };
+                let copy_size = meshlet_count as u64 * visibility_stride;
+                if copy_size == 0 {
+                    continue;
+                }
+
+                self.device.cmd_copy_buffer(
+                    self.staging_cmd_buffer,
+                    old_buffer.vk_handle(),
+                    new_buffer.vk_handle(),
+                    &[vk::BufferCopy::default()
+                        .src_offset(*old_start as u64 * visibility_stride)
+                        .dst_offset(new_start as u64 * visibility_stride)
+                        .size(copy_size)],
+                );
+            }
+        }
+
         // Submit (& wait at end of function).
         self.device.end_command_buffer(self.staging_cmd_buffer).unwrap();
         self.device
@@ -1663,6 +1721,15 @@ impl Renderer {
 
         // Wait for transfer to complete before returning.
         self.device.wait_for_fences(&[self.staging_fence], true, u64::MAX).unwrap();
+
+        self.visibility_buffers = new_visibility_buffers;
+        self.visibility_index_cache = new_visibility_index_cache;
+        let retire_after = PipelineStage::FrustumCull.done_value(self.frame.saturating_sub(1));
+        for old_buffer in old_visibility_buffers {
+            if !old_buffer.is_null() {
+                self.visibility_buffer_retire_list.push((retire_after, old_buffer));
+            }
+        }
 
         // Scene is ready, push.
         self.scene_resources.push(SceneResources {

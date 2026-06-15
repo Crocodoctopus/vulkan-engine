@@ -59,9 +59,5 @@ pub fn format_bytes(bytes: usize) -> String {
         unit += 1;
     }
 
-    if unit == 0 {
-        format!("{bytes} {}", UNITS[unit])
-    } else {
-        format!("{value:.1} {}", UNITS[unit])
-    }
+    if unit == 0 { format!("{bytes} {}", UNITS[unit]) } else { format!("{value:.1} {}", UNITS[unit]) }
 }
