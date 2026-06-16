@@ -1,3 +1,6 @@
+#ifndef TYPES_H_INCLUDED
+#define TYPES_H_INCLUDED
+
 #extension GL_EXT_shader_16bit_storage: require
 #extension GL_EXT_shader_8bit_storage: require
 
@@ -93,3 +96,5 @@ struct FrameGlobal {
 
     uint instances;
 };
+
+#endif

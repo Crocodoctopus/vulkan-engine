@@ -4,6 +4,8 @@
 #extension GL_EXT_shader_16bit_storage: require
 #extension GL_EXT_shader_8bit_storage: require
 
+#include "types.h"
+
 vec3 rotate_quat(vec3 v, vec4 q) {
     return v + 2.0 * cross(q.xyz, cross(q.xyz, v) + q.w * v);
 }
