@@ -1785,30 +1785,46 @@ impl Renderer {
             );
         }
 
-        // Generate index and meshlet data for object set.
+        // Generate index data once per unique mesh, then reference those packed ranges from objects.
+        let mut sorted_meshes: Vec<_> = self.meshes.iter().collect();
+        sorted_meshes.sort_by_key(|(handle, _)| handle.0);
+
         let mut indices = vec![];
+        let mut mesh_index_offset_cache = HashMap::with_capacity(sorted_meshes.len());
+        let mut meshlet_first_index_cache = HashMap::with_capacity(sorted_meshes.len());
+        for (handle, mesh) in sorted_meshes {
+            let mesh_base_index = indices.len() as u32;
+            mesh_index_offset_cache.insert(*handle, mesh_base_index);
+
+            let meshlets = &mesh.1;
+            let mut first_index = 0u32;
+            let mut meshlet_first_indices = Vec::with_capacity(meshlets.len());
+            let mut offset = 0u32;
+            for meshlet in meshlets {
+                meshlet_first_indices.push(first_index);
+                indices.extend(meshlet.indices.iter().map(|&index| index as u32 + offset));
+                offset += meshlet.positions.len() as u32;
+                first_index += meshlet.indices.len() as u32;
+            }
+            meshlet_first_index_cache.insert(*handle, meshlet_first_indices.into_boxed_slice());
+        }
+
         let mut meshlet_data = vec![];
         let mut new_visibility_index_cache = HashMap::with_capacity(self.objects.len());
         let mut object_meshlet_counts = HashMap::with_capacity(self.objects.len());
         let mut instances = 0u32;
         let mut triangle_count = 0usize;
-        let mut first_index = 0;
         for (i, (handle, object)) in self.objects.iter().enumerate() {
-            // Get associated mesh and index offset.
+            // Get associated mesh and its packed index range.
             let mesh = &self.meshes.get(&object.mesh).unwrap().1;
             let meshlet_start = instances;
             new_visibility_index_cache.insert(*handle, meshlet_start);
             object_meshlet_counts.insert(*handle, mesh.len() as u32);
 
-            // Indices.
-            let mut offset = 0u32;
-            for meshlet in mesh {
-                indices.extend(meshlet.indices.iter().map(|&index| index as u32 + offset));
-                offset += meshlet.positions.len() as u32;
-            }
-
             // Mesh data.
-            for meshlet in mesh {
+            let mesh_base_index = mesh_index_offset_cache.get(&object.mesh).copied().unwrap();
+            let meshlet_first_indices = meshlet_first_index_cache.get(&object.mesh).unwrap();
+            for (meshlet_idx, meshlet) in mesh.iter().enumerate() {
                 triangle_count += meshlet.indices.len() / 3;
                 meshlet_data.push(GpuMeshletInstance {
                     center: Vec3::from(meshlet.center),
@@ -1819,9 +1835,8 @@ impl Renderer {
                     cone_cutoff: meshlet.cone_cutoff,
                     object_id: i as u32,
                     index_count: meshlet.indices.len() as u32,
-                    first_index,
+                    first_index: mesh_base_index + meshlet_first_indices[meshlet_idx],
                 });
-                first_index += meshlet.indices.len() as u32;
                 instances += 1;
             }
         }
