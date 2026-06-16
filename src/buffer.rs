@@ -60,6 +60,30 @@ impl<T: ?Sized> Buffer<T> {
     pub(crate) fn size(&self) -> usize {
         self.size_bytes as usize
     }
+
+    pub(crate) fn new_sized(
+        allocator: &vk_mem::Allocator,
+        size_bytes: u64,
+        vk_usage: vk::BufferUsageFlags,
+        vma_usage: vk_mem::MemoryUsage,
+    ) -> Self {
+        unsafe {
+            let (buffer, alloc) = allocator
+                .create_buffer(
+                    &vk::BufferCreateInfo::default().size(size_bytes).usage(vk_usage),
+                    &vk_mem::AllocationCreateInfo { usage: vma_usage, ..Default::default() },
+                )
+                .unwrap();
+
+            Buffer {
+                phantom: std::marker::PhantomData,
+                buffer,
+                alloc: Some(alloc),
+                len: 1,
+                size_bytes,
+            }
+        }
+    }
 }
 
 #[allow(unused)]

@@ -15,48 +15,15 @@ pub(super) struct GpuDrawIndexedIndirectCommand {
 pub(super) struct GpuDrawCommandBuffer {
     pub len: ArrayLength,
     #[shader(align(4), size(runtime))]
-    pub data: Vec<GpuDrawIndexedIndirectCommand>,
+    pub data: Box<[GpuDrawIndexedIndirectCommand]>,
 }
 
 impl GpuDrawCommandBuffer {
     pub const LEN_OFFSET: u64 = <Self as encase::ShaderType>::METADATA.offset(0);
     pub const DATA_OFFSET: u64 = <Self as encase::ShaderType>::METADATA.offset(1);
 
-    pub fn new(data: impl IntoIterator<Item = GpuDrawIndexedIndirectCommand>) -> Self {
-        Self { len: ArrayLength, data: data.into_iter().collect() }
-    }
-
-    pub fn into_bytes(self) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        {
-            let mut buffer = encase::StorageBuffer::new(&mut bytes);
-            buffer.write(&self).unwrap();
-        }
-        bytes
-    }
-}
-
-impl From<Vec<GpuDrawIndexedIndirectCommand>> for GpuDrawCommandBuffer {
-    fn from(data: Vec<GpuDrawIndexedIndirectCommand>) -> Self {
-        Self::new(data)
-    }
-}
-
-impl<const N: usize> From<[GpuDrawIndexedIndirectCommand; N]> for GpuDrawCommandBuffer {
-    fn from(data: [GpuDrawIndexedIndirectCommand; N]) -> Self {
-        Self::new(data)
-    }
-}
-
-impl From<&[GpuDrawIndexedIndirectCommand]> for GpuDrawCommandBuffer {
-    fn from(data: &[GpuDrawIndexedIndirectCommand]) -> Self {
-        Self::new(data.iter().copied())
-    }
-}
-
-impl FromIterator<GpuDrawIndexedIndirectCommand> for GpuDrawCommandBuffer {
-    fn from_iter<T: IntoIterator<Item = GpuDrawIndexedIndirectCommand>>(iter: T) -> Self {
-        Self::new(iter)
+    pub fn byte_size(len: u32) -> u64 {
+        Self::DATA_OFFSET + len as u64 * std::mem::size_of::<GpuDrawIndexedIndirectCommand>() as u64
     }
 }
 

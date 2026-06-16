@@ -147,7 +147,7 @@ impl SwapchainResources {
 
 /* Resources that need regeneration when object set changes */
 struct SceneResources {
-    indirect_cmd_buffer: Buffer<[u8]>,
+    indirect_cmd_buffer: Buffer<GpuDrawCommandBuffer>,
 
     /* TODO: These are static after creation */
     index_buffer: Buffer<[u32]>,
@@ -1605,13 +1605,9 @@ impl Renderer {
             vk_mem::MemoryUsage::AutoPreferDevice,
         );
 
-        let indirect_cmd_bytes = GpuDrawCommandBuffer::new(
-            std::iter::repeat(GpuDrawIndexedIndirectCommand::default()).take(instances as usize),
-        )
-        .into_bytes();
-        let indirect_cmd_buffer = Buffer::<[u8]>::new(
+        let indirect_cmd_buffer = Buffer::<GpuDrawCommandBuffer>::new_sized(
             &self.allocator,
-            indirect_cmd_bytes.len() as u32,
+            GpuDrawCommandBuffer::byte_size(instances),
             vk::BufferUsageFlags::STORAGE_BUFFER
                 | vk::BufferUsageFlags::INDIRECT_BUFFER
                 | vk::BufferUsageFlags::TRANSFER_DST
@@ -1658,14 +1654,6 @@ impl Renderer {
             );
         }
         self.staging_buffer.stage(&self.device, self.staging_cmd_buffer, &meshlet_instance_buffer, 0, meshlet_data);
-        self.staging_buffer.stage_bytes(
-            &self.device,
-            self.staging_cmd_buffer,
-            &indirect_cmd_buffer,
-            0,
-            &indirect_cmd_bytes,
-        );
-
         for slot in 0..VISIBILITY_BUFFER_COUNT {
             let new_buffer = &new_visibility_buffers[slot];
             if new_buffer.is_null() {
