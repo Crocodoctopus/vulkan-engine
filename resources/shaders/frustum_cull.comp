@@ -50,22 +50,24 @@ void main() {
         }
     }
 
+    /* At this point, the meshlet is within the frustum. */
+
+    // If it wasn't visible N frames ago, append it as a late candidate...
     if (!frame_global.meshlet_visibility_buffer.data[meshlet_id]) {
-        // Append as draw candidate.
+        const uint i = atomicAdd(frame_global.visible_meshlet_candidate_buffer.len, 1);
+        frame_global.visible_meshlet_candidate_buffer.meshlet_ids[i] = meshlet_id;
         return;
     }
 
-    // Append draw command.
+    // ... otherwise, append as a draw command.
     VkDrawIndexedIndirectCommand cmd;
     cmd.index_count = meshlet.index_count;
     cmd.first_index = meshlet.first_index;
     cmd.instance_count = 1;
-    // Payload convention: object vertex indices are local, so vertex_offset is
-    // otherwise zero. Use it to carry object_id and undo the offset in render.vert.
+    // vertex_offset and first_instance are unused by the vert shader, and
+    // can be repurposed to forward up to 64 bits.
     cmd.vertex_offset = int(meshlet.object_id);
-    // Forward one u32 through first_instance; currently this is a stable
-    // meshlet id for debug coloring, but it can be repurposed by render.vert.
-    cmd.first_instance = meshlet_id;
+    cmd.first_instance = meshlet_id; // <- used for debug, unneeded.
 
     const uint i = atomicAdd(frame_global.draw_cmd_buffer.len, 1);
     frame_global.draw_cmd_buffer.data[i] = cmd;

@@ -65,6 +65,12 @@ layout (buffer_reference, scalar) buffer MeshletVisibilityBuffer {
     bool data[];
 };
 
+// Meshlets that are not trivially visible.
+layout (buffer_reference, scalar) buffer VisibleMeshletCandidateBuffer {
+    uint len;
+    uint meshlet_ids[];
+};
+
 struct FrameGlobal {
     mat4 pv;
     mat4 proj;
@@ -81,6 +87,8 @@ struct FrameGlobal {
     MeshletInstanceBuffer meshlet_buffer;
     DrawCmdBuffer draw_cmd_buffer;
     ObjectInstanceBuffer object_buffer;
+
+    VisibleMeshletCandidateBuffer visible_meshlet_candidate_buffer;
 
     uint instances;
 };

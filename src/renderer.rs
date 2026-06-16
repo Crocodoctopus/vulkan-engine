@@ -148,6 +148,7 @@ impl SwapchainResources {
 /* Resources that need regeneration when object set changes */
 struct SceneResources {
     indirect_cmd_buffer: Buffer<GpuDrawCommandBuffer>,
+    visible_meshlet_candidate_buffers: [Buffer<[u8]>; MAX_HZB_IN_FLIGHT],
 
     /* TODO: These are static after creation */
     index_buffer: Buffer<[u32]>,
@@ -157,6 +158,9 @@ struct SceneResources {
 
 impl SceneResources {
     unsafe fn free(self, allocator: &vk_mem::Allocator) {
+        for buffer in self.visible_meshlet_candidate_buffers {
+            buffer.destroy(&allocator);
+        }
         self.index_buffer.destroy(&allocator);
         self.object_instance_buffer.destroy(&allocator);
         self.meshlet_instance_buffer.destroy(&allocator);
@@ -218,7 +222,7 @@ pub struct Renderer {
     hzb_sampler: vk::Sampler,
     global_set: vk::DescriptorSet,
     frame_sets: [vk::DescriptorSet; MAX_FRAMES_IN_FLIGHT],
-    frame_global_buffers: [Buffer<FrameGlobal>; MAX_FRAMES_IN_FLIGHT],
+    frame_global_buffers: [Buffer<GpuFrameGlobal>; MAX_FRAMES_IN_FLIGHT],
 
     // Used for sequencing stages, and other cross-frame syncing.
     pipeline_semaphore: vk::Semaphore,
@@ -717,7 +721,7 @@ impl Renderer {
             });
 
             let frame_global_buffers = std::array::from_fn(|_| {
-                Buffer::<FrameGlobal>::new(
+                Buffer::<GpuFrameGlobal>::new(
                     &allocator,
                     vk::BufferUsageFlags::UNIFORM_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
                     vk_mem::MemoryUsage::AutoPreferDevice,
@@ -869,6 +873,7 @@ impl Renderer {
             index_buffer,
             object_instance_buffer,
             meshlet_instance_buffer,
+            visible_meshlet_candidate_buffers,
             ..
         } = self.scene_resources.last_mut().unwrap();
 
@@ -889,6 +894,7 @@ impl Renderer {
         let hzb_image = hzb_images[hzb_slot];
         let hzb_set = hzb_sets[hzb_slot];
         let hzb_build_src_views = &hzb_build_src_views[hzb_slot];
+        let visible_meshlet_candidate_buffer = &visible_meshlet_candidate_buffers[hzb_slot];
 
         // Command buffer associated with this frame.
         let data_upload = cmd_buffers[frame_index][PipelineStage::DataUpload as usize];
@@ -1024,7 +1030,7 @@ impl Renderer {
                         cmd,
                         frame_global_buffer,
                         0,
-                        [FrameGlobal {
+                        [GpuFrameGlobal {
                             pv: projection * view,
                             proj: projection,
                             view,
@@ -1045,6 +1051,10 @@ impl Renderer {
                             object_buffer: self.device.get_buffer_device_address(
                                 &vk::BufferDeviceAddressInfo::default().buffer(object_instance_buffer.vk_handle()),
                             ),
+                            visible_meshlet_candidate_buffer: self.device.get_buffer_device_address(
+                                &vk::BufferDeviceAddressInfo::default()
+                                    .buffer(visible_meshlet_candidate_buffer.vk_handle()),
+                            ),
                             instances: meshlet_instance_buffer.len(),
                         }],
                     );
@@ -1052,6 +1062,13 @@ impl Renderer {
                         cmd,
                         indirect_cmd_buffer.vk_handle(),
                         GpuDrawCommandBuffer::LEN_OFFSET,
+                        std::mem::size_of::<u32>() as u64,
+                        0,
+                    );
+                    self.device.cmd_fill_buffer(
+                        cmd,
+                        visible_meshlet_candidate_buffer.vk_handle(),
+                        GpuVisibleMeshletCandidateBuffer::LEN_OFFSET,
                         std::mem::size_of::<u32>() as u64,
                         0,
                     );
@@ -1615,6 +1632,21 @@ impl Renderer {
             vk_mem::MemoryUsage::AutoPreferDevice,
         );
 
+        let visible_meshlet_candidate_buffers = std::array::from_fn(|_| {
+            if instances > 0 {
+                Buffer::<[u8]>::new(
+                    &self.allocator,
+                    GpuVisibleMeshletCandidateBuffer::byte_size(instances) as u32,
+                    vk::BufferUsageFlags::STORAGE_BUFFER
+                        | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+                        | vk::BufferUsageFlags::TRANSFER_DST,
+                    vk_mem::MemoryUsage::AutoPreferDevice,
+                )
+            } else {
+                Buffer::null()
+            }
+        });
+
         let visibility_stride = std::mem::size_of::<u32>() as u64;
         let old_visibility_buffers =
             std::mem::replace(&mut self.visibility_buffers, std::array::from_fn(|_| Buffer::null()));
@@ -1725,6 +1757,7 @@ impl Renderer {
             object_instance_buffer,
             meshlet_instance_buffer,
             indirect_cmd_buffer,
+            visible_meshlet_candidate_buffers,
         });
     }
 

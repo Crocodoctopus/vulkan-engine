@@ -27,9 +27,25 @@ impl GpuDrawCommandBuffer {
     }
 }
 
+#[derive(Clone, Debug, Default, encase::ShaderType)]
+pub(super) struct GpuVisibleMeshletCandidateBuffer {
+    pub len: ArrayLength,
+    #[shader(align(4), size(runtime))]
+    pub meshlet_ids: Box<[u32]>,
+}
+
+impl GpuVisibleMeshletCandidateBuffer {
+    pub const LEN_OFFSET: u64 = <Self as encase::ShaderType>::METADATA.offset(0);
+    pub const DATA_OFFSET: u64 = <Self as encase::ShaderType>::METADATA.offset(1);
+
+    pub fn byte_size(len: u32) -> u64 {
+        Self::DATA_OFFSET + len as u64 * std::mem::size_of::<u32>() as u64
+    }
+}
+
 #[derive(Copy, Clone, Debug)]
 #[repr(C)]
-pub(super) struct FrameGlobal {
+pub(super) struct GpuFrameGlobal {
     // Matrices.
     pub pv: Mat4,
     pub proj: Mat4,
@@ -47,6 +63,7 @@ pub(super) struct FrameGlobal {
     pub meshlet_buffer: vk::DeviceAddress,
     pub draw_cmd_buffer: vk::DeviceAddress,
     pub object_buffer: vk::DeviceAddress,
+    pub visible_meshlet_candidate_buffer: vk::DeviceAddress,
 
     pub instances: u32,
 }
