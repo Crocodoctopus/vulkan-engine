@@ -1,0 +1,42 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_scalar_block_layout: require
+#extension GL_EXT_shader_8bit_storage: require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_nonuniform_qualifier : require
+
+layout (local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
+
+#include "types.h"
+#include "util.h"
+
+layout (set = 0, binding = 0) uniform sampler2D hzb_views[];
+
+layout(std430, set = 1, binding = 0) UNIFORM {
+    FrameGlobal frame_global;
+};
+
+void main() {
+    uint candidate_id = gl_GlobalInvocationID.x;
+    uint candidate_count = frame_global.frustum_passing_meshlet_buffer.len;
+    if (candidate_id >= candidate_count) {
+        return;
+    }
+
+    uint meshlet_id = frame_global.frustum_passing_meshlet_buffer.meshlet_ids[candidate_id];
+    MeshletInstance meshlet = frame_global.meshlet_buffer.data[meshlet_id];
+
+    // The occlusion pass is currently a plumbing pass: everything that reached it is visible.
+    bool was_visible = frame_global.meshlet_visibility_buffer.data[meshlet_id];
+    frame_global.meshlet_visibility_buffer.data[meshlet_id] = true;
+
+    if (!was_visible) {
+        const uint draw_index = atomicAdd(frame_global.late_draw_cmd_buffer.len, 1);
+        frame_global.late_draw_cmd_buffer.data[draw_index] = make_draw_cmd(meshlet, meshlet_id);
+    }
+
+    // Touch the HZB input so the descriptor stays part of the intended interface.
+    if (texelFetch(hzb_views[0], ivec2(0, 0), 0).r < -1.0) {
+        frame_global.meshlet_visibility_buffer.data[meshlet_id] = false;
+    }
+}

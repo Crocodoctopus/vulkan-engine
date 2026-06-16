@@ -28,14 +28,6 @@ layout (buffer_reference, std430) readonly buffer ObjectInstanceBuffer {
     ObjectInstance data[];
 };
 
-struct VkDrawIndexedIndirectCommand {
-    uint index_count;
-    uint instance_count;
-    uint first_index;
-    int vertex_offset;
-    uint first_instance;
-};
-
 struct MeshletInstance {
     // Culling.
     vec3 center;
@@ -55,20 +47,28 @@ layout (buffer_reference, std430) readonly buffer MeshletInstanceBuffer {
     MeshletInstance data[];
 };
 
-layout (buffer_reference, std430) writeonly buffer DrawCmdBuffer {
-    // Counter prefix for vkCmdDrawIndexedIndirectCount; commands start immediately after it.
-    uint len;
-    VkDrawIndexedIndirectCommand data[];
-};
-
 layout (buffer_reference, scalar) buffer MeshletVisibilityBuffer {
     bool data[];
 };
 
-// Meshlets that are not trivially visible.
-layout (buffer_reference, scalar) buffer VisibleMeshletCandidateBuffer {
+// Meshlets that pass frustum culling and still need occlusion testing.
+layout (buffer_reference, scalar) buffer FrustumPassingMeshletBuffer {
     uint len;
     uint meshlet_ids[];
+};
+
+struct VkDrawIndexedIndirectCommand {
+    uint index_count;
+    uint instance_count;
+    uint first_index;
+    int vertex_offset;
+    uint first_instance;
+};
+
+layout (buffer_reference, std430) writeonly buffer DrawCmdBuffer {
+    // Counter prefix for vkCmdDrawIndexedIndirectCount; commands start immediately after it.
+    uint len;
+    VkDrawIndexedIndirectCommand data[];
 };
 
 struct FrameGlobal {
@@ -86,9 +86,10 @@ struct FrameGlobal {
     MeshletVisibilityBuffer meshlet_visibility_buffer;
     MeshletInstanceBuffer meshlet_buffer;
     DrawCmdBuffer draw_cmd_buffer;
+    DrawCmdBuffer late_draw_cmd_buffer;
     ObjectInstanceBuffer object_buffer;
 
-    VisibleMeshletCandidateBuffer visible_meshlet_candidate_buffer;
+    FrustumPassingMeshletBuffer frustum_passing_meshlet_buffer;
 
     uint instances;
 };

@@ -63,23 +63,29 @@ fn main() {
     let _obj1 = renderer
         .create_object(sphere, Vec3::new(0.0, 0.0, 0.0), 0.05, Quat::from_euler(EulerRot::XYZ, 0.0, 0.0, 0.0))
         .unwrap();
-    let _obj2 = renderer
-        .create_object(
-            bunny,
-            Vec3::new(1.0, 0.4, 0.0),
-            2.0,
-            Quat::from_euler(EulerRot::XYZ, std::f32::consts::PI, 0.0, 0.0),
-        )
-        .unwrap();
-    let mut bunny_count = 1_u32;
-    /*let bunny_obj3 = renderer
-    .create_object(
-        bunny_mesh,
-        Vec3::new(2.0, 0.4, 0.0),
-        Quat::from_euler(EulerRot::XYZ, std::f32::consts::PI, 0.0, 0.0),
-        Vec3::splat(2.0),
-    )
-    .unwrap();*/
+    let bunny_spacing = 0.25_f32;
+    let bunny_scale = 1.4_f32;
+    let bunny_offset = Vec3::new(
+        1.5 - ((8 - 1) as f32) * 0.5 * bunny_spacing,
+        -0.25 - ((8 - 1) as f32) * 0.5 * bunny_spacing,
+        -4.0 - ((8 - 1) as f32) * 0.5 * bunny_spacing,
+    );
+    for z in 0..8 {
+        for y in 0..8 {
+            for x in 0..8 {
+                let position = bunny_offset
+                    + Vec3::new(x as f32 * bunny_spacing, y as f32 * bunny_spacing, z as f32 * bunny_spacing);
+                let _ = renderer
+                    .create_object(
+                        bunny,
+                        position,
+                        bunny_scale,
+                        Quat::from_euler(EulerRot::XYZ, std::f32::consts::PI, 0.0, 0.0),
+                    )
+                    .unwrap();
+            }
+        }
+    }
 
     // "Gameloop"
     //let mut timestamp = 0_u64;
@@ -123,13 +129,11 @@ fn main() {
                         KeyCode::KeyS => &mut s_down,
                         KeyCode::KeyD => &mut d_down,
                         KeyCode::KeyZ if state == ElementState::Pressed => {
-                            let i = bunny_count;
-                            bunny_count += 1;
                             renderer
                                 .create_object(
                                     bunny,
-                                    Vec3::new(1.0 + 0.55 * i as f32, 0.4, 0.0),
-                                    2.0,
+                                    Vec3::new(0.0, 0.0, 0.0),
+                                    bunny_scale,
                                     Quat::from_euler(EulerRot::XYZ, std::f32::consts::PI, 0.0, 0.0),
                                 )
                                 .unwrap();

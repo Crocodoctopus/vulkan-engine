@@ -2,6 +2,7 @@ use std::process::Command;
 
 fn main() {
     println!("cargo:rerun-if-changed=resources/shaders/types.h");
+    println!("cargo:rerun-if-changed=resources/shaders/util.h");
 
     // Add shader filenames here to build them.
     let shaders: &[&str] = &[
@@ -9,6 +10,7 @@ fn main() {
         "render.frag",
         "frustum_cull.comp",
         "build_hzb.comp",
+        "occlusion_cull.comp",
     ];
 
     for shader in shaders {

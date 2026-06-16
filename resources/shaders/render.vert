@@ -4,6 +4,7 @@
 #extension GL_EXT_shader_explicit_arithmetic_types : require
 
 #include "types.h"
+#include "util.h"
 
 layout(std430, set = 1, binding = 0) UNIFORM {
     FrameGlobal frame_global;
@@ -32,10 +33,6 @@ vec4 colors[14] = {
     vec4(1.0, 1.0, 0.25, 1.0),
     vec4(1.0, 1.0, 1.0, 1.0),
 };
-
-vec3 rotate_quat(vec3 v, vec4 q) {
-    return v + 2.0 * cross(q.xyz, cross(q.xyz, v) + q.w * v);
-}
 
 void main() {
     ObjectInstance object = frame_global.object_buffer.data[gl_BaseVertex];

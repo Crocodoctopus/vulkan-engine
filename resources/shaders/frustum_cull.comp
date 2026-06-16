@@ -7,14 +7,11 @@
 layout (local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 #include "types.h"
+#include "util.h"
 
 layout(std430, set = 0, binding = 0) UNIFORM {
     FrameGlobal frame_global;
 };
-
-vec3 rotate_quat(vec3 v, vec4 q) {
-    return v + 2.0 * cross(q.xyz, cross(q.xyz, v) + q.w * v);
-}
 
 void main() {
     uint meshlet_id = gl_GlobalInvocationID.x;
@@ -52,23 +49,16 @@ void main() {
 
     /* At this point, the meshlet is within the frustum. */
 
-    // If it wasn't visible N frames ago, append it as a late candidate...
+    // Every frustum-visible meshlet participates in the speculative visibility pass.
+    const uint candidate_index = atomicAdd(frame_global.frustum_passing_meshlet_buffer.len, 1);
+    frame_global.frustum_passing_meshlet_buffer.meshlet_ids[candidate_index] = meshlet_id;
+
+    // If it wasn't visible N frames ago, defer the draw to the late pass.
     if (!frame_global.meshlet_visibility_buffer.data[meshlet_id]) {
-        const uint i = atomicAdd(frame_global.visible_meshlet_candidate_buffer.len, 1);
-        frame_global.visible_meshlet_candidate_buffer.meshlet_ids[i] = meshlet_id;
         return;
     }
 
     // ... otherwise, append as a draw command.
-    VkDrawIndexedIndirectCommand cmd;
-    cmd.index_count = meshlet.index_count;
-    cmd.first_index = meshlet.first_index;
-    cmd.instance_count = 1;
-    // vertex_offset and first_instance are unused by the vert shader, and
-    // can be repurposed to forward up to 64 bits.
-    cmd.vertex_offset = int(meshlet.object_id);
-    cmd.first_instance = meshlet_id; // <- used for debug, unneeded.
-
     const uint i = atomicAdd(frame_global.draw_cmd_buffer.len, 1);
-    frame_global.draw_cmd_buffer.data[i] = cmd;
+    frame_global.draw_cmd_buffer.data[i] = make_draw_cmd(meshlet, meshlet_id);
 }

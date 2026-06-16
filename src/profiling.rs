@@ -137,13 +137,16 @@ impl PipelineProfiler {
             let scale = 1.0 / self.samples as f32;
             let data_upload_ms = self.stage_accum_ms[PipelineStage::DataUpload as usize] * scale;
             let frustum_cull_ms = self.stage_accum_ms[PipelineStage::FrustumCull as usize] * scale;
-            let first_draw_ms = self.stage_accum_ms[PipelineStage::FirstDraw as usize] * scale;
+            let early_draw_ms = self.stage_accum_ms[PipelineStage::EarlyDraw as usize] * scale;
             let build_hzb_ms = self.stage_accum_ms[PipelineStage::BuildHzb as usize] * scale;
-            let sum_ms = data_upload_ms + frustum_cull_ms + first_draw_ms + build_hzb_ms;
+            let occlusion_cull_ms = self.stage_accum_ms[PipelineStage::OcclusionCull as usize] * scale;
+            let late_draw_ms = self.stage_accum_ms[PipelineStage::LateDraw as usize] * scale;
+            let sum_ms =
+                data_upload_ms + frustum_cull_ms + early_draw_ms + build_hzb_ms + occlusion_cull_ms + late_draw_ms;
             let total_ms = self.total_accum_ms * scale;
 
             println!(
-                "timestamp: real = {total_ms:.4}ms (sum = {sum_ms:.4}ms)\n  upload = {data_upload_ms:.4}ms\n  frustum = {frustum_cull_ms:.4}ms\n  draw = {first_draw_ms:.4}ms\n  hzb = {build_hzb_ms:.4}ms"
+                "timestamp: real = {total_ms:.4}ms (sum = {sum_ms:.4}ms)\n  upload = {data_upload_ms:.4}ms\n  frustum = {frustum_cull_ms:.4}ms\n  early_draw = {early_draw_ms:.4}ms\n  build_hzb = {build_hzb_ms:.4}ms\n  occlusion = {occlusion_cull_ms:.4}ms\n  late_draw = {late_draw_ms:.4}ms"
             );
 
             self.stage_accum_ms = [0.0; PipelineStage::FrameEnd as usize];

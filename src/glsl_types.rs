@@ -28,13 +28,13 @@ impl GpuDrawCommandBuffer {
 }
 
 #[derive(Clone, Debug, Default, encase::ShaderType)]
-pub(super) struct GpuVisibleMeshletCandidateBuffer {
+pub(super) struct GpuFrustumPassingMeshletBuffer {
     pub len: ArrayLength,
     #[shader(align(4), size(runtime))]
     pub meshlet_ids: Box<[u32]>,
 }
 
-impl GpuVisibleMeshletCandidateBuffer {
+impl GpuFrustumPassingMeshletBuffer {
     pub const LEN_OFFSET: u64 = <Self as encase::ShaderType>::METADATA.offset(0);
     pub const DATA_OFFSET: u64 = <Self as encase::ShaderType>::METADATA.offset(1);
 
@@ -62,8 +62,9 @@ pub(super) struct GpuFrameGlobal {
     pub meshlet_visibility_buffer: vk::DeviceAddress,
     pub meshlet_buffer: vk::DeviceAddress,
     pub draw_cmd_buffer: vk::DeviceAddress,
+    pub late_draw_cmd_buffer: vk::DeviceAddress,
     pub object_buffer: vk::DeviceAddress,
-    pub visible_meshlet_candidate_buffer: vk::DeviceAddress,
+    pub frustum_passing_meshlet_buffer: vk::DeviceAddress,
 
     pub instances: u32,
 }
