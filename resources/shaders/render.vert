@@ -16,7 +16,7 @@ layout (location = 2) out vec4 frag_color;
 layout (location = 3) out vec3 frag_normal;
 layout (location = 4) out vec3 frag_position;
 
-vec4 colors[14] = {
+vec4 colors[16] = {
     vec4(0.0, 0.0, 1.0, 1.0),
     vec4(0.0, 1.0, 0.0, 1.0),
     vec4(0.0, 1.0, 1.0, 1.0),
@@ -32,11 +32,16 @@ vec4 colors[14] = {
     vec4(1.0, 0.25, 1.0, 1.0),
     vec4(1.0, 1.0, 0.25, 1.0),
     vec4(1.0, 1.0, 1.0, 1.0),
+    vec4(0.5, 0.5, 0.0, 1.0),
+    vec4(0.0, 0.5, 0.5, 1.0),
 };
 
 void main() {
     ObjectInstance object = frame_global.object_buffer.data[gl_BaseVertex];
     Vertex vert = object.vertex_buffer.data[gl_VertexIndex - gl_BaseVertex];
+    uint meshlet_tag;
+    uint lod_id;
+    unpack_draw_payload(gl_BaseInstance, meshlet_tag, lod_id);
 
     // Decompress.
     vec3 position = vec3(vert.x, vert.y, vert.z) / 32767.0f;
@@ -50,5 +55,5 @@ void main() {
     frag_normal = rotate_quat(normal, object.orientation);
     frag_uv = uv;
     frag_tex_id = object.tex_id;
-    frag_color = colors[gl_BaseInstance % 14];
+    frag_color = colors[meshlet_tag];
 }

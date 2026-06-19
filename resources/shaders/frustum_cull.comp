@@ -60,5 +60,5 @@ void main() {
 
     // ... otherwise, append as a draw command.
     const uint i = atomicAdd(frame_global.draw_cmd_buffer.len, 1);
-    frame_global.draw_cmd_buffer.data[i] = make_draw_cmd(meshlet, meshlet_id);
+    frame_global.draw_cmd_buffer.data[i] = make_draw_cmd(meshlet, meshlet_id, 0u);
 }

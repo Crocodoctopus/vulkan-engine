@@ -6,18 +6,33 @@
 
 #include "types.h"
 
+const uint MESHLET_TAG_BITS = 4u;
+const uint LOD_ID_BITS = 3u;
+const uint MESHLET_TAG_MASK = (1u << MESHLET_TAG_BITS) - 1u;
+const uint LOD_ID_MASK = (1u << LOD_ID_BITS) - 1u;
+const uint LOD_ID_SHIFT = MESHLET_TAG_BITS;
+
 vec3 rotate_quat(vec3 v, vec4 q) {
     return v + 2.0 * cross(q.xyz, cross(q.xyz, v) + q.w * v);
 }
 
-VkDrawIndexedIndirectCommand make_draw_cmd(MeshletInstance meshlet, uint padding) {
+uint pack_draw_payload(uint meshlet_tag, uint lod_id) {
+    return (meshlet_tag & MESHLET_TAG_MASK) | ((lod_id & LOD_ID_MASK) << LOD_ID_SHIFT);
+}
+
+void unpack_draw_payload(uint payload, out uint meshlet_tag, out uint lod_id) {
+    meshlet_tag = payload & MESHLET_TAG_MASK;
+    lod_id = (payload >> LOD_ID_SHIFT) & LOD_ID_MASK;
+}
+
+VkDrawIndexedIndirectCommand make_draw_cmd(MeshletInstance meshlet, uint meshlet_tag, uint lod_id) {
     VkDrawIndexedIndirectCommand cmd;
     cmd.index_count = meshlet.index_count;
     cmd.first_index = meshlet.first_index;
     cmd.instance_count = 1;
-    // vertex_offset carries the object index; first_instance forwards an extra u32 to the vertex stage.
+    // vertex_offset carries the object index; first_instance carries a 5-bit debug tag and LOD ID.
     cmd.vertex_offset = int(meshlet.object_id);
-    cmd.first_instance = padding;
+    cmd.first_instance = pack_draw_payload(meshlet_tag, lod_id);
     return cmd;
 }
 
