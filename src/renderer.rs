@@ -553,7 +553,8 @@ impl Renderer {
                                 &vk::PipelineDepthStencilStateCreateInfo::default()
                                     .depth_test_enable(true)
                                     .depth_write_enable(true)
-                                    .depth_compare_op(vk::CompareOp::LESS),
+                                    // Reverse-Z keeps the closest depth as the largest value.
+                                    .depth_compare_op(vk::CompareOp::GREATER),
                             )
                             .layout(pipeline_layout)],
                         None,
@@ -1042,7 +1043,8 @@ impl Renderer {
                     });
 
                     // Upload global descriptor data & object data.
-                    let projection = Mat4::perspective_infinite_rh(
+                    // Reverse-Z projection: near maps to 1.0, infinity tends toward 0.0.
+                    let projection = Mat4::perspective_infinite_reverse_rh(
                         std::f32::consts::FRAC_PI_6,
                         self.core.surface_extent.width as f32 / self.core.surface_extent.height as f32,
                         0.1,
@@ -1308,7 +1310,8 @@ impl Renderer {
                                 .load_op(vk::AttachmentLoadOp::CLEAR)
                                 .store_op(vk::AttachmentStoreOp::STORE)
                                 .clear_value(vk::ClearValue {
-                                    depth_stencil: vk::ClearDepthStencilValue { depth: 1.0, stencil: 0 },
+                                    // Reverse-Z clears to the farthest depth value.
+                                    depth_stencil: vk::ClearDepthStencilValue { depth: 0.0, stencil: 0 },
                                 }),
                         )
                         .color_attachments(&[vk::RenderingAttachmentInfo::default()
