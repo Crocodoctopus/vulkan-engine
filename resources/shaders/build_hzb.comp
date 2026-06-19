@@ -30,6 +30,8 @@ void main() {
     float z01 = texelFetch(src_views[view], p01, 0).r;
     float z11 = texelFetch(src_views[view], p11, 0).r;
 
-    float reduced = max(max(z00, z10), max(z01, z11));
+    // Reverse-Z: smaller depth is farther away. Store the farthest visible
+    // depth in each footprint so occlusion tests can prove full coverage.
+    float reduced = min(min(z00, z10), min(z01, z11));
     imageStore(dst_views[view], dst_xy, vec4(reduced, 0.0, 0.0, 0.0));
 }

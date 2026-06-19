@@ -16,6 +16,93 @@ layout(std430, set = 1, binding = 0) UNIFORM {
     FrameGlobal frame_global;
 };
 
+const float NEAR_PLANE = 0.1;
+const float DEPTH_BIAS = 0.000001;
+
+bool sphere_occluded(MeshletInstance meshlet, ObjectInstance object) {
+    vec3 center_ws = object.position + object.scale * rotate_quat(meshlet.center, object.orientation);
+    vec3 center_vs = (frame_global.view * vec4(center_ws, 1.0)).xyz;
+    float radius = abs(object.scale) * meshlet.radius;
+
+    // Anything touching the near plane is kept visible; projection bounds become
+    // unstable there and conservative culling should favor false negatives.
+    if (center_vs.z + radius >= -NEAR_PLANE) {
+        return false;
+    }
+
+    vec2 ndc_min = vec2( 1e30);
+    vec2 ndc_max = vec2(-1e30);
+
+    for (uint i = 0; i < 8; i++) {
+        vec3 corner = center_vs + radius * vec3(
+            ((i & 1u) != 0u) ? 1.0 : -1.0,
+            ((i & 2u) != 0u) ? 1.0 : -1.0,
+            ((i & 4u) != 0u) ? 1.0 : -1.0
+        );
+
+        vec4 clip = frame_global.proj * vec4(corner, 1.0);
+        if (clip.w <= 0.0) {
+            return false;
+        }
+
+        vec2 ndc = clip.xy / clip.w;
+        ndc_min = min(ndc_min, ndc);
+        ndc_max = max(ndc_max, ndc);
+    }
+
+    vec2 uv_min = ndc_min * 0.5 + 0.5;
+    vec2 uv_max = ndc_max * 0.5 + 0.5;
+
+    if (uv_max.x <= 0.0 || uv_max.y <= 0.0 || uv_min.x >= 1.0 || uv_min.y >= 1.0) {
+        return false;
+    }
+
+    uv_min = clamp(uv_min, vec2(0.0), vec2(1.0));
+    uv_max = clamp(uv_max, vec2(0.0), vec2(1.0));
+
+    ivec2 base_size = textureSize(hzb_views[1], 0);
+    vec2 base_size_f = vec2(base_size);
+    ivec2 base_min = clamp(ivec2(floor(uv_min * base_size_f)), ivec2(0), base_size - ivec2(1));
+    ivec2 base_max = clamp(ivec2(ceil (uv_max * base_size_f)) - ivec2(1), ivec2(0), base_size - ivec2(1));
+    base_max = max(base_max, base_min);
+
+    int mip_count = int(floor(log2(float(max(base_size.x, base_size.y))))) + 1;
+    int mip = 0;
+    for (; mip < mip_count - 1; mip++) {
+        int scale = 1 << mip;
+        ivec2 mip_min_probe = base_min / scale;
+        ivec2 mip_max_probe = base_max / scale;
+        ivec2 mip_extent_probe = mip_max_probe - mip_min_probe + ivec2(1);
+        if (mip_extent_probe.x <= 2 && mip_extent_probe.y <= 2) {
+            break;
+        }
+    }
+
+    int view_index = 1 + mip;
+    int mip_scale = 1 << mip;
+    ivec2 mip_size = textureSize(hzb_views[nonuniformEXT(view_index)], 0);
+    ivec2 mip_min = clamp(base_min / mip_scale, ivec2(0), mip_size - ivec2(1));
+    ivec2 mip_max = clamp(base_max / mip_scale, ivec2(0), mip_size - ivec2(1));
+
+    float z00 = texelFetch(hzb_views[nonuniformEXT(view_index)], ivec2(mip_min.x, mip_min.y), 0).r;
+    float z10 = texelFetch(hzb_views[nonuniformEXT(view_index)], ivec2(mip_max.x, mip_min.y), 0).r;
+    float z01 = texelFetch(hzb_views[nonuniformEXT(view_index)], ivec2(mip_min.x, mip_max.y), 0).r;
+    float z11 = texelFetch(hzb_views[nonuniformEXT(view_index)], ivec2(mip_max.x, mip_max.y), 0).r;
+    float farthest_occluder_depth = min(min(z00, z10), min(z01, z11));
+
+    vec4 nearest_clip = frame_global.proj * vec4(center_vs + vec3(0.0, 0.0, radius), 1.0);
+    if (nearest_clip.w <= 0.0) {
+        return false;
+    }
+
+    float nearest_sphere_depth = clamp(nearest_clip.z / nearest_clip.w, 0.0, 1.0);
+
+    // Reverse-Z uses larger values for closer geometry. The meshlet sphere is
+    // occluded only if every depth represented by the sampled HZB texels is
+    // closer than the nearest possible depth of the sphere.
+    return farthest_occluder_depth > nearest_sphere_depth + DEPTH_BIAS;
+}
+
 void main() {
     uint candidate_id = gl_GlobalInvocationID.x;
     uint candidate_count = frame_global.frustum_passing_meshlet_buffer.len;
@@ -25,18 +112,14 @@ void main() {
 
     uint meshlet_id = frame_global.frustum_passing_meshlet_buffer.meshlet_ids[candidate_id];
     MeshletInstance meshlet = frame_global.meshlet_buffer.data[meshlet_id];
+    ObjectInstance object = frame_global.object_buffer.data[meshlet.object_id];
 
-    // The occlusion pass is currently a plumbing pass: everything that reached it is visible.
     bool was_visible = frame_global.meshlet_visibility_buffer.data[meshlet_id];
-    frame_global.meshlet_visibility_buffer.data[meshlet_id] = true;
+    bool visible = !sphere_occluded(meshlet, object);
+    frame_global.meshlet_visibility_buffer.data[meshlet_id] = visible;
 
-    if (!was_visible) {
+    if (visible && !was_visible) {
         const uint draw_index = atomicAdd(frame_global.late_draw_cmd_buffer.len, 1);
         frame_global.late_draw_cmd_buffer.data[draw_index] = make_draw_cmd(meshlet, meshlet_id);
-    }
-
-    // Touch the HZB input so the descriptor stays part of the intended interface.
-    if (texelFetch(hzb_views[0], ivec2(0, 0), 0).r < -1.0) {
-        frame_global.meshlet_visibility_buffer.data[meshlet_id] = false;
     }
 }
