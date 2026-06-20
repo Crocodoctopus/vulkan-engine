@@ -1,4 +1,5 @@
 use crate::core::Core;
+use crate::image::ImageView2D;
 use ash::{khr, vk};
 
 pub(crate) struct Swapchain {
@@ -45,23 +46,13 @@ impl Swapchain {
         let images = swapchain_device.get_swapchain_images(swapchain).unwrap().into_boxed_slice();
         let color_views = (0..images.len())
             .into_iter()
-            .map(|i| {
-                device
-                    .create_image_view(
-                        &vk::ImageViewCreateInfo::default()
-                            .image(images[i])
-                            .view_type(vk::ImageViewType::TYPE_2D)
-                            .format(surface_format.format)
-                            .subresource_range(vk::ImageSubresourceRange {
-                                aspect_mask: vk::ImageAspectFlags::COLOR,
-                                base_mip_level: 0,
-                                level_count: 1,
-                                base_array_layer: 0,
-                                layer_count: 1,
-                            }),
-                        None,
-                    )
+            .map(|i| unsafe {
+                ImageView2D::new()
+                    .format(surface_format.format)
+                    .aspect(vk::ImageAspectFlags::COLOR)
+                    .build_raw(device, images[i], surface_format.format)
                     .unwrap()
+                    .vk_handle()
             })
             .collect();
 

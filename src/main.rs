@@ -13,12 +13,14 @@ extern crate winit;
 mod buffer;
 mod core;
 mod glsl_types;
+mod image;
 mod mesh;
 mod profiling;
 mod renderer;
 mod staging;
 mod swapchain;
 mod util;
+mod vk_helpers;
 
 use crate::renderer::*;
 use glam::*;
@@ -217,48 +219,20 @@ fn main() {
     std::process::abort();
 }
 
-/*let (viking_room_image, mut viking_room_alloc) = renderer
-.allocator
-.create_image(
-    &vk::ImageCreateInfo::default()
-        .image_type(vk::ImageType::TYPE_2D)
-        .extent(vk::Extent3D {
-            width: viking_room_tex_w,
-            height: viking_room_tex_h,
-            depth: 1,
-        })
-        .mip_levels(1)
-        .array_layers(1)
-        .format(vk::Format::R8G8B8A8_UNORM)
-        .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
-        .tiling(vk::ImageTiling::OPTIMAL)
-        .initial_layout(vk::ImageLayout::UNDEFINED)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE)
-        .samples(vk::SampleCountFlags::TYPE_1),
-    &vk_mem::AllocationCreateInfo {
-        ..Default::default()
-    },
-)
-.unwrap();
-
-let viking_room_view = renderer
-    .device
-    .create_image_view(
-        &vk::ImageViewCreateInfo::default()
-            .image(viking_room_image)
-            .view_type(vk::ImageViewType::TYPE_2D)
-            .format(vk::Format::R8G8B8A8_UNORM)
-            .subresource_range(
-                vk::ImageSubresourceRange::default()
-                    .aspect_mask(vk::ImageAspectFlags::COLOR)
-                    .base_mip_level(0)
-                    .level_count(1)
-                    .base_array_layer(0)
-                    .layer_count(1),
-            ),
-        None,
-    )
+/*let viking_room_image = Image2D::new()
+    .extent(vk::Extent2D { width: viking_room_tex_w, height: viking_room_tex_h })
+    .format(vk::Format::R8G8B8A8_UNORM)
+    .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
+    .build(&renderer.allocator)
     .unwrap();
+
+let viking_room_view = unsafe {
+    ImageView2D::new()
+        .format(vk::Format::R8G8B8A8_UNORM)
+        .aspect(vk::ImageAspectFlags::COLOR)
+        .build(&renderer.device, &viking_room_image)
+        .unwrap()
+};
 
 let viking_room_sampler = renderer
 .device
