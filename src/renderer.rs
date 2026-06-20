@@ -1292,31 +1292,15 @@ impl Renderer {
                 PipelineStage::DataUpload,
                 data_upload,
                 |cmd| {
+                    let camera_forward = Vec3::new(
+                        self.cam_rot[0].sin() * self.cam_rot[1].cos(),
+                        self.cam_rot[1].sin(),
+                        -self.cam_rot[0].cos() * self.cam_rot[1].cos(),
+                    );
                     let mut object_data = Vec::with_capacity(self.objects.len());
-                    let mut active_meshlet_ids = Vec::with_capacity(meshlet_instance_buffer.len() as usize);
-
-                    for (handle, obj) in &self.objects {
+                    for (_handle, obj) in self.objects.iter() {
                         let mesh = self.meshes.get(&obj.mesh).unwrap();
                         let vertex_buffers = self.vertex_buffers.get(&obj.mesh).unwrap();
-                        let distance = (self.cam_pos - obj.position).length();
-                        let object_radius = obj.scale * mesh.scale * mesh.radius;
-                        let lod_ratio = (distance.max(1e-5) / object_radius.max(1e-5)) * LOD_DISTANCE_BIAS;
-                        let lod_id = lod_ratio
-                            .log2()
-                            .floor()
-                            .clamp(0.0, (mesh.lod_count.saturating_sub(1)) as f32) as u32;
-                        let lod_idx = lod_id as usize;
-                        let meshlet_start = self.visibility_index_cache.get(handle).copied().unwrap();
-                        let lod_meshlet_offset = mesh.lods[..lod_idx]
-                            .iter()
-                            .map(|lod| lod.len() as u32)
-                            .sum::<u32>();
-
-                        for meshlet_idx in 0..mesh.lods[lod_idx].len() as u32 {
-                            let meshlet_id = meshlet_start + lod_meshlet_offset + meshlet_idx;
-                            active_meshlet_ids.push((meshlet_id << 3) | lod_id);
-                        }
-
                         object_data.push(GpuObjectInstance {
                             position: obj.position,
                             scale: obj.scale * mesh.scale,
@@ -1338,6 +1322,40 @@ impl Renderer {
                         });
                     }
 
+                    let mut active_objects: Vec<_> = self.objects.iter().collect();
+                    active_objects.sort_by(|(handle_a, obj_a), (handle_b, obj_b)| {
+                        let mesh_a = self.meshes.get(&obj_a.mesh).unwrap();
+                        let mesh_b = self.meshes.get(&obj_b.mesh).unwrap();
+                        let radius_a = obj_a.scale * mesh_a.scale * mesh_a.radius;
+                        let radius_b = obj_b.scale * mesh_b.scale * mesh_b.radius;
+                        let depth_a = (obj_a.position - self.cam_pos).length() - radius_a;
+                        let depth_b = (obj_b.position - self.cam_pos).length() - radius_b;
+                        depth_a.total_cmp(&depth_b).then(handle_a.0.cmp(&handle_b.0))
+                    });
+
+                    let mut active_meshlet_ids = Vec::with_capacity(meshlet_instance_buffer.len() as usize);
+                    for (handle, obj) in active_objects {
+                        let mesh = self.meshes.get(&obj.mesh).unwrap();
+                        let distance = (self.cam_pos - obj.position).length();
+                        let object_radius = obj.scale * mesh.scale * mesh.radius;
+                        let lod_ratio = (distance.max(1e-5) / object_radius.max(1e-5)) * LOD_DISTANCE_BIAS;
+                        let lod_id = lod_ratio
+                            .log2()
+                            .floor()
+                            .clamp(0.0, (mesh.lod_count.saturating_sub(1)) as f32) as u32;
+                        let lod_idx = lod_id as usize;
+                        let meshlet_start = self.visibility_index_cache.get(handle).copied().unwrap();
+                        let lod_meshlet_offset = mesh.lods[..lod_idx]
+                            .iter()
+                            .map(|lod| lod.len() as u32)
+                            .sum::<u32>();
+
+                        for meshlet_idx in 0..mesh.lods[lod_idx].len() as u32 {
+                            let meshlet_id = meshlet_start + lod_meshlet_offset + meshlet_idx;
+                            active_meshlet_ids.push((meshlet_id << 3) | lod_id);
+                        }
+                    }
+
                     active_meshlet_count = active_meshlet_ids.len() as u32;
 
                     // Upload global descriptor data & object data.
@@ -1348,11 +1366,7 @@ impl Renderer {
                         0.1,
                     );
 
-                    let p = Vec3::new(
-                        self.cam_rot[0].sin() * self.cam_rot[1].cos(),
-                        self.cam_rot[1].sin(),
-                        -self.cam_rot[0].cos() * self.cam_rot[1].cos(),
-                    );
+                    let p = camera_forward;
                     let view = Mat4::look_to_rh(self.cam_pos, p, Vec3::new(0., 1., 0.));
 
                     // Frustum plane data.
