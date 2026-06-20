@@ -1,7 +1,7 @@
 use crate::buffer::Buffer;
 use crate::core::Core;
 use crate::glsl_types::*;
-use crate::mesh::{Meshlet, load_mesh};
+use crate::mesh::{load_mesh, Mesh, MAX_LODS};
 use crate::profiling::PipelineProfiler;
 use crate::staging::StagingBuffer;
 use crate::swapchain::Swapchain;
@@ -160,6 +160,7 @@ impl SwapchainResources {
 /* Resources that need regeneration when object set changes */
 struct SceneResources {
     indirect_cmd_buffer: Buffer<GpuDrawCommandBuffer>,
+    active_meshlet_buffers: [Buffer<GpuActiveMeshletBuffer>; MAX_FRAMES_IN_FLIGHT],
     frustum_passing_meshlet_buffers: [Buffer<[u8]>; MAX_HZB_IN_FLIGHT],
     late_draw_cmd_buffers: [Buffer<GpuDrawCommandBuffer>; MAX_HZB_IN_FLIGHT],
 
@@ -171,6 +172,9 @@ struct SceneResources {
 
 impl SceneResources {
     unsafe fn free(self, allocator: &vk_mem::Allocator) {
+        for buffer in self.active_meshlet_buffers {
+            buffer.destroy(&allocator);
+        }
         for buffer in self.frustum_passing_meshlet_buffers {
             buffer.destroy(&allocator);
         }
@@ -226,9 +230,9 @@ pub struct Renderer {
     /* Generic resource containers: */
     cwd: PathBuf,
     resource_counter: u32,
-    meshes: HashMap<MeshHandle, (f32, Box<[Meshlet]>)>,
+    meshes: HashMap<MeshHandle, Mesh>,
     objects: Vec<(ObjectHandle, Object)>,
-    vertex_buffers: HashMap<MeshHandle, Buffer<[GpuVertex]>>,
+    vertex_buffers: HashMap<MeshHandle, [Buffer<[GpuVertex]>; MAX_LODS]>,
     // Canonical packed meshlet start index for each object.
     visibility_index_cache: HashMap<ObjectHandle, u32>,
 
@@ -271,6 +275,8 @@ pub struct Renderer {
     pub cam_rot: Vec2, // YX
     pub overdraw_enabled: bool,
 }
+
+const LOD_DISTANCE_BIAS: f32 = 0.5;
 
 impl Drop for Renderer {
     fn drop(&mut self) {
@@ -1139,6 +1145,7 @@ impl Renderer {
 
         let SceneResources {
             indirect_cmd_buffer,
+            active_meshlet_buffers,
             index_buffer,
             object_instance_buffer,
             meshlet_instance_buffer,
@@ -1166,6 +1173,7 @@ impl Renderer {
         let hzb_image = hzb_images[hzb_slot];
         let hzb_set = hzb_sets[hzb_slot];
         let hzb_build_src_views = &hzb_build_src_views[hzb_slot];
+        let active_meshlet_buffer = &active_meshlet_buffers[frame_index];
         let frustum_passing_meshlet_buffer = &frustum_passing_meshlet_buffers[hzb_slot];
         let late_draw_cmd_buffer = &late_draw_cmd_buffers[hzb_slot];
 
@@ -1186,6 +1194,7 @@ impl Renderer {
         let overdraw_enabled = self.overdraw_enabled;
         let hzb_base_width = self.core.surface_extent.width.div_ceil(2).max(1);
         let hzb_base_height = self.core.surface_extent.height.div_ceil(2).max(1);
+        let mut active_meshlet_count = 0u32;
 
         // Visibility information.
         let visibility_buffer = &self.visibility_buffers[frame_count % VISIBILITY_BUFFER_COUNT];
@@ -1283,16 +1292,53 @@ impl Renderer {
                 PipelineStage::DataUpload,
                 data_upload,
                 |cmd| {
-                    let object_data = self.objects.iter().map(|(_, obj)| GpuObjectInstance {
-                        position: obj.position,
-                        scale: obj.scale * self.meshes.get(&obj.mesh).unwrap().0,
-                        orientation: obj.orientation,
-                        vertex_buffer: self.device.get_buffer_device_address(
-                            &vk::BufferDeviceAddressInfo::default()
-                                .buffer(self.vertex_buffers.get(&obj.mesh).unwrap().vk_handle()),
-                        ),
-                        texture_id: 0,
-                    });
+                    let mut object_data = Vec::with_capacity(self.objects.len());
+                    let mut active_meshlet_ids = Vec::with_capacity(meshlet_instance_buffer.len() as usize);
+
+                    for (handle, obj) in &self.objects {
+                        let mesh = self.meshes.get(&obj.mesh).unwrap();
+                        let vertex_buffers = self.vertex_buffers.get(&obj.mesh).unwrap();
+                        let distance = (self.cam_pos - obj.position).length();
+                        let object_radius = obj.scale * mesh.scale * mesh.radius;
+                        let lod_ratio = (distance.max(1e-5) / object_radius.max(1e-5)) * LOD_DISTANCE_BIAS;
+                        let lod_id = lod_ratio
+                            .log2()
+                            .floor()
+                            .clamp(0.0, (mesh.lod_count.saturating_sub(1)) as f32) as u32;
+                        let lod_idx = lod_id as usize;
+                        let meshlet_start = self.visibility_index_cache.get(handle).copied().unwrap();
+                        let lod_meshlet_offset = mesh.lods[..lod_idx]
+                            .iter()
+                            .map(|lod| lod.len() as u32)
+                            .sum::<u32>();
+
+                        for meshlet_idx in 0..mesh.lods[lod_idx].len() as u32 {
+                            let meshlet_id = meshlet_start + lod_meshlet_offset + meshlet_idx;
+                            active_meshlet_ids.push((meshlet_id << 3) | lod_id);
+                        }
+
+                        object_data.push(GpuObjectInstance {
+                            position: obj.position,
+                            scale: obj.scale * mesh.scale,
+                            orientation: obj.orientation,
+                            vertex_buffer: std::array::from_fn(|lod| {
+                                if lod >= mesh.lod_count {
+                                    return 0;
+                                }
+                                let buffer = &vertex_buffers[lod];
+                                if buffer.is_null() {
+                                    0
+                                } else {
+                                    self.device.get_buffer_device_address(
+                                        &vk::BufferDeviceAddressInfo::default().buffer(buffer.vk_handle()),
+                                    )
+                                }
+                            }),
+                            texture_id: 0,
+                        });
+                    }
+
+                    active_meshlet_count = active_meshlet_ids.len() as u32;
 
                     // Upload global descriptor data & object data.
                     // Reverse-Z projection: near maps to 1.0, infinity tends toward 0.0.
@@ -1324,8 +1370,27 @@ impl Renderer {
                         cmd,
                         &object_instance_buffer,
                         0,
-                        object_data.collect::<Vec<_>>(),
+                        object_data,
                     );
+
+                    if !active_meshlet_buffer.is_null() {
+                        self.device.cmd_fill_buffer(
+                            cmd,
+                            active_meshlet_buffer.vk_handle(),
+                            GpuActiveMeshletBuffer::LEN_OFFSET,
+                            std::mem::size_of::<u32>() as u64,
+                            active_meshlet_count,
+                        );
+                        self.staging_buffer.stage(
+                            &self.device,
+                            cmd,
+                            active_meshlet_buffer,
+                            GpuActiveMeshletBuffer::DATA_OFFSET,
+                            active_meshlet_ids,
+                        );
+                    } else {
+                        active_meshlet_count = 0;
+                    }
 
                     self.staging_buffer.stage(
                         &self.device,
@@ -1347,6 +1412,9 @@ impl Renderer {
                                 0.0,
                                 0.0,
                             ),
+                            active_meshlet_buffer: self.device.get_buffer_device_address(
+                                &vk::BufferDeviceAddressInfo::default().buffer(active_meshlet_buffer.vk_handle()),
+                            ),
                             meshlet_visibility_buffer: self.device.get_buffer_device_address(
                                 &vk::BufferDeviceAddressInfo::default().buffer(visibility_buffer.vk_handle()),
                             ),
@@ -1366,9 +1434,10 @@ impl Renderer {
                                 &vk::BufferDeviceAddressInfo::default()
                                     .buffer(frustum_passing_meshlet_buffer.vk_handle()),
                             ),
-                            instances: meshlet_instance_buffer.len(),
+                            instances: active_meshlet_count,
                         }],
                     );
+
                     self.device.cmd_fill_buffer(
                         cmd,
                         indirect_cmd_buffer.vk_handle(),
@@ -1510,7 +1579,9 @@ impl Renderer {
 
                     self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.frustum_cull_pipeline);
 
-                    self.device.cmd_dispatch(cmd, meshlet_instance_buffer.len().div_ceil(64), 1, 1);
+                    if active_meshlet_count > 0 {
+                        self.device.cmd_dispatch(cmd, active_meshlet_count.div_ceil(64), 1, 1);
+                    }
                 },
             );
 
@@ -2156,24 +2227,28 @@ impl Renderer {
         let old_visibility_index_cache = self.visibility_index_cache.clone();
 
         // Generate vertex data for newly added meshes.
-        let new_meshes: HashMap<MeshHandle, Box<[GpuVertex]>> = self
+        let new_meshes: HashMap<MeshHandle, [Box<[GpuVertex]>; MAX_LODS]> = self
             .meshes
-            .iter()
-            .filter(|(k, _)| !self.vertex_buffers.contains_key(k))
-            .map(|(id, mesh)| {
-                (
-                    *id,
-                    mesh.1
-                        .iter()
-                        .flat_map(|meshlet| {
-                            (0..meshlet.positions.len()).map(|i| GpuVertex {
-                                position: meshlet.positions[i],
+                .iter()
+                .filter(|(k, _)| !self.vertex_buffers.contains_key(k))
+                .map(|(id, mesh)| {
+                    let lod_vertices = std::array::from_fn(|lod| {
+                        if lod >= mesh.lod_count {
+                            return Vec::new().into_boxed_slice();
+                        }
+                        mesh.lods[lod]
+                            .iter()
+                            .flat_map(|meshlet| {
+                                (0..meshlet.positions.len()).map(|i| GpuVertex {
+                                    position: meshlet.positions[i],
                                 normal: meshlet.normals[i],
                                 uv: [0, 0],
                             })
                         })
-                        .collect(),
-                )
+                        .collect::<Vec<_>>()
+                        .into_boxed_slice()
+                });
+                (*id, lod_vertices)
             })
             .collect();
 
@@ -2181,18 +2256,23 @@ impl Renderer {
         for (id, vertices) in &new_meshes {
             self.vertex_buffers.insert(
                 *id,
-                Buffer::<[GpuVertex]>::new(
-                    &self.allocator,
-                    vertices.len() as u32,
-                    vk::BufferUsageFlags::VERTEX_BUFFER
-                        | vk::BufferUsageFlags::TRANSFER_DST
-                        | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-                    vk_mem::MemoryUsage::AutoPreferDevice,
-                ),
+                std::array::from_fn(|lod| {
+                    if vertices[lod].is_empty() {
+                        return Buffer::null();
+                    }
+                    Buffer::<[GpuVertex]>::new(
+                        &self.allocator,
+                        vertices[lod].len() as u32,
+                        vk::BufferUsageFlags::VERTEX_BUFFER
+                            | vk::BufferUsageFlags::TRANSFER_DST
+                            | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                        vk_mem::MemoryUsage::AutoPreferDevice,
+                    )
+                }),
             );
         }
 
-        // Generate index data once per unique mesh, then reference those packed ranges from objects.
+        // Generate index data once per unique mesh and LOD, then reference those packed ranges from objects.
         let mut sorted_meshes: Vec<_> = self.meshes.iter().collect();
         sorted_meshes.sort_by_key(|(handle, _)| handle.0);
 
@@ -2200,20 +2280,23 @@ impl Renderer {
         let mut mesh_index_offset_cache = HashMap::with_capacity(sorted_meshes.len());
         let mut meshlet_first_index_cache = HashMap::with_capacity(sorted_meshes.len());
         for (handle, mesh) in sorted_meshes {
-            let mesh_base_index = indices.len() as u32;
-            mesh_index_offset_cache.insert(*handle, mesh_base_index);
+            let mut mesh_base_indices = [0u32; MAX_LODS];
+            let mut meshlet_first_indices: [Vec<u32>; MAX_LODS] = std::array::from_fn(|_| Vec::new());
+            for lod in 0..mesh.lod_count {
+                let meshlets = &mesh.lods[lod];
+                mesh_base_indices[lod] = indices.len() as u32;
 
-            let meshlets = &mesh.1;
-            let mut first_index = 0u32;
-            let mut meshlet_first_indices = Vec::with_capacity(meshlets.len());
-            let mut offset = 0u32;
-            for meshlet in meshlets {
-                meshlet_first_indices.push(first_index);
-                indices.extend(meshlet.indices.iter().map(|&index| index as u32 + offset));
-                offset += meshlet.positions.len() as u32;
-                first_index += meshlet.indices.len() as u32;
+                let mut first_index = 0u32;
+                let mut offset = 0u32;
+                for meshlet in meshlets {
+                    meshlet_first_indices[lod].push(first_index);
+                    indices.extend(meshlet.indices.iter().map(|&index| index as u32 + offset));
+                    offset += meshlet.positions.len() as u32;
+                    first_index += meshlet.indices.len() as u32;
+                }
             }
-            meshlet_first_index_cache.insert(*handle, meshlet_first_indices.into_boxed_slice());
+            mesh_index_offset_cache.insert(*handle, mesh_base_indices);
+            meshlet_first_index_cache.insert(*handle, meshlet_first_indices.map(Vec::into_boxed_slice));
         }
 
         let mut meshlet_data = vec![];
@@ -2223,28 +2306,33 @@ impl Renderer {
         let mut triangle_count = 0usize;
         for (i, (handle, object)) in self.objects.iter().enumerate() {
             // Get associated mesh and its packed index range.
-            let mesh = &self.meshes.get(&object.mesh).unwrap().1;
+            let mesh = self.meshes.get(&object.mesh).unwrap();
             let meshlet_start = instances;
             new_visibility_index_cache.insert(*handle, meshlet_start);
-            object_meshlet_counts.insert(*handle, mesh.len() as u32);
+            object_meshlet_counts.insert(*handle, mesh.lods[..mesh.lod_count].iter().map(|lod| lod.len() as u32).sum::<u32>());
 
             // Mesh data.
-            let mesh_base_index = mesh_index_offset_cache.get(&object.mesh).copied().unwrap();
+            let mesh_base_indices = mesh_index_offset_cache.get(&object.mesh).copied().unwrap();
             let meshlet_first_indices = meshlet_first_index_cache.get(&object.mesh).unwrap();
-            for (meshlet_idx, meshlet) in mesh.iter().enumerate() {
-                triangle_count += meshlet.indices.len() / 3;
-                meshlet_data.push(GpuMeshletInstance {
-                    center: Vec3::from(meshlet.center),
-                    radius: meshlet.radius,
-                    cone_apex: Vec3::from(meshlet.cone_apex),
-                    pad0: 0.,
-                    cone_axis: Vec3::from(meshlet.cone_axis),
-                    cone_cutoff: meshlet.cone_cutoff,
-                    object_id: i as u32,
-                    index_count: meshlet.indices.len() as u32,
-                    first_index: mesh_base_index + meshlet_first_indices[meshlet_idx],
-                });
-                instances += 1;
+            for lod in 0..mesh.lod_count {
+                let lod_meshlets = &mesh.lods[lod];
+                let mesh_base_index = mesh_base_indices[lod];
+                let lod_meshlet_first_indices = &meshlet_first_indices[lod];
+                for (meshlet_idx, meshlet) in lod_meshlets.iter().enumerate() {
+                    triangle_count += meshlet.indices.len() / 3;
+                    meshlet_data.push(GpuMeshletInstance {
+                        center: Vec3::from(meshlet.center),
+                        radius: meshlet.radius,
+                        cone_apex: Vec3::from(meshlet.cone_apex),
+                        pad0: 0.,
+                        cone_axis: Vec3::from(meshlet.cone_axis),
+                        cone_cutoff: meshlet.cone_cutoff,
+                        object_id: i as u32,
+                        index_count: meshlet.indices.len() as u32,
+                        first_index: mesh_base_index + lod_meshlet_first_indices[meshlet_idx],
+                    });
+                    instances += 1;
+                }
             }
         }
 
@@ -2254,8 +2342,12 @@ impl Renderer {
         let meshlet_count = instances as usize;
         let new_mesh_count = new_meshes.len();
         let index_upload_bytes = indices.len() * std::mem::size_of::<u32>();
-        let vertex_upload_bytes =
-            new_meshes.iter().map(|(_, vertices)| vertices.len() * std::mem::size_of::<GpuVertex>()).sum::<usize>();
+        let vertex_upload_bytes = new_meshes
+            .iter()
+            .map(|(_, vertices)| {
+                vertices.iter().map(|lod_vertices| lod_vertices.len()).sum::<usize>() * std::mem::size_of::<GpuVertex>()
+            })
+            .sum::<usize>();
         let meshlet_upload_bytes = meshlet_data.len() * std::mem::size_of::<GpuMeshletInstance>();
         let total_upload_bytes = index_upload_bytes + vertex_upload_bytes + meshlet_upload_bytes;
         println!(
@@ -2304,6 +2396,21 @@ impl Renderer {
                 | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
             vk_mem::MemoryUsage::AutoPreferDevice,
         );
+
+        let active_meshlet_buffers = std::array::from_fn(|_| {
+            if instances > 0 {
+                Buffer::<GpuActiveMeshletBuffer>::new_sized(
+                    &self.allocator,
+                    GpuActiveMeshletBuffer::byte_size(instances),
+                    vk::BufferUsageFlags::STORAGE_BUFFER
+                        | vk::BufferUsageFlags::TRANSFER_DST
+                        | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                    vk_mem::MemoryUsage::AutoPreferDevice,
+                )
+            } else {
+                Buffer::null()
+            }
+        });
 
         let frustum_passing_meshlet_buffers = std::array::from_fn(|_| {
             if instances > 0 {
@@ -2366,13 +2473,19 @@ impl Renderer {
         self.staging_buffer.reset();
         self.staging_buffer.stage(&self.device, self.staging_cmd_buffer, &index_buffer, 0, indices);
         for (id, vertices) in &new_meshes {
-            self.staging_buffer.stage(
-                &self.device,
-                self.staging_cmd_buffer,
-                self.vertex_buffers.get(id).unwrap(),
-                0,
-                vertices.as_ref(),
-            );
+            let buffers = self.vertex_buffers.get(id).unwrap();
+            for lod in 0..MAX_LODS {
+                if vertices[lod].is_empty() {
+                    continue;
+                }
+                self.staging_buffer.stage(
+                    &self.device,
+                    self.staging_cmd_buffer,
+                    &buffers[lod],
+                    0,
+                    vertices[lod].as_ref(),
+                );
+            }
         }
         self.staging_buffer.stage(&self.device, self.staging_cmd_buffer, &meshlet_instance_buffer, 0, meshlet_data);
         for slot in 0..VISIBILITY_BUFFER_COUNT {
@@ -2446,6 +2559,7 @@ impl Renderer {
             object_instance_buffer,
             meshlet_instance_buffer,
             indirect_cmd_buffer,
+            active_meshlet_buffers,
             frustum_passing_meshlet_buffers,
             late_draw_cmd_buffers,
         });

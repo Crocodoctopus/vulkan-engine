@@ -38,10 +38,10 @@ vec4 colors[16] = {
 
 void main() {
     ObjectInstance object = frame_global.object_buffer.data[gl_BaseVertex];
-    Vertex vert = object.vertex_buffer.data[gl_VertexIndex - gl_BaseVertex];
     uint meshlet_tag;
     uint lod_id;
     unpack_draw_payload(gl_BaseInstance, meshlet_tag, lod_id);
+    Vertex vert = object.vertex_buffer[lod_id].data[gl_VertexIndex - gl_BaseVertex];
 
     // Decompress.
     vec3 position = vec3(vert.x, vert.y, vert.z) / 32767.0f;

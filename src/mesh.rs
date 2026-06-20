@@ -3,6 +3,8 @@ use itertools::Itertools;
 use std::collections::HashMap;
 use std::path::Path;
 
+pub(crate) const MAX_LODS: usize = 8;
+
 #[derive(Debug)]
 pub(crate) struct Meshlet {
     pub center: [f32; 3],
@@ -16,23 +18,38 @@ pub(crate) struct Meshlet {
     pub _texcoords: Box<[[i16; 2]]>,
 }
 
-pub(crate) fn load_mesh(filename: impl AsRef<Path>) -> Option<(f32, Box<[Meshlet]>)> {
+#[derive(Debug)]
+pub(crate) struct Mesh {
+    pub scale: f32,
+    pub radius: f32,
+    pub lod_count: usize,
+    pub lods: [Box<[Meshlet]>; MAX_LODS],
+}
+
+pub(crate) fn load_mesh(filename: impl AsRef<Path>) -> Option<Mesh> {
+    let filename = filename.as_ref();
     let model = {
         use std::io::BufReader;
-        let data = std::fs::read(filename.as_ref()).ok()?;
+        let data = std::fs::read(filename).ok()?;
         let (models, _) =
             tobj::load_obj_buf(&mut BufReader::new(&data[..]), |_| Ok((Vec::new(), HashMap::new()))).unwrap();
         models.into_iter().next()?.mesh
     };
-    println!("Model details ({:?}):", filename.as_ref());
+    let lod_count = match filename.file_stem().and_then(|stem| stem.to_str()) {
+        Some("viking_room") => 1,
+        _ => MAX_LODS,
+    };
+    println!("Model details ({:?}):", filename);
     println!("  Indices: {}", model.indices.len());
     println!("  Positions: {}", model.positions.len());
     println!("  Normals: {}", model.normals.len());
+    println!("  LODs: {}", lod_count);
 
     // Calculate bounds.
     let scale =
         model.positions.iter().tuples().fold(0f32, |scale, (x, y, z)| scale.max(x.abs()).max(y.abs()).max(z.abs()));
 
+    #[derive(Clone, Copy, Default)]
     struct Vertex {
         position: Vec3,
         normal: Vec3,
@@ -46,7 +63,7 @@ pub(crate) fn load_mesh(filename: impl AsRef<Path>) -> Option<(f32, Box<[Meshlet
         }
     }
 
-    let mut indices = model.indices;
+    let indices = model.indices;
     let positions: Vec<Vec3> = model.positions.chunks_exact(3).map(Vec3::from_slice).collect();
     let uvs: Vec<Vec2> = model.texcoords.chunks_exact(2).map(Vec2::from_slice).collect();
     let normals: Vec<Vec3> = if !model.normals.is_empty() {
@@ -71,7 +88,7 @@ pub(crate) fn load_mesh(filename: impl AsRef<Path>) -> Option<(f32, Box<[Meshlet
         normals
     };
 
-    let mut vertices: Box<[Vertex]> = (0..model.positions.len() / 3)
+    let vertices: Box<[Vertex]> = (0..model.positions.len() / 3)
         .map(|i| Vertex {
             position: positions[i],
             normal: normals[i],
@@ -80,55 +97,79 @@ pub(crate) fn load_mesh(filename: impl AsRef<Path>) -> Option<(f32, Box<[Meshlet
         })
         .collect();
 
-    // Optimize index count.
-    meshopt::optimize_vertex_cache_in_place(&mut indices, vertices.len());
+    let radius = positions.iter().fold(0f32, |acc, position| acc.max(position.length())) / scale;
+    let triangle_count = indices.len() / 3;
+    let mut lod_indices = indices;
+    let lods: [Box<[Meshlet]>; MAX_LODS] = std::array::from_fn(|lod| {
+        if lod >= lod_count {
+            return Vec::new().into_boxed_slice();
+        }
 
-    // Optimize overdraw.
-    meshopt::optimize_overdraw_in_place_decoder(&mut indices, &vertices, 1.05);
-
-    // Optimize vertex fetch.
-    meshopt::optimize_vertex_fetch_in_place(&mut indices, &mut vertices);
-
-    let adapter = meshopt::VertexDataAdapter {
-        reader: std::io::Cursor::new(unsafe {
-            std::slice::from_raw_parts(vertices.as_ptr() as *const u8, size_of::<Vertex>() * vertices.len())
-        }),
-        vertex_count: vertices.len(),
-        vertex_stride: size_of::<Vertex>(),
-        position_offset: 0,
-    };
-
-    let meshlets = meshopt::build_meshlets(&indices, &adapter, 64, 124, 0.5)
-        .iter()
-        .map(|meshlet| {
-            let bounds = meshopt::compute_meshlet_bounds_decoder(meshlet, &vertices);
-            Meshlet {
-                // Vertex positions are quantized in normalized mesh space, so bounds need
-                // to use the same normalization to stay consistent in shaders.
-                center: (Vec3::from_array(bounds.center) / scale).to_array(),
-                radius: bounds.radius / scale,
-                cone_apex: (Vec3::from_array(bounds.cone_apex) / scale).to_array(),
-                cone_axis: bounds.cone_axis,
-                cone_cutoff: bounds.cone_cutoff,
-                indices: meshlet.triangles.to_owned().into_boxed_slice(),
-                positions: meshlet
-                    .vertices
-                    .iter()
-                    .map(|&i| (vertices[i as usize].position / scale * 32767.).to_array().map(|e| e as i16))
-                    .collect(),
-                normals: meshlet
-                    .vertices
-                    .iter()
-                    .map(|&i| (vertices[i as usize].normal * 127.).to_array().map(|e| e as i8))
-                    .collect(),
-                _texcoords: meshlet
-                    .vertices
-                    .iter()
-                    .map(|&i| (vertices[i as usize].uv * 32767.).to_array().map(|e| e as i16))
-                    .collect(),
+        if lod > 0 {
+            let target_triangles = (triangle_count >> lod).max(1);
+            let target_index_count = target_triangles * 3;
+            let simplified = meshopt::simplify_decoder(
+                &lod_indices,
+                &vertices,
+                target_index_count,
+                1.0,
+                meshopt::SimplifyOptions::None,
+                None,
+            );
+            if simplified.len() >= 3 {
+                lod_indices = simplified;
             }
-        })
-        .collect();
+        }
 
-    Some((scale, meshlets))
+        let mut fetch_indices = lod_indices.clone();
+        // Reorder after simplification so LOD content stays stable.
+        meshopt::optimize_vertex_cache_in_place(&mut fetch_indices, vertices.len());
+        meshopt::optimize_overdraw_in_place_decoder(&mut fetch_indices, &vertices, 1.05);
+
+        let lod_vertices = meshopt::optimize_vertex_fetch(&mut fetch_indices, &vertices);
+
+        let adapter = meshopt::VertexDataAdapter {
+            reader: std::io::Cursor::new(unsafe {
+                std::slice::from_raw_parts(lod_vertices.as_ptr() as *const u8, size_of::<Vertex>() * lod_vertices.len())
+            }),
+            vertex_count: lod_vertices.len(),
+            vertex_stride: size_of::<Vertex>(),
+            position_offset: 0,
+        };
+
+        meshopt::build_meshlets(&fetch_indices, &adapter, 64, 124, 0.5)
+            .iter()
+            .map(|meshlet| {
+                let bounds = meshopt::compute_meshlet_bounds_decoder(meshlet, &lod_vertices);
+                Meshlet {
+                    // Vertex positions are quantized in normalized mesh space, so bounds need
+                    // to use the same normalization to stay consistent in shaders.
+                    center: (Vec3::from_array(bounds.center) / scale).to_array(),
+                    radius: bounds.radius / scale,
+                    cone_apex: (Vec3::from_array(bounds.cone_apex) / scale).to_array(),
+                    cone_axis: bounds.cone_axis,
+                    cone_cutoff: bounds.cone_cutoff,
+                    indices: meshlet.triangles.to_owned().into_boxed_slice(),
+                    positions: meshlet
+                        .vertices
+                        .iter()
+                        .map(|&i| (lod_vertices[i as usize].position / scale * 32767.).to_array().map(|e| e as i16))
+                        .collect(),
+                    normals: meshlet
+                        .vertices
+                        .iter()
+                        .map(|&i| (lod_vertices[i as usize].normal * 127.).to_array().map(|e| e as i8))
+                        .collect(),
+                    _texcoords: meshlet
+                        .vertices
+                        .iter()
+                        .map(|&i| (lod_vertices[i as usize].uv * 32767.).to_array().map(|e| e as i16))
+                        .collect(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice()
+    });
+
+    Some(Mesh { scale, radius, lod_count, lods })
 }

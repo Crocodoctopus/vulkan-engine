@@ -43,6 +43,22 @@ impl GpuFrustumPassingMeshletBuffer {
     }
 }
 
+#[derive(Clone, Debug, Default, encase::ShaderType)]
+pub(super) struct GpuActiveMeshletBuffer {
+    pub len: ArrayLength,
+    #[shader(align(4), size(runtime))]
+    pub meshlet_ids: Box<[u32]>,
+}
+
+impl GpuActiveMeshletBuffer {
+    pub const LEN_OFFSET: u64 = <Self as encase::ShaderType>::METADATA.offset(0);
+    pub const DATA_OFFSET: u64 = <Self as encase::ShaderType>::METADATA.offset(1);
+
+    pub fn byte_size(len: u32) -> u64 {
+        Self::DATA_OFFSET + len as u64 * std::mem::size_of::<u32>() as u64
+    }
+}
+
 #[derive(Copy, Clone, Debug)]
 #[repr(C)]
 pub(super) struct GpuFrameGlobal {
@@ -60,6 +76,7 @@ pub(super) struct GpuFrameGlobal {
     pub frustum: Vec4,
     pub screen_info: Vec4,
 
+    pub active_meshlet_buffer: vk::DeviceAddress,
     pub meshlet_visibility_buffer: vk::DeviceAddress,
     pub meshlet_buffer: vk::DeviceAddress,
     pub draw_cmd_buffer: vk::DeviceAddress,
@@ -76,7 +93,7 @@ pub(super) struct GpuObjectInstance {
     pub position: Vec3,
     pub scale: f32,
     pub orientation: Quat,
-    pub vertex_buffer: vk::DeviceAddress,
+    pub vertex_buffer: [vk::DeviceAddress; 8],
     pub texture_id: u32,
 }
 

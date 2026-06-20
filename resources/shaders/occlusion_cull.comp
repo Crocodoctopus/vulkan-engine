@@ -111,7 +111,10 @@ void main() {
         return;
     }
 
-    uint meshlet_id = frame_global.frustum_passing_meshlet_buffer.meshlet_ids[candidate_id];
+    uint packed_meshlet = frame_global.frustum_passing_meshlet_buffer.meshlet_ids[candidate_id];
+    uint meshlet_id;
+    uint lod_id;
+    unpack_active_meshlet(packed_meshlet, meshlet_id, lod_id);
     MeshletInstance meshlet = frame_global.meshlet_buffer.data[meshlet_id];
     ObjectInstance object = frame_global.object_buffer.data[meshlet.object_id];
 
@@ -121,6 +124,6 @@ void main() {
 
     if (visible && !was_visible) {
         const uint draw_index = atomicAdd(frame_global.late_draw_cmd_buffer.len, 1);
-        frame_global.late_draw_cmd_buffer.data[draw_index] = make_draw_cmd(meshlet, meshlet_id, 0u);
+        frame_global.late_draw_cmd_buffer.data[draw_index] = make_draw_cmd(meshlet, meshlet_id, lod_id);
     }
 }

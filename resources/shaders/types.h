@@ -19,11 +19,16 @@ layout (buffer_reference, scalar) readonly buffer VertexBuffer {
     Vertex data[];
 };
 
+layout (buffer_reference, scalar) buffer ActiveMeshletBuffer {
+    uint len;
+    uint meshlet_ids[]; // Packed meshlet_id in the upper bits, LOD in the low 3 bits.
+};
+
 struct ObjectInstance {
     vec3 position;
     float scale;
     vec4 orientation;
-    VertexBuffer vertex_buffer;
+    VertexBuffer vertex_buffer[8];
     uint tex_id;
 };
 
@@ -57,7 +62,7 @@ layout (buffer_reference, scalar) buffer MeshletVisibilityBuffer {
 // Meshlets that pass frustum culling and still need occlusion testing.
 layout (buffer_reference, scalar) buffer FrustumPassingMeshletBuffer {
     uint len;
-    uint meshlet_ids[];
+    uint meshlet_ids[]; // Packed meshlet_id + LOD, same encoding as ActiveMeshletBuffer.
 };
 
 struct VkDrawIndexedIndirectCommand {
@@ -87,6 +92,7 @@ struct FrameGlobal {
     vec4 frustum;
     vec4 screen_info;
 
+    ActiveMeshletBuffer active_meshlet_buffer;
     MeshletVisibilityBuffer meshlet_visibility_buffer;
     MeshletInstanceBuffer meshlet_buffer;
     DrawCmdBuffer draw_cmd_buffer;
