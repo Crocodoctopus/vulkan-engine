@@ -1184,6 +1184,8 @@ impl Renderer {
         let overdraw_set = self.overdraw_sets[frame_index];
         let frame_global_buffer = &self.frame_global_buffers[frame_index];
         let overdraw_enabled = self.overdraw_enabled;
+        let hzb_base_width = self.core.surface_extent.width.div_ceil(2).max(1);
+        let hzb_base_height = self.core.surface_extent.height.div_ceil(2).max(1);
 
         // Visibility information.
         let visibility_buffer = &self.visibility_buffers[frame_count % VISIBILITY_BUFFER_COUNT];
@@ -1696,10 +1698,8 @@ impl Renderer {
 
                     self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.build_hzb_pipeline);
 
-                    let w =
-                        self.core.surface_extent.width.div_ceil(2).checked_shr(level).unwrap_or(0).max(1).div_ceil(8);
-                    let h =
-                        self.core.surface_extent.height.div_ceil(2).checked_shr(level).unwrap_or(0).max(1).div_ceil(8);
+                    let w = hzb_base_width.checked_shr(level).unwrap_or(0).max(1).div_ceil(8);
+                    let h = hzb_base_height.checked_shr(level).unwrap_or(0).max(1).div_ceil(8);
                     self.device.cmd_dispatch_base(cmd, 0, 0, level, w, h, 1);
 
                     // Keep each mip level coherent as the reduction chain walks down the pyramid.
@@ -2477,15 +2477,14 @@ impl Renderer {
                     .unwrap()
             });
 
-        // TODO: Eventually, we will want variable resolutions.
         let vk::Extent2D { width, height, .. } = self.core.surface_extent;
         if width > MAX_HZB_DIMENSION || height > MAX_HZB_DIMENSION {
             panic!("HZB/occlusion descriptor set only supports up to {MAX_HZB_DIMENSION}; got {width}x{height}");
         }
 
-        // Calculate hzb dimensions for later.
-        let hzb_width = width.div_ceil(2); // div2 for half resolution
-        let hzb_height = height.div_ceil(2); // ..
+        // Round the half-res base up to the next power of two so the mip chain is regular.
+        let hzb_width = width.div_ceil(2).max(1).next_power_of_two();
+        let hzb_height = height.div_ceil(2).max(1).next_power_of_two();
         let mipmaps = u32::max(hzb_width, hzb_height).ilog2() + 1;
 
         if mipmaps > MAX_HZB_MIPS {
@@ -2770,8 +2769,8 @@ impl Renderer {
                 tmp.push(
                     vk::ImageMemoryBarrier2::default()
                         .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
-                        .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                        .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                        .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+                        .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
                         .image(hzb_images[slot])
                         .subresource_range(
                             vk::ImageSubresourceRange::default()
@@ -2782,7 +2781,7 @@ impl Renderer {
                                 .layer_count(1),
                         )
                         .old_layout(vk::ImageLayout::UNDEFINED)
-                        .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+                        .new_layout(vk::ImageLayout::GENERAL),
                 );
             }
 
@@ -2836,6 +2835,46 @@ impl Renderer {
                 self.staging_cmd_buffer,
                 &vk::DependencyInfo::default().image_memory_barriers(&tmp),
             );
+
+            for slot in 0..SwapchainResources::HZB_SLOT_COUNT {
+                self.device.cmd_clear_color_image(
+                    self.staging_cmd_buffer,
+                    hzb_images[slot],
+                    vk::ImageLayout::GENERAL,
+                    &vk::ClearColorValue { float32: [0.0, 0.0, 0.0, 0.0] },
+                    &[vk::ImageSubresourceRange::default()
+                        .aspect_mask(vk::ImageAspectFlags::COLOR)
+                        .base_mip_level(0)
+                        .level_count(mipmaps)
+                        .base_array_layer(0)
+                        .layer_count(1)],
+                );
+            }
+
+            let tmp = Vec::from_iter((0..SwapchainResources::HZB_SLOT_COUNT).map(|slot| {
+                vk::ImageMemoryBarrier2::default()
+                    .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+                    .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                    .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
+                    .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
+                    .image(hzb_images[slot])
+                    .subresource_range(
+                        vk::ImageSubresourceRange::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .base_mip_level(0)
+                            .level_count(vk::REMAINING_MIP_LEVELS)
+                            .base_array_layer(0)
+                            .layer_count(1),
+                    )
+                    .old_layout(vk::ImageLayout::GENERAL)
+                    .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+            }));
+
+            self.device.cmd_pipeline_barrier2(
+                self.staging_cmd_buffer,
+                &vk::DependencyInfo::default().image_memory_barriers(&tmp),
+            );
+
             self.device.end_command_buffer(self.staging_cmd_buffer).unwrap();
 
             self.device

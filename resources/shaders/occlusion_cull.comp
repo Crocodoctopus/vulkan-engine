@@ -60,7 +60,8 @@ bool sphere_occluded(MeshletInstance meshlet, ObjectInstance object) {
     uv_min = clamp(uv_min, vec2(0.0), vec2(1.0));
     uv_max = clamp(uv_max, vec2(0.0), vec2(1.0));
 
-    ivec2 base_size = textureSize(hzb_views[1], 0);
+    // Query bounds should be expressed in actual screen coverage, not the padded HZB allocation.
+    ivec2 base_size = ivec2((frame_global.screen_info.xy + vec2(1.0)) * 0.5);
     vec2 base_size_f = vec2(base_size);
     ivec2 base_min = clamp(ivec2(floor(uv_min * base_size_f)), ivec2(0), base_size - ivec2(1));
     ivec2 base_max = clamp(ivec2(ceil (uv_max * base_size_f)) - ivec2(1), ivec2(0), base_size - ivec2(1));
