@@ -85,6 +85,7 @@ struct FrameGlobal {
     vec4 light_color;
 
     vec4 frustum;
+    vec4 screen_info;
 
     MeshletVisibilityBuffer meshlet_visibility_buffer;
     MeshletInstanceBuffer meshlet_buffer;

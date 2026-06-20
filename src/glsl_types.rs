@@ -58,6 +58,7 @@ pub(super) struct GpuFrameGlobal {
     pub light_color: Vec4,
 
     pub frustum: Vec4,
+    pub screen_info: Vec4,
 
     pub meshlet_visibility_buffer: vk::DeviceAddress,
     pub meshlet_buffer: vk::DeviceAddress,

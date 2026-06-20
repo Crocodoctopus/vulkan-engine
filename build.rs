@@ -8,6 +8,8 @@ fn main() {
     let shaders: &[&str] = &[
         "render.vert",
         "render.frag",
+        "overdraw.frag",
+        "overdraw_resolve.comp",
         "frustum_cull.comp",
         "build_hzb.comp",
         "occlusion_cull.comp",

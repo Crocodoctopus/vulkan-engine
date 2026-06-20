@@ -70,17 +70,29 @@ fn main() {
         -0.25 - ((8 - 1) as f32) * 0.5 * bunny_spacing,
         -4.0 - ((8 - 1) as f32) * 0.5 * bunny_spacing,
     );
+    // Deterministic per-instance jitter keeps the scene stable across runs while breaking up uniform silhouettes.
+    let next_unit = |seed: &mut u32| -> f32 {
+        *seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+        ((*seed >> 8) as f32) / (((u32::MAX >> 8) as f32).max(1.0))
+    };
     for z in 0..8 {
         for y in 0..8 {
             for x in 0..8 {
                 let position = bunny_offset
                     + Vec3::new(x as f32 * bunny_spacing, y as f32 * bunny_spacing, z as f32 * bunny_spacing);
+                let mut seed = (x as u32).wrapping_mul(73856093)
+                    ^ (y as u32).wrapping_mul(19349663)
+                    ^ (z as u32).wrapping_mul(83492791)
+                    ^ 0xB16B_00B5;
+                let yaw = next_unit(&mut seed) * std::f32::consts::TAU;
+                let pitch = (next_unit(&mut seed) - 0.5) * 0.35;
+                let roll = (next_unit(&mut seed) - 0.5) * 0.35;
                 let _ = renderer
                     .create_object(
                         bunny,
                         position,
                         bunny_scale,
-                        Quat::from_euler(EulerRot::XYZ, std::f32::consts::PI, 0.0, 0.0),
+                        Quat::from_euler(EulerRot::XYZ, std::f32::consts::PI + pitch, yaw, roll),
                     )
                     .unwrap();
             }
@@ -128,6 +140,10 @@ fn main() {
                         KeyCode::KeyA => &mut a_down,
                         KeyCode::KeyS => &mut s_down,
                         KeyCode::KeyD => &mut d_down,
+                        KeyCode::KeyO if state == ElementState::Pressed => {
+                            renderer.overdraw_enabled = !renderer.overdraw_enabled;
+                            return;
+                        }
                         KeyCode::KeyZ if state == ElementState::Pressed => {
                             renderer
                                 .create_object(

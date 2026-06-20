@@ -80,11 +80,13 @@ impl Core {
         let surface =
             ash_window::create_surface(&entry, &instance, raw_display_handle, raw_window_handle, None).unwrap();
 
-        let surface_format = surface_instance
-            .get_physical_device_surface_formats(physical_device, surface)
-            .unwrap()
-            .into_iter()
-            .next()
+        let surface_formats = surface_instance.get_physical_device_surface_formats(physical_device, surface).unwrap();
+        let surface_format = surface_formats
+            .iter()
+            .copied()
+            .find(|format| format.format == vk::Format::R8G8B8A8_UNORM)
+            .or_else(|| surface_formats.iter().copied().find(|format| format.format == vk::Format::B8G8R8A8_UNORM))
+            .or_else(|| surface_formats.first().copied())
             .unwrap();
         let surface_capabilities =
             surface_instance.get_physical_device_surface_capabilities(physical_device, surface).unwrap();
