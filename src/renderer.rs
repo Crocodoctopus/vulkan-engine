@@ -79,7 +79,6 @@ struct SwapchainResources {
     // cover the live visibility window.
     hzb_images: [vk::Image; MAX_HZB_IN_FLIGHT],
     hzb_allocs: [vk_mem::Allocation; MAX_HZB_IN_FLIGHT],
-    hzb_build_depth_views: [vk::ImageView; MAX_HZB_IN_FLIGHT],
     hzb_build_src_views: [Box<[vk::ImageView]>; MAX_HZB_IN_FLIGHT],
     hzb_build_dst_views: [Box<[vk::ImageView]>; MAX_HZB_IN_FLIGHT],
     hzb_sets: [vk::DescriptorSet; MAX_HZB_IN_FLIGHT],
@@ -106,7 +105,6 @@ impl SwapchainResources {
         let Self {
             hzb_images,
             mut hzb_allocs,
-            hzb_build_depth_views,
             hzb_build_src_views,
             hzb_build_dst_views,
             hzb_sets,
@@ -121,7 +119,6 @@ impl SwapchainResources {
         } = self;
 
         for slot in 0..Self::HZB_SLOT_COUNT {
-            device.destroy_image_view(hzb_build_depth_views[slot], None);
             for view in hzb_build_src_views[slot].iter().copied() {
                 device.destroy_image_view(view, None);
             }
@@ -2814,12 +2811,6 @@ impl Renderer {
                 .unwrap()
         });
 
-        debug_assert!(SwapchainResources::HZB_SLOT_COUNT <= MAX_FRAMES_IN_FLIGHT);
-        let hzb_build_depth_views = std::array::from_fn(|slot| {
-            debug_assert!(slot < depth_views.len());
-            depth_views[slot]
-        });
-
         // Write descriptors for each HZB scratch slot.
         for slot in 0..SwapchainResources::HZB_SLOT_COUNT {
             let hzb_src_infos: Box<_> = hzb_build_src_views[slot]
@@ -2840,7 +2831,7 @@ impl Renderer {
                 .collect();
 
             let depth_info = [vk::DescriptorImageInfo::default()
-                .image_view(hzb_build_depth_views[slot])
+                .image_view(depth_views[slot])
                 .sampler(self.hzb_sampler)
                 .image_layout(vk::ImageLayout::DEPTH_READ_ONLY_OPTIMAL)];
 
@@ -3020,7 +3011,6 @@ impl Renderer {
         self.swapchain_resources = Some(SwapchainResources {
             hzb_images,
             hzb_allocs,
-            hzb_build_depth_views,
             hzb_build_src_views,
             hzb_build_dst_views,
             hzb_sets,
