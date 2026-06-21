@@ -48,14 +48,14 @@ pub(crate) const DEPTH_2D_SUBRESOURCE_RANGE: vk::ImageSubresourceRange = vk::Ima
     layer_count: 1,
 };
 
-pub(crate) unsafe fn record_cmd_buffer(
+pub(crate) unsafe fn record_cmd_buffer<T>(
     device: &ash::Device,
     profiler: &PipelineProfiler,
     frame_index: usize,
     stage: crate::renderer::PipelineStage,
     cmd: vk::CommandBuffer,
-    f: impl FnOnce(vk::CommandBuffer),
-) {
+    f: impl FnOnce(vk::CommandBuffer) -> T,
+) -> T {
     device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).unwrap();
     device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
 
@@ -67,7 +67,7 @@ pub(crate) unsafe fn record_cmd_buffer(
         profiler.write_stage_start(device, cmd, frame_index, stage);
     }
 
-    f(cmd);
+    let result = f(cmd);
 
     if stage != crate::renderer::PipelineStage::FrameEnd {
         profiler.write_stage_end(device, cmd, frame_index, stage);
@@ -77,4 +77,5 @@ pub(crate) unsafe fn record_cmd_buffer(
     }
 
     device.end_command_buffer(cmd).unwrap();
+    result
 }

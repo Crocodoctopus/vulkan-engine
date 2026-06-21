@@ -100,8 +100,6 @@ struct FrameGlobal {
     ObjectInstanceBuffer object_buffer;
 
     FrustumPassingMeshletBuffer frustum_passing_meshlet_buffer;
-
-    uint instances;
 };
 
 #endif

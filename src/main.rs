@@ -110,6 +110,7 @@ fn main() {
     let mut a_down = false;
     let mut s_down = false;
     let mut d_down = false;
+    let mut bunny_count = 0;
     loop {
         // Input.
         let mut exit = false;
@@ -147,10 +148,12 @@ fn main() {
                             return;
                         }
                         KeyCode::KeyZ if state == ElementState::Pressed => {
+                            let i = bunny_count;
+                            bunny_count += 1;
                             renderer
                                 .create_object(
                                     bunny,
-                                    Vec3::new(0.0, 0.0, 0.0),
+                                    Vec3::new(1.0 + 0.55 * i as f32, 0.4, 0.0),
                                     bunny_scale,
                                     Quat::from_euler(EulerRot::XYZ, std::f32::consts::PI, 0.0, 0.0),
                                 )

@@ -164,6 +164,7 @@ struct SceneResources {
     active_meshlet_buffers: [Buffer<GpuActiveMeshletBuffer>; MAX_FRAMES_IN_FLIGHT],
     frustum_passing_meshlet_buffers: [Buffer<[u8]>; MAX_HZB_IN_FLIGHT],
     late_draw_cmd_buffers: [Buffer<GpuDrawCommandBuffer>; MAX_HZB_IN_FLIGHT],
+    maximum_meshlets: u32,
 
     /* TODO: These are static after creation */
     index_buffer: Buffer<[u32]>,
@@ -1147,6 +1148,7 @@ impl Renderer {
         let SceneResources {
             indirect_cmd_buffer,
             active_meshlet_buffers,
+            maximum_meshlets,
             index_buffer,
             object_instance_buffer,
             meshlet_instance_buffer,
@@ -1195,7 +1197,6 @@ impl Renderer {
         let overdraw_enabled = self.overdraw_enabled;
         let hzb_base_width = self.core.surface_extent.width.div_ceil(2).max(1);
         let hzb_base_height = self.core.surface_extent.height.div_ceil(2).max(1);
-        let mut active_meshlet_count = 0u32;
 
         // Visibility information.
         let visibility_buffer = &self.visibility_buffers[frame_count % VISIBILITY_BUFFER_COUNT];
@@ -1253,7 +1254,7 @@ impl Renderer {
             );
 
             // TODO: Make command buffers better.
-            record_cmd_buffer(
+            let active_meshlet_count = record_cmd_buffer(
                 &self.device,
                 &self.profiler,
                 frame_index,
@@ -1278,13 +1279,10 @@ impl Renderer {
                                     return 0;
                                 }
                                 let buffer = &vertex_buffers[lod];
-                                if buffer.is_null() {
-                                    0
-                                } else {
-                                    self.device.get_buffer_device_address(
-                                        &vk::BufferDeviceAddressInfo::default().buffer(buffer.vk_handle()),
-                                    )
-                                }
+                                assert!(!buffer.is_null());
+                                self.device.get_buffer_device_address(
+                                    &vk::BufferDeviceAddressInfo::default().buffer(buffer.vk_handle()),
+                                )
                             }),
                             texture_id: 0,
                         });
@@ -1319,7 +1317,9 @@ impl Renderer {
                         }
                     }
 
-                    active_meshlet_count = active_meshlet_ids.len() as u32;
+                    let active_meshlet_count = active_meshlet_ids.len() as u32;
+                    assert!(active_meshlet_count <= *maximum_meshlets);
+                    assert!(!active_meshlet_buffer.is_null());
 
                     // Upload global descriptor data & object data.
                     // Reverse-Z projection: near maps to 1.0, infinity tends toward 0.0.
@@ -1344,24 +1344,20 @@ impl Renderer {
 
                     self.staging_buffer.stage(&self.device, cmd, &object_instance_buffer, 0, object_data);
 
-                    if !active_meshlet_buffer.is_null() {
-                        self.device.cmd_fill_buffer(
-                            cmd,
-                            active_meshlet_buffer.vk_handle(),
-                            GpuActiveMeshletBuffer::LEN_OFFSET,
-                            std::mem::size_of::<u32>() as u64,
-                            active_meshlet_count,
-                        );
-                        self.staging_buffer.stage(
-                            &self.device,
-                            cmd,
-                            active_meshlet_buffer,
-                            GpuActiveMeshletBuffer::DATA_OFFSET,
-                            active_meshlet_ids,
-                        );
-                    } else {
-                        active_meshlet_count = 0;
-                    }
+                    self.device.cmd_fill_buffer(
+                        cmd,
+                        active_meshlet_buffer.vk_handle(),
+                        GpuActiveMeshletBuffer::LEN_OFFSET,
+                        std::mem::size_of::<u32>() as u64,
+                        active_meshlet_count,
+                    );
+                    self.staging_buffer.stage(
+                        &self.device,
+                        cmd,
+                        active_meshlet_buffer,
+                        GpuActiveMeshletBuffer::DATA_OFFSET,
+                        active_meshlet_ids,
+                    );
 
                     self.staging_buffer.stage(
                         &self.device,
@@ -1405,7 +1401,6 @@ impl Renderer {
                                 &vk::BufferDeviceAddressInfo::default()
                                     .buffer(frustum_passing_meshlet_buffer.vk_handle()),
                             ),
-                            instances: active_meshlet_count,
                         }],
                     );
 
@@ -1416,65 +1411,22 @@ impl Renderer {
                         std::mem::size_of::<u32>() as u64,
                         0,
                     );
-                    if !frustum_passing_meshlet_buffer.is_null() {
-                        self.device.cmd_fill_buffer(
-                            cmd,
-                            frustum_passing_meshlet_buffer.vk_handle(),
-                            GpuFrustumPassingMeshletBuffer::LEN_OFFSET,
-                            std::mem::size_of::<u32>() as u64,
-                            0,
-                        );
-                    }
-                    if !late_draw_cmd_buffer.is_null() {
-                        self.device.cmd_fill_buffer(
-                            cmd,
-                            late_draw_cmd_buffer.vk_handle(),
-                            GpuDrawCommandBuffer::LEN_OFFSET,
-                            std::mem::size_of::<u32>() as u64,
-                            0,
-                        );
-                    }
+                    self.device.cmd_fill_buffer(
+                        cmd,
+                        frustum_passing_meshlet_buffer.vk_handle(),
+                        GpuFrustumPassingMeshletBuffer::LEN_OFFSET,
+                        std::mem::size_of::<u32>() as u64,
+                        0,
+                    );
+                    self.device.cmd_fill_buffer(
+                        cmd,
+                        late_draw_cmd_buffer.vk_handle(),
+                        GpuDrawCommandBuffer::LEN_OFFSET,
+                        std::mem::size_of::<u32>() as u64,
+                        0,
+                    );
 
-                    let mut buffer_barriers = vec![
-                        vk::BufferMemoryBarrier2::default()
-                            .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
-                            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                            .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                            .dst_access_mask(
-                                vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE,
-                            )
-                            .buffer(indirect_cmd_buffer.vk_handle())
-                            .offset(0)
-                            .size(indirect_cmd_buffer.size() as u64),
-                    ];
-                    if !frustum_passing_meshlet_buffer.is_null() {
-                        buffer_barriers.push(
-                            vk::BufferMemoryBarrier2::default()
-                                .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
-                                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                                .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                                .dst_access_mask(
-                                    vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE,
-                                )
-                                .buffer(frustum_passing_meshlet_buffer.vk_handle())
-                                .offset(0)
-                                .size(frustum_passing_meshlet_buffer.size() as u64),
-                        );
-                    }
-                    if !late_draw_cmd_buffer.is_null() {
-                        buffer_barriers.push(
-                            vk::BufferMemoryBarrier2::default()
-                                .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
-                                .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                                .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                                .dst_access_mask(
-                                    vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE,
-                                )
-                                .buffer(late_draw_cmd_buffer.vk_handle())
-                                .offset(0)
-                                .size(late_draw_cmd_buffer.size() as u64),
-                        );
-                    }
+                    active_meshlet_count
                 },
             );
 
@@ -1485,60 +1437,6 @@ impl Renderer {
                 PipelineStage::FrustumCull,
                 frustum_cull,
                 |cmd| {
-                    // Copy visibility history into the current frame's buffer.
-                    let visibility_copy_size = visibility_buffer.size().min(last_visibility_buffer.size());
-                    if visibility_copy_size > 0 {
-                        self.device.cmd_copy_buffer(
-                            cmd,
-                            last_visibility_buffer.vk_handle(),
-                            visibility_buffer.vk_handle(),
-                            &[vk::BufferCopy::default().src_offset(0).dst_offset(0).size(visibility_copy_size as u64)],
-                        );
-                    }
-
-                    // TMP: start newly appended visibility entries as visible for testing.
-                    if visibility_copy_size < visibility_buffer.size() {
-                        self.device.cmd_fill_buffer(
-                            cmd,
-                            visibility_buffer.vk_handle(),
-                            visibility_copy_size as u64,
-                            (visibility_buffer.size() - visibility_copy_size) as u64,
-                            1,
-                        );
-                    }
-
-                    // Visibility history was filled/copy-updated on TRANSFER, so make it visible to the frustum cull
-                    // compute pass.
-                    self.device.cmd_pipeline_barrier2(
-                        cmd,
-                        &vk::DependencyInfo::default().buffer_memory_barriers(&[vk::BufferMemoryBarrier2::default()
-                            .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
-                            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                            .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                            .dst_access_mask(
-                                vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE,
-                            )
-                            .buffer(visibility_buffer.vk_handle())
-                            .offset(0)
-                            .size(visibility_buffer.size() as u64)]),
-                    );
-
-                    // The indirect buffer is also rewritten during upload and needs to be visible before compute reads
-                    // it.
-                    self.device.cmd_pipeline_barrier2(
-                        cmd,
-                        &vk::DependencyInfo::default().buffer_memory_barriers(&[vk::BufferMemoryBarrier2::default()
-                            .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
-                            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                            .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                            .dst_access_mask(
-                                vk::AccessFlags2::SHADER_STORAGE_READ | vk::AccessFlags2::SHADER_STORAGE_WRITE,
-                            )
-                            .buffer(indirect_cmd_buffer.vk_handle())
-                            .offset(0)
-                            .size(indirect_cmd_buffer.size() as u64)]),
-                    );
-
                     self.device.cmd_bind_descriptor_sets(
                         cmd,
                         vk::PipelineBindPoint::COMPUTE,
@@ -1550,9 +1448,7 @@ impl Renderer {
 
                     self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.frustum_cull_pipeline);
 
-                    if active_meshlet_count > 0 {
-                        self.device.cmd_dispatch(cmd, active_meshlet_count.div_ceil(64), 1, 1);
-                    }
+                    self.device.cmd_dispatch(cmd, active_meshlet_count.div_ceil(64), 1, 1);
                 },
             );
 
@@ -1662,7 +1558,7 @@ impl Renderer {
                     GpuDrawCommandBuffer::DATA_OFFSET,
                     indirect_cmd_buffer.vk_handle(),
                     GpuDrawCommandBuffer::LEN_OFFSET,
-                    meshlet_instance_buffer.len(),
+                    *maximum_meshlets,
                     size_of::<vk::DrawIndexedIndirectCommand>() as u32,
                 );
 
@@ -1858,7 +1754,7 @@ impl Renderer {
                     GpuDrawCommandBuffer::DATA_OFFSET,
                     late_draw_cmd_buffer.vk_handle(),
                     GpuDrawCommandBuffer::LEN_OFFSET,
-                    meshlet_instance_buffer.len(),
+                    *maximum_meshlets,
                     size_of::<vk::DrawIndexedIndirectCommand>() as u32,
                 );
 
@@ -1876,20 +1772,6 @@ impl Renderer {
                             .dst_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
                             .old_layout(vk::ImageLayout::PRESENT_SRC_KHR)
                             .new_layout(vk::ImageLayout::GENERAL)]),
-                    );
-
-                    // The resolve pass reads the accumulated counts after the fragment shader atomics finish.
-                    self.device.cmd_pipeline_barrier2(
-                        cmd,
-                        &vk::DependencyInfo::default().image_memory_barriers(&[vk::ImageMemoryBarrier2::default()
-                            .src_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                            .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
-                            .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
-                            .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                            .image(overdraw_image.vk_handle())
-                            .subresource_range(COLOR_2D_SUBRESOURCE_RANGE)
-                            .old_layout(vk::ImageLayout::GENERAL)
-                            .new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)]),
                     );
 
                     self.device.cmd_bind_descriptor_sets(
@@ -2126,9 +2008,10 @@ impl Renderer {
             self.vertex_buffers.insert(
                 *id,
                 std::array::from_fn(|lod| {
-                    if vertices[lod].is_empty() {
+                    if lod >= self.meshes.get(id).unwrap().lod_count {
                         return Buffer::null();
                     }
+                    assert!(!vertices[lod].is_empty());
                     Buffer::<[GpuVertex]>::new(
                         &self.allocator,
                         vertices[lod].len() as u32,
@@ -2206,6 +2089,15 @@ impl Renderer {
             }
         }
 
+        let maximum_meshlets = self
+            .objects
+            .iter()
+            .map(|(_, object)| {
+                let mesh = self.meshes.get(&object.mesh).unwrap();
+                mesh.lods[..mesh.lod_count].iter().map(|lod| lod.len() as u32).max().unwrap_or(0)
+            })
+            .sum::<u32>();
+
         // Print some information about the scene.
         // TODO: Move this to the end?
         let object_count = self.objects.len();
@@ -2259,7 +2151,7 @@ impl Renderer {
 
         let indirect_cmd_buffer = Buffer::<GpuDrawCommandBuffer>::new_sized(
             &self.allocator,
-            GpuDrawCommandBuffer::byte_size(instances),
+            GpuDrawCommandBuffer::byte_size(maximum_meshlets.max(1)),
             vk::BufferUsageFlags::STORAGE_BUFFER
                 | vk::BufferUsageFlags::INDIRECT_BUFFER
                 | vk::BufferUsageFlags::TRANSFER_DST
@@ -2268,69 +2160,53 @@ impl Renderer {
         );
 
         let active_meshlet_buffers = std::array::from_fn(|_| {
-            if instances > 0 {
-                Buffer::<GpuActiveMeshletBuffer>::new_sized(
-                    &self.allocator,
-                    GpuActiveMeshletBuffer::byte_size(instances),
-                    vk::BufferUsageFlags::STORAGE_BUFFER
-                        | vk::BufferUsageFlags::TRANSFER_DST
-                        | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-                    vk_mem::MemoryUsage::AutoPreferDevice,
-                )
-            } else {
-                Buffer::null()
-            }
+            Buffer::<GpuActiveMeshletBuffer>::new_sized(
+                &self.allocator,
+                GpuActiveMeshletBuffer::byte_size(maximum_meshlets.max(1)),
+                vk::BufferUsageFlags::STORAGE_BUFFER
+                    | vk::BufferUsageFlags::TRANSFER_DST
+                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                vk_mem::MemoryUsage::AutoPreferDevice,
+            )
         });
 
         let frustum_passing_meshlet_buffers = std::array::from_fn(|_| {
-            if instances > 0 {
-                Buffer::<[u8]>::new(
-                    &self.allocator,
-                    GpuFrustumPassingMeshletBuffer::byte_size(instances) as u32,
-                    vk::BufferUsageFlags::STORAGE_BUFFER
-                        | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
-                        | vk::BufferUsageFlags::TRANSFER_DST,
-                    vk_mem::MemoryUsage::AutoPreferDevice,
-                )
-            } else {
-                Buffer::null()
-            }
+            Buffer::<[u8]>::new(
+                &self.allocator,
+                GpuFrustumPassingMeshletBuffer::byte_size(maximum_meshlets.max(1)) as u32,
+                vk::BufferUsageFlags::STORAGE_BUFFER
+                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+                    | vk::BufferUsageFlags::TRANSFER_DST,
+                vk_mem::MemoryUsage::AutoPreferDevice,
+            )
         });
 
         let late_draw_cmd_buffers = std::array::from_fn(|_| {
-            if instances > 0 {
-                Buffer::<GpuDrawCommandBuffer>::new_sized(
-                    &self.allocator,
-                    GpuDrawCommandBuffer::byte_size(instances),
-                    vk::BufferUsageFlags::STORAGE_BUFFER
-                        | vk::BufferUsageFlags::INDIRECT_BUFFER
-                        | vk::BufferUsageFlags::TRANSFER_DST
-                        | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-                    vk_mem::MemoryUsage::AutoPreferDevice,
-                )
-            } else {
-                Buffer::null()
-            }
+            Buffer::<GpuDrawCommandBuffer>::new_sized(
+                &self.allocator,
+                GpuDrawCommandBuffer::byte_size(maximum_meshlets.max(1)),
+                vk::BufferUsageFlags::STORAGE_BUFFER
+                    | vk::BufferUsageFlags::INDIRECT_BUFFER
+                    | vk::BufferUsageFlags::TRANSFER_DST
+                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                vk_mem::MemoryUsage::AutoPreferDevice,
+            )
         });
 
         let visibility_stride = std::mem::size_of::<u32>() as u64;
         let old_visibility_buffers =
             std::mem::replace(&mut self.visibility_buffers, std::array::from_fn(|_| Buffer::null()));
-        let mut new_visibility_buffers = std::array::from_fn(|_| Buffer::null());
+        let new_visibility_buffers = std::array::from_fn(|_| Buffer::<[u32]>::new(
+            &self.allocator,
+            instances.max(1),
+            vk::BufferUsageFlags::STORAGE_BUFFER
+                | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+                | vk::BufferUsageFlags::TRANSFER_SRC
+                | vk::BufferUsageFlags::TRANSFER_DST,
+            vk_mem::MemoryUsage::AutoPreferDevice,
+        ));
         for slot in 0..VISIBILITY_BUFFER_COUNT {
-            new_visibility_buffers[slot] = if instances > 0 {
-                Buffer::<[u32]>::new(
-                    &self.allocator,
-                    instances,
-                    vk::BufferUsageFlags::STORAGE_BUFFER
-                        | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
-                        | vk::BufferUsageFlags::TRANSFER_SRC
-                        | vk::BufferUsageFlags::TRANSFER_DST,
-                    vk_mem::MemoryUsage::AutoPreferDevice,
-                )
-            } else {
-                Buffer::null()
-            };
+            debug_assert!(!new_visibility_buffers[slot].is_null());
         }
 
         self.device.wait_for_fences(&[self.staging_fence], true, u64::MAX).unwrap();
@@ -2360,10 +2236,6 @@ impl Renderer {
         self.staging_buffer.stage(&self.device, self.staging_cmd_buffer, &meshlet_instance_buffer, 0, meshlet_data);
         for slot in 0..VISIBILITY_BUFFER_COUNT {
             let new_buffer = &new_visibility_buffers[slot];
-            if new_buffer.is_null() {
-                continue;
-            }
-
             self.device.cmd_fill_buffer(
                 self.staging_cmd_buffer,
                 new_buffer.vk_handle(),
@@ -2432,6 +2304,7 @@ impl Renderer {
             active_meshlet_buffers,
             frustum_passing_meshlet_buffers,
             late_draw_cmd_buffers,
+            maximum_meshlets,
         });
     }
 

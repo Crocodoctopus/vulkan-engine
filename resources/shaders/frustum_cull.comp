@@ -17,7 +17,7 @@ void main() {
     uint active_meshlet_id = gl_GlobalInvocationID.x;
 
     // Filter invalid invocation ids.
-    if (active_meshlet_id >= frame_global.instances) return;
+    if (active_meshlet_id >= frame_global.active_meshlet_buffer.len) return;
 
     uint packed_meshlet = frame_global.active_meshlet_buffer.meshlet_ids[active_meshlet_id];
     uint meshlet_id;

@@ -83,8 +83,6 @@ pub(super) struct GpuFrameGlobal {
     pub late_draw_cmd_buffer: vk::DeviceAddress,
     pub object_buffer: vk::DeviceAddress,
     pub frustum_passing_meshlet_buffer: vk::DeviceAddress,
-
-    pub instances: u32,
 }
 
 #[derive(Clone, Debug)]

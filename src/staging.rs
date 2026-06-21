@@ -56,6 +56,9 @@ impl StagingBuffer {
         T: Clone,
     {
         let data = data.as_ref();
+        if data.is_empty() {
+            return;
+        }
 
         let alignment = std::mem::align_of::<T>();
         self.head = (((self.head as usize + alignment - 1) / alignment) * alignment) as *mut u8;
@@ -89,6 +92,10 @@ impl StagingBuffer {
         offset: u64,
         bytes: &[u8],
     ) {
+        if bytes.is_empty() {
+            return;
+        }
+
         let alignment = 4usize;
         self.head = (((self.head as usize + alignment - 1) / alignment) * alignment) as *mut u8;
 
