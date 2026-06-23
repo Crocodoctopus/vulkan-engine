@@ -80,7 +80,6 @@ pub(super) struct GpuFrameGlobal {
     pub meshlet_visibility_buffer: vk::DeviceAddress,
     pub meshlet_buffer: vk::DeviceAddress,
     pub draw_cmd_buffer: vk::DeviceAddress,
-    pub late_draw_cmd_buffer: vk::DeviceAddress,
     pub object_buffer: vk::DeviceAddress,
     pub frustum_passing_meshlet_buffer: vk::DeviceAddress,
 }

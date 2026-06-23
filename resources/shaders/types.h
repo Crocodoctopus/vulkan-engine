@@ -96,7 +96,6 @@ struct FrameGlobal {
     MeshletVisibilityBuffer meshlet_visibility_buffer;
     MeshletInstanceBuffer meshlet_buffer;
     DrawCmdBuffer draw_cmd_buffer;
-    DrawCmdBuffer late_draw_cmd_buffer;
     ObjectInstanceBuffer object_buffer;
 
     FrustumPassingMeshletBuffer frustum_passing_meshlet_buffer;

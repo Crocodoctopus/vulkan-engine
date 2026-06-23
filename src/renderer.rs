@@ -163,7 +163,6 @@ struct SceneResources {
     indirect_cmd_buffer: Buffer<GpuDrawCommandBuffer>,
     active_meshlet_buffers: [Buffer<GpuActiveMeshletBuffer>; MAX_FRAMES_IN_FLIGHT],
     frustum_passing_meshlet_buffers: [Buffer<[u8]>; MAX_HZB_IN_FLIGHT],
-    late_draw_cmd_buffers: [Buffer<GpuDrawCommandBuffer>; MAX_HZB_IN_FLIGHT],
     maximum_meshlets: u32,
 
     /* TODO: These are static after creation */
@@ -178,9 +177,6 @@ impl SceneResources {
             buffer.destroy(&allocator);
         }
         for buffer in self.frustum_passing_meshlet_buffers {
-            buffer.destroy(&allocator);
-        }
-        for buffer in self.late_draw_cmd_buffers {
             buffer.destroy(&allocator);
         }
         self.index_buffer.destroy(&allocator);
@@ -1153,7 +1149,6 @@ impl Renderer {
             object_instance_buffer,
             meshlet_instance_buffer,
             frustum_passing_meshlet_buffers,
-            late_draw_cmd_buffers,
             ..
         } = self.scene_resources.last_mut().unwrap();
 
@@ -1178,7 +1173,6 @@ impl Renderer {
         let hzb_build_src_views = &hzb_build_src_views[hzb_slot];
         let active_meshlet_buffer = &active_meshlet_buffers[frame_index];
         let frustum_passing_meshlet_buffer = &frustum_passing_meshlet_buffers[hzb_slot];
-        let late_draw_cmd_buffer = &late_draw_cmd_buffers[hzb_slot];
 
         // Command buffer associated with this frame.
         let data_upload = cmd_buffers[frame_index][PipelineStage::DataUpload as usize];
@@ -1200,7 +1194,7 @@ impl Renderer {
 
         // Visibility information.
         let visibility_buffer = &self.visibility_buffers[frame_count % VISIBILITY_BUFFER_COUNT];
-        let last_visibility_buffer =
+        let _last_visibility_buffer =
             &self.visibility_buffers[(frame_count - VISIBILITY_DEPTH) % VISIBILITY_BUFFER_COUNT];
 
         unsafe {
@@ -1391,9 +1385,6 @@ impl Renderer {
                             draw_cmd_buffer: self.device.get_buffer_device_address(
                                 &vk::BufferDeviceAddressInfo::default().buffer(indirect_cmd_buffer.vk_handle()),
                             ),
-                            late_draw_cmd_buffer: self.device.get_buffer_device_address(
-                                &vk::BufferDeviceAddressInfo::default().buffer(late_draw_cmd_buffer.vk_handle()),
-                            ),
                             object_buffer: self.device.get_buffer_device_address(
                                 &vk::BufferDeviceAddressInfo::default().buffer(object_instance_buffer.vk_handle()),
                             ),
@@ -1418,14 +1409,6 @@ impl Renderer {
                         std::mem::size_of::<u32>() as u64,
                         0,
                     );
-                    self.device.cmd_fill_buffer(
-                        cmd,
-                        late_draw_cmd_buffer.vk_handle(),
-                        GpuDrawCommandBuffer::LEN_OFFSET,
-                        std::mem::size_of::<u32>() as u64,
-                        0,
-                    );
-
                     active_meshlet_count
                 },
             );
@@ -1680,6 +1663,15 @@ impl Renderer {
                 PipelineStage::OcclusionCull,
                 occlusion_cull,
                 |cmd| {
+                    // Reuse the indirect buffer for the late list only after early draw has consumed it.
+                    self.device.cmd_fill_buffer(
+                        cmd,
+                        indirect_cmd_buffer.vk_handle(),
+                        GpuDrawCommandBuffer::LEN_OFFSET,
+                        std::mem::size_of::<u32>() as u64,
+                        0,
+                    );
+
                     self.device.cmd_bind_descriptor_sets(
                         cmd,
                         vk::PipelineBindPoint::COMPUTE,
@@ -1750,9 +1742,9 @@ impl Renderer {
 
                 self.device.cmd_draw_indexed_indirect_count(
                     cmd,
-                    late_draw_cmd_buffer.vk_handle(),
+                    indirect_cmd_buffer.vk_handle(),
                     GpuDrawCommandBuffer::DATA_OFFSET,
-                    late_draw_cmd_buffer.vk_handle(),
+                    indirect_cmd_buffer.vk_handle(),
                     GpuDrawCommandBuffer::LEN_OFFSET,
                     *maximum_meshlets,
                     size_of::<vk::DrawIndexedIndirectCommand>() as u32,
@@ -2181,18 +2173,6 @@ impl Renderer {
             )
         });
 
-        let late_draw_cmd_buffers = std::array::from_fn(|_| {
-            Buffer::<GpuDrawCommandBuffer>::new_sized(
-                &self.allocator,
-                GpuDrawCommandBuffer::byte_size(maximum_meshlets.max(1)),
-                vk::BufferUsageFlags::STORAGE_BUFFER
-                    | vk::BufferUsageFlags::INDIRECT_BUFFER
-                    | vk::BufferUsageFlags::TRANSFER_DST
-                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-                vk_mem::MemoryUsage::AutoPreferDevice,
-            )
-        });
-
         let visibility_stride = std::mem::size_of::<u32>() as u64;
         let old_visibility_buffers =
             std::mem::replace(&mut self.visibility_buffers, std::array::from_fn(|_| Buffer::null()));
@@ -2303,7 +2283,6 @@ impl Renderer {
             indirect_cmd_buffer,
             active_meshlet_buffers,
             frustum_passing_meshlet_buffers,
-            late_draw_cmd_buffers,
             maximum_meshlets,
         });
     }

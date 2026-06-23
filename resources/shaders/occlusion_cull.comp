@@ -123,7 +123,7 @@ void main() {
     frame_global.meshlet_visibility_buffer.data[meshlet_id] = visible;
 
     if (visible && !was_visible) {
-        const uint draw_index = atomicAdd(frame_global.late_draw_cmd_buffer.len, 1);
-        frame_global.late_draw_cmd_buffer.data[draw_index] = make_draw_cmd(meshlet, meshlet_id, lod_id);
+        const uint draw_index = atomicAdd(frame_global.draw_cmd_buffer.len, 1);
+        frame_global.draw_cmd_buffer.data[draw_index] = make_draw_cmd(meshlet, meshlet_id, lod_id);
     }
 }
