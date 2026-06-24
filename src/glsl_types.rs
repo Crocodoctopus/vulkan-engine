@@ -1,8 +1,11 @@
 use ash::vk;
-use encase::ArrayLength;
 use glam::*;
+use std::mem::offset_of;
 
-#[derive(Clone, Copy, Debug, Default, encase::ShaderType)]
+use crate::buffer::Trailing;
+
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
 pub(super) struct GpuDrawIndexedIndirectCommand {
     pub index_count: u32,
     pub instance_count: u32,
@@ -11,56 +14,65 @@ pub(super) struct GpuDrawIndexedIndirectCommand {
     pub first_instance: u32,
 }
 
-#[derive(Clone, Debug, Default, encase::ShaderType)]
-pub(super) struct GpuDrawCommandBuffer {
-    pub len: ArrayLength,
-    #[shader(align(4), size(runtime))]
-    pub data: Box<[GpuDrawIndexedIndirectCommand]>,
-}
-
-impl GpuDrawCommandBuffer {
-    pub const LEN_OFFSET: u64 = <Self as encase::ShaderType>::METADATA.offset(0);
-    pub const DATA_OFFSET: u64 = <Self as encase::ShaderType>::METADATA.offset(1);
-
-    pub fn byte_size(len: u32) -> u64 {
-        Self::DATA_OFFSET + len as u64 * std::mem::size_of::<GpuDrawIndexedIndirectCommand>() as u64
-    }
-}
-
-#[derive(Clone, Debug, Default, encase::ShaderType)]
-pub(super) struct GpuFrustumPassingMeshletBuffer {
-    pub len: ArrayLength,
-    #[shader(align(4), size(runtime))]
-    pub meshlet_ids: Box<[u32]>,
-}
-
-impl GpuFrustumPassingMeshletBuffer {
-    pub const LEN_OFFSET: u64 = <Self as encase::ShaderType>::METADATA.offset(0);
-    pub const DATA_OFFSET: u64 = <Self as encase::ShaderType>::METADATA.offset(1);
-
-    pub fn byte_size(len: u32) -> u64 {
-        Self::DATA_OFFSET + len as u64 * std::mem::size_of::<u32>() as u64
-    }
-}
-
-#[derive(Clone, Debug, Default, encase::ShaderType)]
-pub(super) struct GpuActiveMeshletBuffer {
-    pub len: ArrayLength,
-    #[shader(align(4), size(runtime))]
-    pub meshlet_ids: Box<[u32]>,
-}
-
-impl GpuActiveMeshletBuffer {
-    pub const LEN_OFFSET: u64 = <Self as encase::ShaderType>::METADATA.offset(0);
-    pub const DATA_OFFSET: u64 = <Self as encase::ShaderType>::METADATA.offset(1);
-
-    pub fn byte_size(len: u32) -> u64 {
-        Self::DATA_OFFSET + len as u64 * std::mem::size_of::<u32>() as u64
-    }
-}
-
-#[derive(Copy, Clone, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
+pub(super) struct GpuDrawCommandBuffer {
+    pub len: u32,
+    pub data: [GpuDrawIndexedIndirectCommand; 0],
+}
+
+impl Trailing for GpuDrawCommandBuffer {
+    type Tail = GpuDrawIndexedIndirectCommand;
+
+    fn tail_offset() -> u64 {
+        offset_of!(Self, data) as u64
+    }
+
+    fn byte_size(len: u32) -> u64 {
+        Self::tail_offset() + len as u64 * std::mem::size_of::<Self::Tail>() as u64
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+pub(super) struct GpuFrustumPassingMeshletBuffer {
+    pub len: u32,
+    pub data: [u32; 0],
+}
+
+impl Trailing for GpuFrustumPassingMeshletBuffer {
+    type Tail = u32;
+
+    fn tail_offset() -> u64 {
+        offset_of!(Self, data) as u64
+    }
+
+    fn byte_size(len: u32) -> u64 {
+        Self::tail_offset() + len as u64 * std::mem::size_of::<Self::Tail>() as u64
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C)]
+pub(super) struct GpuActiveMeshletBuffer {
+    pub len: u32,
+    pub data: [u32; 0],
+}
+
+impl Trailing for GpuActiveMeshletBuffer {
+    type Tail = u32;
+
+    fn tail_offset() -> u64 {
+        offset_of!(Self, data) as u64
+    }
+
+    fn byte_size(len: u32) -> u64 {
+        Self::tail_offset() + len as u64 * std::mem::size_of::<Self::Tail>() as u64
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C, align(16))]
 pub(super) struct GpuFrameGlobal {
     // Matrices.
     pub pv: Mat4,
@@ -84,8 +96,8 @@ pub(super) struct GpuFrameGlobal {
     pub frustum_passing_meshlet_buffer: vk::DeviceAddress,
 }
 
-#[derive(Clone, Debug)]
-#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+#[repr(C, align(16))]
 pub(super) struct GpuObjectInstance {
     pub position: Vec3,
     pub scale: f32,
@@ -94,7 +106,7 @@ pub(super) struct GpuObjectInstance {
     pub texture_id: u32,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 #[repr(C, align(16))]
 pub(super) struct GpuMeshletInstance {
     // Culling.
@@ -111,7 +123,7 @@ pub(super) struct GpuMeshletInstance {
     pub first_index: u32,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
 pub(super) struct GpuVertex {
     pub position: [i16; 3],

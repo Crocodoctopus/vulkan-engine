@@ -4,7 +4,7 @@ use crate::glsl_types::*;
 use crate::image::{Image2D, ImageView2D};
 use crate::mesh::{MAX_LODS, Mesh, load_mesh};
 use crate::profiling::PipelineProfiler;
-use crate::staging::StagingBuffer;
+use crate::staging::{Partial, StagingBuffer, Whole};
 use crate::swapchain::Swapchain;
 use crate::util::{const_max, const_min, format_bytes, format_usize_commas};
 use crate::vk_helpers::*;
@@ -28,6 +28,18 @@ pub(super) struct Object {
     pub scale: f32,
     pub orientation: Quat,
 }
+
+#[allow(unused)]
+const B: u64 = 1;
+#[allow(non_upper_case_globals, unused)]
+const KiB: u64 = 1024 * B;
+#[allow(non_upper_case_globals, unused)]
+const MiB: u64 = 1024 * KiB;
+#[allow(non_upper_case_globals, unused)]
+const GiB: u64 = 1024 * MiB;
+
+const STAGING_ARENA_SIZE: u64 = 256 * MiB;
+const STAGING_FIF_BLOCK_SIZE: u64 = 32 * MiB;
 
 pub(crate) const MAX_FRAMES_IN_FLIGHT: usize = 2;
 const VISIBILITY_DEPTH: usize = 2;
@@ -162,7 +174,7 @@ impl SwapchainResources {
 struct SceneResources {
     indirect_cmd_buffer: Buffer<GpuDrawCommandBuffer>,
     active_meshlet_buffers: [Buffer<GpuActiveMeshletBuffer>; MAX_FRAMES_IN_FLIGHT],
-    frustum_passing_meshlet_buffers: [Buffer<[u8]>; MAX_HZB_IN_FLIGHT],
+    frustum_passing_meshlet_buffers: [Buffer<GpuFrustumPassingMeshletBuffer>; MAX_HZB_IN_FLIGHT],
     maximum_meshlets: u32,
 
     /* TODO: These are static after creation */
@@ -209,7 +221,7 @@ pub struct Renderer {
     _global_set_layout: vk::DescriptorSetLayout,
     hzb_set_layout: vk::DescriptorSetLayout,
     _frame_set_layout: vk::DescriptorSetLayout,
-    overdraw_set_layout: vk::DescriptorSetLayout,
+    _overdraw_set_layout: vk::DescriptorSetLayout,
 
     /* Pipelines: */
     frustum_cull_pipeline_layout: vk::PipelineLayout,
@@ -235,20 +247,32 @@ pub struct Renderer {
     visibility_index_cache: HashMap<ObjectHandle, u32>,
 
     /* Staging: */
-    staging_buffer: StagingBuffer,
+    staging_vk_buffer: vk::Buffer,
+    _staging_allocation: vk_mem::Allocation,
+    staging_base: *mut u8,
+    staging_block: vk_mem::VirtualBlock,
+    // TODO: For rebuilds, needs more permanent solution
     staging_cmd_buffer: vk::CommandBuffer,
-    staging_fence: vk::Fence,
+
+    /* Lone sampler: */
+    hzb_sampler: vk::Sampler,
 
     /* Scene: */
     // Bindless set of all image views.
     global_descriptor_pool: vk::DescriptorPool,
     _descriptor_pools: [vk::DescriptorPool; MAX_FRAMES_IN_FLIGHT],
-    overdraw_descriptor_pools: [vk::DescriptorPool; MAX_FRAMES_IN_FLIGHT],
+    _overdraw_descriptor_pools: [vk::DescriptorPool; MAX_FRAMES_IN_FLIGHT],
 
-    hzb_sampler: vk::Sampler,
+    // Reusable FIF staging buffers.
+    staging_buffers: [StagingBuffer; MAX_FRAMES_IN_FLIGHT],
+
+    // Global & per FIF desciptor sets.
     global_set: vk::DescriptorSet,
+    // (frame_sets and overdraw_sets are arrays of samplers)
     frame_sets: [vk::DescriptorSet; MAX_FRAMES_IN_FLIGHT],
     overdraw_sets: [vk::DescriptorSet; MAX_FRAMES_IN_FLIGHT],
+
+    // Global buffer.
     frame_global_buffers: [Buffer<GpuFrameGlobal>; MAX_FRAMES_IN_FLIGHT],
 
     // Used for sequencing stages, and other cross-frame syncing.
@@ -257,13 +281,14 @@ pub struct Renderer {
     // Visibility is shared across frames; replaced buffers retire once no
     // submitted frustum/occlusion pass can reference them.
     visibility_buffers: [Buffer<[u32]>; VISIBILITY_BUFFER_COUNT],
+    // TODO: Fold this (and visibility_buffers) into scene_resources.
     visibility_buffer_retire_list: Vec<(u64, Buffer<[u32]>)>,
 
     // Dirty flags for resource regeneration.
     swapchain_resources_dirty: bool,
     scene_resources_dirty: bool,
 
-    // When rendering a FIF
+    // When rendering a FIF.
     swapchain_resources: Option<SwapchainResources>,
     scene_resources: Vec<SceneResources>,
 
@@ -830,7 +855,33 @@ impl Renderer {
                 .unwrap();
 
             // Staging data.
-            let staging_buffer = StagingBuffer::new(1024 * 1024 * 1024, &allocator);
+            use vk_mem::Alloc;
+
+            let (staging_buffer, mut staging_allocation) = allocator
+                .create_buffer(
+                    &vk::BufferCreateInfo::default()
+                        .size(STAGING_ARENA_SIZE)
+                        .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+                        .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                    &vk_mem::AllocationCreateInfo {
+                        flags: vk_mem::AllocationCreateFlags::MAPPED
+                            | vk_mem::AllocationCreateFlags::HOST_ACCESS_SEQUENTIAL_WRITE,
+                        usage: vk_mem::MemoryUsage::AutoPreferHost,
+                        required_flags: vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let staging_base = allocator.map_memory(&mut staging_allocation).unwrap();
+            let mut staging_block = vk_mem::VirtualBlock::new(vk_mem::VirtualBlockCreateInfo {
+                size: STAGING_ARENA_SIZE,
+                flags: Default::default(),
+                allocation_callbacks: None,
+            })
+            .unwrap();
+            let staging_buffers = std::array::from_fn(|_| {
+                StagingBuffer::new(&mut staging_block, staging_buffer, staging_base, STAGING_FIF_BLOCK_SIZE)
+            });
 
             let staging_cmd_buffer = device
                 .allocate_command_buffers(
@@ -840,10 +891,6 @@ impl Renderer {
                         .command_buffer_count(1),
                 )
                 .unwrap()[0];
-
-            let staging_fence = device
-                .create_fence(&vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED), None)
-                .unwrap();
 
             // The renderer starts at STARTING_FRAME so the steady-state render path
             // can read the previous timestamp slot without startup branches.
@@ -1027,7 +1074,7 @@ impl Renderer {
                 _global_set_layout: global_set_layout,
                 hzb_set_layout,
                 _frame_set_layout: frame_set_layout,
-                overdraw_set_layout,
+                _overdraw_set_layout: overdraw_set_layout,
 
                 frustum_cull_pipeline_layout,
                 frustum_cull_pipeline,
@@ -1049,13 +1096,16 @@ impl Renderer {
                 vertex_buffers: HashMap::new(),
                 visibility_index_cache: HashMap::new(),
 
-                staging_buffer,
+                staging_vk_buffer: staging_buffer,
+                _staging_allocation: staging_allocation,
+                staging_base,
+                staging_block,
+                staging_buffers,
                 staging_cmd_buffer,
-                staging_fence,
 
                 global_descriptor_pool,
                 _descriptor_pools: descriptor_pools,
-                overdraw_descriptor_pools,
+                _overdraw_descriptor_pools: overdraw_descriptor_pools,
 
                 hzb_sampler,
                 global_set,
@@ -1100,7 +1150,7 @@ impl Renderer {
         let frame_count = self.frame;
         self.frame += 1;
 
-        // Wait if we have too many frames in flight.
+        // Ensure fif[N] doesn't run while there is currently a frame running in fif[N].
         unsafe {
             self.wait_for_pipeline_stage(frame_count - MAX_FRAMES_IN_FLIGHT + 1, PipelineStage::DataUpload);
         }
@@ -1334,31 +1384,24 @@ impl Renderer {
                     let frustum = Vec4::from([frustum_x.x, frustum_x.z, frustum_y.y, frustum_y.z]);
 
                     // Upload scene data.
-                    self.staging_buffer.reset();
-
-                    self.staging_buffer.stage(&self.device, cmd, &object_instance_buffer, 0, object_data);
+                    let staging = &mut self.staging_buffers[frame_index];
+                    staging.reset();
+                    staging.stage(&self.device, cmd, &object_instance_buffer, Whole(object_data));
 
                     self.device.cmd_fill_buffer(
                         cmd,
                         active_meshlet_buffer.vk_handle(),
-                        GpuActiveMeshletBuffer::LEN_OFFSET,
+                        0,
                         std::mem::size_of::<u32>() as u64,
                         active_meshlet_count,
                     );
-                    self.staging_buffer.stage(
-                        &self.device,
-                        cmd,
-                        active_meshlet_buffer,
-                        GpuActiveMeshletBuffer::DATA_OFFSET,
-                        active_meshlet_ids,
-                    );
+                    staging.stage(&self.device, cmd, active_meshlet_buffer, Partial(0, active_meshlet_ids));
 
-                    self.staging_buffer.stage(
+                    staging.stage(
                         &self.device,
                         cmd,
                         frame_global_buffer,
-                        0,
-                        [GpuFrameGlobal {
+                        Whole(GpuFrameGlobal {
                             pv: projection * view,
                             proj: projection,
                             view,
@@ -1392,20 +1435,20 @@ impl Renderer {
                                 &vk::BufferDeviceAddressInfo::default()
                                     .buffer(frustum_passing_meshlet_buffer.vk_handle()),
                             ),
-                        }],
+                        }),
                     );
 
                     self.device.cmd_fill_buffer(
                         cmd,
                         indirect_cmd_buffer.vk_handle(),
-                        GpuDrawCommandBuffer::LEN_OFFSET,
+                        0,
                         std::mem::size_of::<u32>() as u64,
                         0,
                     );
                     self.device.cmd_fill_buffer(
                         cmd,
                         frustum_passing_meshlet_buffer.vk_handle(),
-                        GpuFrustumPassingMeshletBuffer::LEN_OFFSET,
+                        0,
                         std::mem::size_of::<u32>() as u64,
                         0,
                     );
@@ -1538,9 +1581,9 @@ impl Renderer {
                 self.device.cmd_draw_indexed_indirect_count(
                     cmd,
                     indirect_cmd_buffer.vk_handle(),
-                    GpuDrawCommandBuffer::DATA_OFFSET,
+                    std::mem::size_of::<u32>() as u64,
                     indirect_cmd_buffer.vk_handle(),
-                    GpuDrawCommandBuffer::LEN_OFFSET,
+                    0,
                     *maximum_meshlets,
                     size_of::<vk::DrawIndexedIndirectCommand>() as u32,
                 );
@@ -1667,7 +1710,7 @@ impl Renderer {
                     self.device.cmd_fill_buffer(
                         cmd,
                         indirect_cmd_buffer.vk_handle(),
-                        GpuDrawCommandBuffer::LEN_OFFSET,
+                        0,
                         std::mem::size_of::<u32>() as u64,
                         0,
                     );
@@ -1743,9 +1786,9 @@ impl Renderer {
                 self.device.cmd_draw_indexed_indirect_count(
                     cmd,
                     indirect_cmd_buffer.vk_handle(),
-                    GpuDrawCommandBuffer::DATA_OFFSET,
+                    std::mem::size_of::<u32>() as u64,
                     indirect_cmd_buffer.vk_handle(),
-                    GpuDrawCommandBuffer::LEN_OFFSET,
+                    0,
                     *maximum_meshlets,
                     size_of::<vk::DrawIndexedIndirectCommand>() as u32,
                 );
@@ -1926,7 +1969,6 @@ impl Renderer {
                     vk::Fence::null(),
                 )
                 .unwrap();
-
             self.device
                 .queue_submit2(
                     self.graphics_queue,
@@ -2141,9 +2183,9 @@ impl Renderer {
             vk_mem::MemoryUsage::AutoPreferDevice,
         );
 
-        let indirect_cmd_buffer = Buffer::<GpuDrawCommandBuffer>::new_sized(
+        let indirect_cmd_buffer = Buffer::<GpuDrawCommandBuffer>::new_trailing(
             &self.allocator,
-            GpuDrawCommandBuffer::byte_size(maximum_meshlets.max(1)),
+            maximum_meshlets.max(1),
             vk::BufferUsageFlags::STORAGE_BUFFER
                 | vk::BufferUsageFlags::INDIRECT_BUFFER
                 | vk::BufferUsageFlags::TRANSFER_DST
@@ -2152,9 +2194,9 @@ impl Renderer {
         );
 
         let active_meshlet_buffers = std::array::from_fn(|_| {
-            Buffer::<GpuActiveMeshletBuffer>::new_sized(
+            Buffer::<GpuActiveMeshletBuffer>::new_trailing(
                 &self.allocator,
-                GpuActiveMeshletBuffer::byte_size(maximum_meshlets.max(1)),
+                maximum_meshlets.max(1),
                 vk::BufferUsageFlags::STORAGE_BUFFER
                     | vk::BufferUsageFlags::TRANSFER_DST
                     | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
@@ -2163,9 +2205,9 @@ impl Renderer {
         });
 
         let frustum_passing_meshlet_buffers = std::array::from_fn(|_| {
-            Buffer::<[u8]>::new(
+            Buffer::<GpuFrustumPassingMeshletBuffer>::new_trailing(
                 &self.allocator,
-                GpuFrustumPassingMeshletBuffer::byte_size(maximum_meshlets.max(1)) as u32,
+                maximum_meshlets.max(1),
                 vk::BufferUsageFlags::STORAGE_BUFFER
                     | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
                     | vk::BufferUsageFlags::TRANSFER_DST,
@@ -2176,44 +2218,41 @@ impl Renderer {
         let visibility_stride = std::mem::size_of::<u32>() as u64;
         let old_visibility_buffers =
             std::mem::replace(&mut self.visibility_buffers, std::array::from_fn(|_| Buffer::null()));
-        let new_visibility_buffers = std::array::from_fn(|_| Buffer::<[u32]>::new(
-            &self.allocator,
-            instances.max(1),
-            vk::BufferUsageFlags::STORAGE_BUFFER
-                | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
-                | vk::BufferUsageFlags::TRANSFER_SRC
-                | vk::BufferUsageFlags::TRANSFER_DST,
-            vk_mem::MemoryUsage::AutoPreferDevice,
-        ));
+        let new_visibility_buffers = std::array::from_fn(|_| {
+            Buffer::<[u32]>::new(
+                &self.allocator,
+                instances.max(1),
+                vk::BufferUsageFlags::STORAGE_BUFFER
+                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS
+                    | vk::BufferUsageFlags::TRANSFER_SRC
+                    | vk::BufferUsageFlags::TRANSFER_DST,
+                vk_mem::MemoryUsage::AutoPreferDevice,
+            )
+        });
         for slot in 0..VISIBILITY_BUFFER_COUNT {
             debug_assert!(!new_visibility_buffers[slot].is_null());
         }
 
-        self.device.wait_for_fences(&[self.staging_fence], true, u64::MAX).unwrap();
-        self.device.reset_fences(&[self.staging_fence]).unwrap();
+        let mut staging =
+            StagingBuffer::new(&mut self.staging_block, self.staging_vk_buffer, self.staging_base, 128 * MiB);
+        let temp_fence = self.device.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
 
         self.device.reset_command_buffer(self.staging_cmd_buffer, vk::CommandBufferResetFlags::empty()).unwrap();
         self.device.begin_command_buffer(self.staging_cmd_buffer, &vk::CommandBufferBeginInfo::default()).unwrap();
 
         // Upload.
-        self.staging_buffer.reset();
-        self.staging_buffer.stage(&self.device, self.staging_cmd_buffer, &index_buffer, 0, indices);
+        staging.reset();
+        staging.stage(&self.device, self.staging_cmd_buffer, &index_buffer, Whole(indices));
         for (id, vertices) in &new_meshes {
             let buffers = self.vertex_buffers.get(id).unwrap();
             for lod in 0..MAX_LODS {
                 if vertices[lod].is_empty() {
                     continue;
                 }
-                self.staging_buffer.stage(
-                    &self.device,
-                    self.staging_cmd_buffer,
-                    &buffers[lod],
-                    0,
-                    vertices[lod].as_ref(),
-                );
+                staging.stage(&self.device, self.staging_cmd_buffer, &buffers[lod], Whole(vertices[lod].as_ref()));
             }
         }
-        self.staging_buffer.stage(&self.device, self.staging_cmd_buffer, &meshlet_instance_buffer, 0, meshlet_data);
+        staging.stage(&self.device, self.staging_cmd_buffer, &meshlet_instance_buffer, Whole(meshlet_data));
         for slot in 0..VISIBILITY_BUFFER_COUNT {
             let new_buffer = &new_visibility_buffers[slot];
             self.device.cmd_fill_buffer(
@@ -2259,12 +2298,14 @@ impl Renderer {
             .queue_submit(
                 self.graphics_queue,
                 &[vk::SubmitInfo::default().command_buffers(&[self.staging_cmd_buffer])],
-                self.staging_fence,
+                temp_fence,
             )
             .unwrap();
 
         // Wait for transfer to complete before returning.
-        self.device.wait_for_fences(&[self.staging_fence], true, u64::MAX).unwrap();
+        self.device.wait_for_fences(&[temp_fence], true, u64::MAX).unwrap();
+        self.device.destroy_fence(temp_fence, None);
+        staging.destroy(&mut self.staging_block);
 
         self.visibility_buffers = new_visibility_buffers;
         self.visibility_index_cache = new_visibility_index_cache;
@@ -2544,8 +2585,7 @@ impl Renderer {
             }));
 
             /* Write command buffer and queue. */
-            self.device.wait_for_fences(&[self.staging_fence], true, u64::MAX).unwrap();
-            self.device.reset_fences(&[self.staging_fence]).unwrap();
+            let temp_fence = self.device.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
 
             self.device.reset_command_buffer(self.staging_cmd_buffer, vk::CommandBufferResetFlags::empty()).unwrap();
             self.device.begin_command_buffer(self.staging_cmd_buffer, &vk::CommandBufferBeginInfo::default()).unwrap();
@@ -2600,13 +2640,13 @@ impl Renderer {
                 .queue_submit(
                     self.graphics_queue,
                     &[vk::SubmitInfo::default().command_buffers(&[self.staging_cmd_buffer])],
-                    self.staging_fence,
+                    temp_fence,
                 )
                 .unwrap();
-        };
 
-        // Wait for transfer to complete before returning.
-        self.device.wait_for_fences(&[self.staging_fence], true, u64::MAX).unwrap();
+            self.device.wait_for_fences(&[temp_fence], true, u64::MAX).unwrap();
+            self.device.destroy_fence(temp_fence, None);
+        };
 
         self.swapchain_resources = Some(SwapchainResources {
             hzb_images,

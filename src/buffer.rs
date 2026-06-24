@@ -1,4 +1,5 @@
 use ash::vk;
+use core::mem::size_of;
 use vk_mem::Alloc;
 
 #[derive(Debug)]
@@ -59,6 +60,10 @@ impl<T: ?Sized> Buffer<T> {
 
     pub(crate) fn size(&self) -> usize {
         self.size_bytes as usize
+    }
+
+    pub(crate) fn len(&self) -> u32 {
+        self.len
     }
 
     pub(crate) fn new_sized(
@@ -138,11 +143,40 @@ impl<T> Buffer<[T]> {
         }
     }
 
-    pub(crate) fn len(&self) -> u32 {
-        self.len
-    }
-
     pub(crate) fn stride(&self) -> u32 {
         size_of::<T>() as u32
+    }
+}
+
+pub(crate) trait Trailing {
+    type Tail;
+
+    fn tail_offset() -> u64;
+    fn byte_size(len: u32) -> u64;
+}
+
+impl<T: Trailing> Buffer<T> {
+    pub(crate) fn new_trailing(
+        allocator: &vk_mem::Allocator,
+        len: u32,
+        vk_usage: vk::BufferUsageFlags,
+        vma_usage: vk_mem::MemoryUsage,
+    ) -> Self {
+        unsafe {
+            let (buffer, alloc) = allocator
+                .create_buffer(
+                    &vk::BufferCreateInfo::default().size(T::byte_size(len)).usage(vk_usage),
+                    &vk_mem::AllocationCreateInfo { usage: vma_usage, ..Default::default() },
+                )
+                .unwrap();
+
+            Buffer {
+                phantom: std::marker::PhantomData,
+                buffer,
+                alloc: Some(alloc),
+                len,
+                size_bytes: T::byte_size(len),
+            }
+        }
     }
 }
