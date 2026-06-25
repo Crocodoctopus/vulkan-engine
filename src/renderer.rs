@@ -4,7 +4,7 @@ use crate::glsl_types::*;
 use crate::image::{Image2D, ImageView2D};
 use crate::mesh::{MAX_LODS, Mesh, load_mesh};
 use crate::profiling::PipelineProfiler;
-use crate::staging::{Partial, StagingBuffer, Whole};
+use crate::staging::{Partial, StagingBlock, StagingBuffer, Whole};
 use crate::swapchain::Swapchain;
 use crate::util::{const_max, const_min, format_bytes, format_usize_commas};
 use crate::vk_helpers::*;
@@ -17,12 +17,12 @@ use std::path::PathBuf;
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 #[derive(Copy, Clone, Hash, Eq, PartialEq, Debug)]
-pub struct MeshHandle(u32);
+pub struct MeshHandle(pub(crate) u32);
 #[derive(Copy, Clone, Hash, Eq, PartialEq, Debug)]
-pub struct ObjectHandle(u32);
+pub struct ObjectHandle(pub(crate) u32);
 
 #[derive(Debug)]
-pub(super) struct Object {
+pub(crate) struct Object {
     pub mesh: MeshHandle,
     pub position: Vec3,
     pub scale: f32,
@@ -38,22 +38,22 @@ const MiB: u64 = 1024 * KiB;
 #[allow(non_upper_case_globals, unused)]
 const GiB: u64 = 1024 * MiB;
 
-const STAGING_ARENA_SIZE: u64 = 256 * MiB;
-const STAGING_FIF_BLOCK_SIZE: u64 = 32 * MiB;
+pub(crate) const STAGING_ARENA_SIZE: u64 = 256 * MiB;
+pub(crate) const STAGING_FIF_BLOCK_SIZE: u64 = 32 * MiB;
 
 pub(crate) const MAX_FRAMES_IN_FLIGHT: usize = 2;
-const VISIBILITY_DEPTH: usize = 2;
-const VISIBILITY_BUFFER_COUNT: usize = VISIBILITY_DEPTH + 1;
-const STARTING_FRAME: usize = const_max([MAX_FRAMES_IN_FLIGHT, VISIBILITY_DEPTH]);
+pub(crate) const VISIBILITY_DEPTH: usize = 2;
+pub(crate) const VISIBILITY_BUFFER_COUNT: usize = VISIBILITY_DEPTH + 1;
+pub(crate) const STARTING_FRAME: usize = const_max([MAX_FRAMES_IN_FLIGHT, VISIBILITY_DEPTH]);
 
 // Dedicated HZB/occlusion descriptor set.
-const MAX_HZB_DIMENSION: u32 = 8192;
-const MAX_HZB_MIPS: u32 = MAX_HZB_DIMENSION.div_ceil(2).ilog2() + 1;
-const HZB_SAMPLED_IMAGE_CAPACITY: u32 = 1 + MAX_HZB_MIPS;
-const HZB_STORAGE_IMAGE_CAPACITY: u32 = MAX_HZB_MIPS;
+pub(crate) const MAX_HZB_DIMENSION: u32 = 8192;
+pub(crate) const MAX_HZB_MIPS: u32 = MAX_HZB_DIMENSION.div_ceil(2).ilog2() + 1;
+pub(crate) const HZB_SAMPLED_IMAGE_CAPACITY: u32 = 1 + MAX_HZB_MIPS;
+pub(crate) const HZB_STORAGE_IMAGE_CAPACITY: u32 = MAX_HZB_MIPS;
 
 // The maximum number of FIF that can be in the BuildHzb of OcclusionCull phase of the pipeline.
-const MAX_HZB_IN_FLIGHT: usize = const_min([MAX_FRAMES_IN_FLIGHT, VISIBILITY_DEPTH]);
+pub(crate) const MAX_HZB_IN_FLIGHT: usize = const_min([MAX_FRAMES_IN_FLIGHT, VISIBILITY_DEPTH]);
 
 /*
 Plan:
@@ -247,10 +247,7 @@ pub struct Renderer {
     visibility_index_cache: HashMap<ObjectHandle, u32>,
 
     /* Staging: */
-    staging_vk_buffer: vk::Buffer,
-    _staging_allocation: vk_mem::Allocation,
-    staging_base: *mut u8,
-    staging_block: vk_mem::VirtualBlock,
+    staging: StagingBlock,
     // TODO: For rebuilds, needs more permanent solution
     staging_cmd_buffer: vk::CommandBuffer,
 
@@ -299,7 +296,8 @@ pub struct Renderer {
     pub overdraw_enabled: bool,
 }
 
-const LOD_DISTANCE_BIAS: f32 = 0.5;
+const LOD_DISTANCE_BIAS: f32 = 2.0;
+const LOD_DISTANCE_OFFSET: f32 = 0.25;
 
 impl Drop for Renderer {
     fn drop(&mut self) {
@@ -855,33 +853,8 @@ impl Renderer {
                 .unwrap();
 
             // Staging data.
-            use vk_mem::Alloc;
-
-            let (staging_buffer, mut staging_allocation) = allocator
-                .create_buffer(
-                    &vk::BufferCreateInfo::default()
-                        .size(STAGING_ARENA_SIZE)
-                        .usage(vk::BufferUsageFlags::TRANSFER_SRC)
-                        .sharing_mode(vk::SharingMode::EXCLUSIVE),
-                    &vk_mem::AllocationCreateInfo {
-                        flags: vk_mem::AllocationCreateFlags::MAPPED
-                            | vk_mem::AllocationCreateFlags::HOST_ACCESS_SEQUENTIAL_WRITE,
-                        usage: vk_mem::MemoryUsage::AutoPreferHost,
-                        required_flags: vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
-                        ..Default::default()
-                    },
-                )
-                .unwrap();
-            let staging_base = allocator.map_memory(&mut staging_allocation).unwrap();
-            let mut staging_block = vk_mem::VirtualBlock::new(vk_mem::VirtualBlockCreateInfo {
-                size: STAGING_ARENA_SIZE,
-                flags: Default::default(),
-                allocation_callbacks: None,
-            })
-            .unwrap();
-            let staging_buffers = std::array::from_fn(|_| {
-                StagingBuffer::new(&mut staging_block, staging_buffer, staging_base, STAGING_FIF_BLOCK_SIZE)
-            });
+            let mut staging = StagingBlock::new(&allocator, STAGING_ARENA_SIZE);
+            let staging_buffers = std::array::from_fn(|_| StagingBuffer::new(&mut staging, STAGING_FIF_BLOCK_SIZE));
 
             let staging_cmd_buffer = device
                 .allocate_command_buffers(
@@ -1096,10 +1069,7 @@ impl Renderer {
                 vertex_buffers: HashMap::new(),
                 visibility_index_cache: HashMap::new(),
 
-                staging_vk_buffer: staging_buffer,
-                _staging_allocation: staging_allocation,
-                staging_base,
-                staging_block,
+                staging,
                 staging_buffers,
                 staging_cmd_buffer,
 
@@ -1348,7 +1318,9 @@ impl Renderer {
                         let mesh = self.meshes.get(&obj.mesh).unwrap();
                         let distance = (self.cam_pos - obj.position).length();
                         let object_radius = obj.scale * mesh.scale * mesh.radius;
-                        let lod_ratio = (distance.max(1e-5) / object_radius.max(1e-5)) * LOD_DISTANCE_BIAS;
+                        let lod_ratio = ((distance.max(1e-5) / object_radius.max(1e-5)) - LOD_DISTANCE_OFFSET)
+                            .max(1e-5)
+                            * LOD_DISTANCE_BIAS;
                         let lod_id =
                             lod_ratio.log2().floor().clamp(0.0, (mesh.lod_count.saturating_sub(1)) as f32) as u32;
                         let lod_idx = lod_id as usize;
@@ -2233,8 +2205,7 @@ impl Renderer {
             debug_assert!(!new_visibility_buffers[slot].is_null());
         }
 
-        let mut staging =
-            StagingBuffer::new(&mut self.staging_block, self.staging_vk_buffer, self.staging_base, 128 * MiB);
+        let mut staging = StagingBuffer::new(&mut self.staging, 128 * MiB);
         let temp_fence = self.device.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
 
         self.device.reset_command_buffer(self.staging_cmd_buffer, vk::CommandBufferResetFlags::empty()).unwrap();
@@ -2305,7 +2276,7 @@ impl Renderer {
         // Wait for transfer to complete before returning.
         self.device.wait_for_fences(&[temp_fence], true, u64::MAX).unwrap();
         self.device.destroy_fence(temp_fence, None);
-        staging.destroy(&mut self.staging_block);
+        staging.free(&mut self.staging);
 
         self.visibility_buffers = new_visibility_buffers;
         self.visibility_index_cache = new_visibility_index_cache;

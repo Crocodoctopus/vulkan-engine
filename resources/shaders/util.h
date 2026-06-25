@@ -13,6 +13,8 @@ const uint MESHLET_TAG_MASK = (1u << MESHLET_TAG_BITS) - 1u;
 const uint LOD_ID_MASK = (1u << LOD_ID_BITS) - 1u;
 const uint LOD_ID_SHIFT = MESHLET_TAG_BITS;
 const uint ACTIVE_MESHLET_ID_SHIFT = LOD_ID_BITS;
+const float LOD_DISTANCE_BIAS = 2.0;
+const float LOD_DISTANCE_OFFSET = 0.25;
 
 vec3 rotate_quat(vec3 v, vec4 q) {
     return v + 2.0 * cross(q.xyz, cross(q.xyz, v) + q.w * v);
@@ -38,6 +40,7 @@ void unpack_active_meshlet(uint payload, out uint meshlet_id, out uint lod_id) {
 
 uint choose_lod(float radius, float distance) {
     float ratio = max(distance, 1e-5) / max(radius, 1e-5);
+    ratio = max((ratio - LOD_DISTANCE_OFFSET) * LOD_DISTANCE_BIAS, 1e-5);
     return uint(clamp(floor(log2(ratio)), 0.0, float(MAX_LODS - 1u)));
 }
 

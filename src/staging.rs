@@ -23,8 +23,9 @@ pub struct StagingBuffer {
 }
 
 impl StagingBuffer {
-    pub unsafe fn new(block: &mut vk_mem::VirtualBlock, buffer: vk::Buffer, base_ptr: *mut u8, len: u64) -> Self {
-        let (allocation, offset) = block
+    pub unsafe fn new(staging: &mut StagingBlock, len: u64) -> Self {
+        let (allocation, offset) = staging
+            .block
             .allocate(vk_mem::VirtualAllocationCreateInfo {
                 size: len,
                 alignment: 4,
@@ -32,21 +33,23 @@ impl StagingBuffer {
                 flags: vk_mem::VirtualAllocationCreateFlags::empty(),
             })
             .unwrap();
-        let info = block.get_allocation_info(&allocation).unwrap();
+        let info = staging.block.get_allocation_info(&allocation).unwrap();
         debug_assert_eq!(info.offset, offset);
 
         Self {
-            buffer,
+            buffer: staging.buffer,
             allocation,
-            base: base_ptr,
+            base: staging.base,
             offset: info.offset as u32,
             len: 0,
             capacity: info.size as u32,
         }
     }
 
-    pub unsafe fn destroy(mut self, block: &mut vk_mem::VirtualBlock) {
-        block.free(&mut self.allocation);
+    pub unsafe fn free(self, staging: &mut StagingBlock) {
+        let mut allocation = std::ptr::read(&self.allocation);
+        staging.block.free(&mut allocation);
+        std::mem::forget(allocation);
         std::mem::forget(self);
     }
 
@@ -94,6 +97,53 @@ impl StagingBuffer {
         op: O,
     ) {
         op.apply(self, device, cmd, dst);
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) struct StagingBlock {
+    pub block: vk_mem::VirtualBlock,
+    pub buffer_allocation: vk_mem::Allocation,
+    pub buffer: vk::Buffer,
+    pub base: *mut u8,
+    pub capacity: u64,
+}
+
+impl StagingBlock {
+    pub unsafe fn new(allocator: &vk_mem::Allocator, size: u64) -> Self {
+        use vk_mem::Alloc;
+
+        let (buffer, mut buffer_allocation) = allocator
+            .create_buffer(
+                &vk::BufferCreateInfo::default()
+                    .size(size)
+                    .usage(vk::BufferUsageFlags::TRANSFER_SRC)
+                    .sharing_mode(vk::SharingMode::EXCLUSIVE),
+                &vk_mem::AllocationCreateInfo {
+                    flags: vk_mem::AllocationCreateFlags::MAPPED | vk_mem::AllocationCreateFlags::HOST_ACCESS_SEQUENTIAL_WRITE,
+                    usage: vk_mem::MemoryUsage::AutoPreferHost,
+                    required_flags: vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let base = allocator.map_memory(&mut buffer_allocation).unwrap();
+        let block = vk_mem::VirtualBlock::new(vk_mem::VirtualBlockCreateInfo {
+            size,
+            flags: Default::default(),
+            allocation_callbacks: None,
+        })
+        .unwrap();
+
+        Self { block, buffer_allocation, buffer, base, capacity: size }
+    }
+
+    #[allow(dead_code)]
+    pub unsafe fn free(self, allocator: &vk_mem::Allocator) {
+        let mut buffer_allocation = std::ptr::read(&self.buffer_allocation);
+        allocator.destroy_buffer(self.buffer, &mut buffer_allocation);
+        std::mem::forget(buffer_allocation);
+        std::mem::forget(self);
     }
 }
 
