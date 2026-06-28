@@ -3,6 +3,7 @@
 #extension GL_EXT_scalar_block_layout: require
 #extension GL_EXT_shader_8bit_storage: require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
 #extension GL_EXT_nonuniform_qualifier : require
 
 layout (local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
@@ -12,14 +13,14 @@ layout (local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 layout (set = 0, binding = 0) uniform sampler2D hzb_views[];
 
-layout(std430, set = 1, binding = 0) UNIFORM {
+layout(std430, set = 1, binding = 0) BUFFER {
     FrameGlobal frame_global;
 };
 
 const float NEAR_PLANE = 0.1;
 const float DEPTH_BIAS = 0.000001;
 
-bool sphere_occluded(MeshletInstance meshlet, ObjectInstance object) {
+bool sphere_occluded(Meshlet meshlet, ObjectInstance object) {
     vec3 center_ws = object.position + object.scale * rotate_quat(meshlet.center, object.orientation);
     vec3 center_vs = (frame_global.view * vec4(center_ws, 1.0)).xyz;
     float radius = abs(object.scale) * meshlet.radius;
@@ -105,25 +106,27 @@ bool sphere_occluded(MeshletInstance meshlet, ObjectInstance object) {
 }
 
 void main() {
-    uint candidate_id = gl_GlobalInvocationID.x;
+    uint candidate_index = gl_GlobalInvocationID.x;
+
     uint candidate_count = frame_global.frustum_passing_meshlet_buffer.len;
-    if (candidate_id >= candidate_count) {
+    if (candidate_index >= candidate_count) {
         return;
     }
 
-    uint packed_meshlet = frame_global.frustum_passing_meshlet_buffer.meshlet_ids[candidate_id];
-    uint meshlet_id;
-    uint lod_id;
-    unpack_active_meshlet(packed_meshlet, meshlet_id, lod_id);
-    MeshletInstance meshlet = frame_global.meshlet_buffer.data[meshlet_id];
-    ObjectInstance object = frame_global.object_buffer.data[meshlet.object_id];
+    MeshletLookup lookup = frame_global.frustum_passing_meshlet_buffer.data[candidate_index];
+    ObjectInstance object = frame_global.object_buffer.data[lookup.object_index];
+    Meshlet meshlet = object.meshlet_buffer.data[lookup.meshlet_index];
+    #define VISIBILITY (object.visibility_buffer.data[lookup.meshlet_index])
 
-    bool was_visible = frame_global.meshlet_visibility_buffer.data[meshlet_id];
+    bool was_visible = VISIBILITY != 0u;
     bool visible = !sphere_occluded(meshlet, object);
-    frame_global.meshlet_visibility_buffer.data[meshlet_id] = visible;
+    VISIBILITY = uint(visible);
 
     if (visible && !was_visible) {
+        uint pad0, pad1;
+        pack(pad0, pad1, lookup.object_index, lookup.meshlet_index);
+        const uint i = atomicAdd(frame_global.draw_cmd_buffer.len, 1);
         const uint draw_index = atomicAdd(frame_global.draw_cmd_buffer.len, 1);
-        frame_global.draw_cmd_buffer.data[draw_index] = make_draw_cmd(meshlet, meshlet_id, lod_id);
+        frame_global.draw_cmd_buffer.data[draw_index] = make_draw_cmd(meshlet, object.scene_index_offset, pad0, pad1);
     }
 }

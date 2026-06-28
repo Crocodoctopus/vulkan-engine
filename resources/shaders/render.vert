@@ -6,7 +6,7 @@
 #include "types.h"
 #include "util.h"
 
-layout(std430, set = 1, binding = 0) UNIFORM {
+layout(std430, set = 1, binding = 0) BUFFER {
     FrameGlobal frame_global;
 };
 
@@ -37,11 +37,11 @@ vec4 colors[16] = {
 };
 
 void main() {
-    ObjectInstance object = frame_global.object_buffer.data[gl_BaseVertex];
-    uint meshlet_tag;
-    uint lod_id;
-    unpack_draw_payload(gl_BaseInstance, meshlet_tag, lod_id);
-    Vertex vert = object.vertex_buffer[lod_id].data[gl_VertexIndex - gl_BaseVertex];
+    uint object_index, meshlet_color_index;
+    unpack(gl_BaseVertex, gl_BaseInstance, object_index, meshlet_color_index);
+
+    ObjectInstance object = frame_global.object_buffer.data[object_index];
+    Vertex vert = object.vertex_buffer.data[gl_VertexIndex - gl_BaseVertex];
 
     // Decompress.
     vec3 position = vec3(vert.x, vert.y, vert.z) / 32767.0f;
@@ -55,5 +55,5 @@ void main() {
     frag_normal = rotate_quat(normal, object.orientation);
     frag_uv = uv;
     frag_tex_id = object.tex_id;
-    frag_color = colors[meshlet_tag];
+    frag_color = colors[meshlet_color_index];
 }

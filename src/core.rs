@@ -53,25 +53,23 @@ impl Core {
             entry.create_instance(&instance_cinfo, None).expect("Failed to create vulkan instance.")
         };
 
-        // Find first descrete GPU.
+        // Prefer an integrated GPU, but fall back to the first available device if needed.
         let physical_device = instance
             .enumerate_physical_devices()
             .expect("Could not find any Vulkan compatible devices.")
             .into_iter()
-            /*.find(|&physical_device| {
-                println!(
-                    "{:?}",
-                    instance
-                        .get_physical_device_properties(physical_device)
-                        .device_type
-                );
+            .find(|&physical_device| {
+                instance.get_physical_device_properties(physical_device).device_type
+                    == vk::PhysicalDeviceType::INTEGRATED_GPU
+            })
+            .or_else(|| {
                 instance
-                    .get_physical_device_properties(physical_device)
-                    .device_type
-                    == vk::PhysicalDeviceType::DISCRETE_GPU
-            })*/
-            .next()
-            .unwrap();
+                    .enumerate_physical_devices()
+                    .expect("Could not find any Vulkan compatible devices.")
+                    .into_iter()
+                    .next()
+            })
+            .expect("Could not find any Vulkan compatible devices.");
 
         // For later.
         let physical_device_properties = instance.get_physical_device_properties(physical_device);

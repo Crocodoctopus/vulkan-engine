@@ -24,26 +24,27 @@ pub struct StagingBuffer {
 
 impl StagingBuffer {
     pub unsafe fn new(staging: &mut StagingBlock, len: u64) -> Self {
-        let (allocation, offset) = staging
-            .block
-            .allocate(vk_mem::VirtualAllocationCreateInfo {
-                size: len,
-                alignment: 4,
-                user_data: 0,
-                flags: vk_mem::VirtualAllocationCreateFlags::empty(),
-            })
-            .unwrap();
+        Self::try_new(staging, len).unwrap()
+    }
+
+    pub unsafe fn try_new(staging: &mut StagingBlock, len: u64) -> ash::prelude::VkResult<Self> {
+        let (allocation, offset) = staging.block.allocate(vk_mem::VirtualAllocationCreateInfo {
+            size: len,
+            alignment: 4,
+            user_data: 0,
+            flags: vk_mem::VirtualAllocationCreateFlags::empty(),
+        })?;
         let info = staging.block.get_allocation_info(&allocation).unwrap();
         debug_assert_eq!(info.offset, offset);
 
-        Self {
+        Ok(Self {
             buffer: staging.buffer,
             allocation,
             base: staging.base,
             offset: info.offset as u32,
             len: 0,
             capacity: info.size as u32,
-        }
+        })
     }
 
     pub unsafe fn free(self, staging: &mut StagingBlock) {
@@ -120,7 +121,8 @@ impl StagingBlock {
                     .usage(vk::BufferUsageFlags::TRANSFER_SRC)
                     .sharing_mode(vk::SharingMode::EXCLUSIVE),
                 &vk_mem::AllocationCreateInfo {
-                    flags: vk_mem::AllocationCreateFlags::MAPPED | vk_mem::AllocationCreateFlags::HOST_ACCESS_SEQUENTIAL_WRITE,
+                    flags: vk_mem::AllocationCreateFlags::MAPPED
+                        | vk_mem::AllocationCreateFlags::HOST_ACCESS_SEQUENTIAL_WRITE,
                     usage: vk_mem::MemoryUsage::AutoPreferHost,
                     required_flags: vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
                     ..Default::default()

@@ -8,6 +8,7 @@
 #define CONCAT(a, b) CONCAT_INNER(a, b)
 #define BUFFER_NAME(line) CONCAT(TMP_, line)
 #define UNIFORM uniform BUFFER_NAME(__LINE__)
+#define BUFFER buffer BUFFER_NAME(__LINE__)
 
 struct Vertex {
     int16_t x, y, z;
@@ -15,28 +16,7 @@ struct Vertex {
     int8_t nx, ny, nz;
 };
 
-layout (buffer_reference, scalar) readonly buffer VertexBuffer {
-    Vertex data[];
-};
-
-layout (buffer_reference, scalar) buffer ActiveMeshletBuffer {
-    uint len;
-    uint meshlet_ids[]; // Packed meshlet_id in the upper bits, LOD in the low 3 bits.
-};
-
-struct ObjectInstance {
-    vec3 position;
-    float scale;
-    vec4 orientation;
-    VertexBuffer vertex_buffer[8];
-    uint tex_id;
-};
-
-layout (buffer_reference, std430) readonly buffer ObjectInstanceBuffer {
-    ObjectInstance data[];
-};
-
-struct MeshletInstance {
+struct Meshlet {
     // Culling.
     vec3 center;
     float radius;
@@ -46,23 +26,46 @@ struct MeshletInstance {
     float cone_cutoff;
 
     // Draw cmd.
-    uint object_id;
     uint index_count;
     uint first_index;
 };
 
-layout (buffer_reference, std430) readonly buffer MeshletInstanceBuffer {
-    MeshletInstance data[];
+layout (buffer_reference, scalar) readonly buffer VertexBuffer {
+    Vertex data[];
 };
 
-layout (buffer_reference, scalar) buffer MeshletVisibilityBuffer {
-    bool data[];
+layout (buffer_reference, std430) readonly buffer MeshletBuffer {
+    Meshlet data[];
+};
+
+layout (buffer_reference, scalar) buffer VisibilityBuffer {
+    uint data[];
+};
+
+struct ObjectInstance {
+    vec3 position;
+    float scale;
+    vec4 orientation;
+    VertexBuffer vertex_buffer;
+    MeshletBuffer meshlet_buffer;
+    VisibilityBuffer visibility_buffer;
+    uint tex_id;
+    uint scene_index_offset;
+};
+
+layout (buffer_reference, std430) readonly buffer ObjectInstanceBuffer {
+    ObjectInstance data[];
+};
+
+struct MeshletLookup {
+    uint16_t object_index;
+    uint16_t meshlet_index;
 };
 
 // Meshlets that pass frustum culling and still need occlusion testing.
 layout (buffer_reference, scalar) buffer FrustumPassingMeshletBuffer {
     uint len;
-    uint meshlet_ids[]; // Packed meshlet_id + LOD, same encoding as ActiveMeshletBuffer.
+    MeshletLookup data[];
 };
 
 struct VkDrawIndexedIndirectCommand {
@@ -79,6 +82,12 @@ layout (buffer_reference, std430) writeonly buffer DrawCmdBuffer {
     VkDrawIndexedIndirectCommand data[];
 };
 
+struct VkDispatchIndirectCommand {
+    uint x;
+    uint y;
+    uint z;
+};
+
 struct FrameGlobal {
     mat4 pv;
     mat4 proj;
@@ -92,13 +101,11 @@ struct FrameGlobal {
     vec4 frustum;
     vec4 screen_info;
 
-    ActiveMeshletBuffer active_meshlet_buffer;
-    MeshletVisibilityBuffer meshlet_visibility_buffer;
-    MeshletInstanceBuffer meshlet_buffer;
     DrawCmdBuffer draw_cmd_buffer;
     ObjectInstanceBuffer object_buffer;
-
     FrustumPassingMeshletBuffer frustum_passing_meshlet_buffer;
+
+    VkDispatchIndirectCommand occlusion_dispatch;
 };
 
 #endif

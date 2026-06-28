@@ -5,7 +5,7 @@
 
 #include "types.h"
 
-layout(std430, set = 1, binding = 0) UNIFORM {
+layout(std430, set = 1, binding = 0) BUFFER {
     FrameGlobal frame_global;
 };
 

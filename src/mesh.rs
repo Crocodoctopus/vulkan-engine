@@ -22,7 +22,7 @@ pub(crate) struct Meshlet {
 pub(crate) struct Mesh {
     pub scale: f32,
     pub radius: f32,
-    pub lod_count: usize,
+    pub lod_count: u8,
     pub lods: [Box<[Meshlet]>; MAX_LODS],
 }
 
@@ -171,5 +171,5 @@ pub(crate) fn load_mesh(filename: impl AsRef<Path>) -> Option<Mesh> {
             .into_boxed_slice()
     });
 
-    Some(Mesh { scale, radius, lod_count, lods })
+    Some(Mesh { scale, radius, lod_count: lod_count as u8, lods })
 }

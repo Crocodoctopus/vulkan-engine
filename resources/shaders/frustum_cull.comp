@@ -3,29 +3,33 @@
 #extension GL_EXT_scalar_block_layout: require
 #extension GL_EXT_shader_8bit_storage: require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
 
 layout (local_size_x = 64, local_size_y = 1, local_size_z = 1) in;
 
 #include "types.h"
 #include "util.h"
 
-layout(std430, set = 0, binding = 0) UNIFORM {
+layout(std430, set = 0, binding = 0) BUFFER {
     FrameGlobal frame_global;
 };
 
+layout(push_constant) uniform PushConstants {
+    uint16_t object_index;
+    uint16_t meshlet_count;
+};
+
 void main() {
-    uint active_meshlet_id = gl_GlobalInvocationID.x;
+    uint16_t meshlet_index = uint16_t(gl_GlobalInvocationID.x);
 
     // Filter invalid invocation ids.
-    if (active_meshlet_id >= frame_global.active_meshlet_buffer.len) return;
+    if (meshlet_index >= meshlet_count) return;
 
-    uint packed_meshlet = frame_global.active_meshlet_buffer.meshlet_ids[active_meshlet_id];
-    uint meshlet_id;
-    uint lod_id;
-    unpack_active_meshlet(packed_meshlet, meshlet_id, lod_id);
-    MeshletInstance meshlet = frame_global.meshlet_buffer.data[meshlet_id];
-    ObjectInstance object = frame_global.object_buffer.data[meshlet.object_id];
-
+    // 
+    ObjectInstance object = frame_global.object_buffer.data[object_index];
+    Meshlet meshlet = object.meshlet_buffer.data[meshlet_index];
+    #define VISIBILITY (object.visibility_buffer.data[meshlet_index])
+    
     // Frustum cull (view-space sphere test).
     vec3 center_ws = object.position + object.scale * rotate_quat(meshlet.center, object.orientation);
     vec4 center = frame_global.view * vec4(center_ws, 1.0);
@@ -36,7 +40,7 @@ void main() {
     bool visible_y = center.z * frame_global.frustum[3] - abs(center.y) * frame_global.frustum[2] > -radius;
     bool visible_z = center.z - radius < znear;
     if (!(visible_x && visible_y && visible_z)) {
-        frame_global.meshlet_visibility_buffer.data[meshlet_id] = false;
+        VISIBILITY = 0u;
         return;
     };
 
@@ -45,7 +49,7 @@ void main() {
         vec3 cone_apex = object.position + object.scale * rotate_quat(meshlet.cone_apex, object.orientation);
         vec3 cone_axis = normalize(rotate_quat(meshlet.cone_axis, object.orientation));
         if (dot(normalize(cone_apex - frame_global.camera_position), cone_axis) >= meshlet.cone_cutoff) {
-            frame_global.meshlet_visibility_buffer.data[meshlet_id] = false;
+            VISIBILITY = 0u;
             return;
         }
     }
@@ -54,14 +58,19 @@ void main() {
 
     // Every frustum-visible meshlet participates in the speculative visibility pass.
     const uint candidate_index = atomicAdd(frame_global.frustum_passing_meshlet_buffer.len, 1);
-    frame_global.frustum_passing_meshlet_buffer.meshlet_ids[candidate_index] = packed_meshlet;
+    frame_global.frustum_passing_meshlet_buffer.data[candidate_index] = MeshletLookup(object_index, meshlet_index);
+    if ((candidate_index & 63) == 0) {
+        atomicAdd(frame_global.occlusion_dispatch.x, 1);
+    }
 
     // If it wasn't visible N frames ago, defer the draw to the late pass.
-    if (!frame_global.meshlet_visibility_buffer.data[meshlet_id]) {
+    if (VISIBILITY == 0u) {
         return;
     }
 
     // ... otherwise, append as a draw command.
+    uint pad0, pad1;
+    pack(pad0, pad1, object_index, meshlet_index);
     const uint i = atomicAdd(frame_global.draw_cmd_buffer.len, 1);
-    frame_global.draw_cmd_buffer.data[i] = make_draw_cmd(meshlet, meshlet_id, lod_id);
+    frame_global.draw_cmd_buffer.data[i] = make_draw_cmd(meshlet, object.scene_index_offset, pad0, pad1);
 }
