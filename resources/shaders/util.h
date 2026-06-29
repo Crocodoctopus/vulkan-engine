@@ -17,12 +17,12 @@ vec3 rotate_quat(vec3 v, vec4 q) {
 }
 
 void unpack(uint pad0, uint pad1, out uint object_index, out uint meshlet_color_index) {
-    object_index = pad0 >> 15;
-    meshlet_color_index = pad0 & 15;
+    object_index = pad0 >> 7;
+    meshlet_color_index = pad0 & 7;
 }
 
 void pack(out uint pad0, out uint pad1, uint object_index, uint meshlet_color_index) {
-    pad0 = (object_index << 15) | (meshlet_color_index & 15);
+    pad0 = (object_index << 7) | (meshlet_color_index & 7);
     pad1 = 0;
 }
 

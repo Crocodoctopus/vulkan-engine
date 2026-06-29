@@ -235,6 +235,7 @@ pub struct Renderer {
     render_pipeline: vk::Pipeline,
     overdraw_render_pipeline_layout: vk::PipelineLayout,
     overdraw_render_pipeline: vk::Pipeline,
+    overshade_render_pipeline: vk::Pipeline,
     overdraw_resolve_pipeline_layout: vk::PipelineLayout,
     overdraw_resolve_pipeline: vk::Pipeline,
     build_hzb_pipeline_layout: vk::PipelineLayout,
@@ -301,6 +302,7 @@ pub struct Renderer {
     pub cam_pos: Vec3,
     pub cam_rot: Vec2, // YX
     pub overdraw_enabled: bool,
+    pub overshade_enabled: bool,
 }
 
 const LOD_DISTANCE_BIAS: f32 = 2.0;
@@ -658,7 +660,7 @@ impl Renderer {
                 (pipeline, pipeline_layout)
             };
 
-            let (overdraw_render_pipeline, overdraw_render_pipeline_layout) = {
+            let (overdraw_render_pipeline, overshade_render_pipeline, overdraw_render_pipeline_layout) = {
                 let pipeline_layout = device
                     .create_pipeline_layout(
                         &vk::PipelineLayoutCreateInfo::default().set_layouts(&[global_set_layout, overdraw_set_layout]),
@@ -668,6 +670,7 @@ impl Renderer {
 
                 let vert_shader = create_shader_module(include_bytes!("render.vert.spirv"));
                 let frag_shader = create_shader_module(include_bytes!("overdraw.frag.spirv"));
+                let overshade_frag_shader = create_shader_module(include_bytes!("overshade.frag.spirv"));
 
                 let pipeline = device
                     .create_graphics_pipelines(
@@ -743,10 +746,85 @@ impl Renderer {
                     .next()
                     .unwrap();
 
+                let overshade_pipeline = device
+                    .create_graphics_pipelines(
+                        vk::PipelineCache::null(),
+                        &[vk::GraphicsPipelineCreateInfo::default()
+                            .push_next(
+                                &mut vk::PipelineRenderingCreateInfo::default()
+                                    .color_attachment_formats(&[])
+                                    .depth_attachment_format(vk::Format::D32_SFLOAT),
+                            )
+                            .stages(&[
+                                vk::PipelineShaderStageCreateInfo::default()
+                                    .module(vert_shader)
+                                    .stage(vk::ShaderStageFlags::VERTEX)
+                                    .name(c"main"),
+                                vk::PipelineShaderStageCreateInfo::default()
+                                    .module(overshade_frag_shader)
+                                    .stage(vk::ShaderStageFlags::FRAGMENT)
+                                    .name(c"main"),
+                            ])
+                            .vertex_input_state(&vk::PipelineVertexInputStateCreateInfo::default())
+                            .input_assembly_state(
+                                &vk::PipelineInputAssemblyStateCreateInfo::default()
+                                    .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
+                                    .primitive_restart_enable(false),
+                            )
+                            .viewport_state(
+                                &vk::PipelineViewportStateCreateInfo::default()
+                                    .viewports(&[vk::Viewport {
+                                        x: 0.,
+                                        y: 0.,
+                                        width: viewport_w as f32,
+                                        height: viewport_h as f32,
+                                        min_depth: 0.0,
+                                        max_depth: 1.0,
+                                    }])
+                                    .scissors(&[vk::Rect2D {
+                                        offset: vk::Offset2D { x: 0, y: 0 },
+                                        extent: vk::Extent2D { width: viewport_w, height: viewport_h },
+                                    }]),
+                            )
+                            .rasterization_state(
+                                &vk::PipelineRasterizationStateCreateInfo::default()
+                                    .depth_clamp_enable(false)
+                                    .rasterizer_discard_enable(false)
+                                    .polygon_mode(vk::PolygonMode::FILL)
+                                    .line_width(1.0)
+                                    .cull_mode(vk::CullModeFlags::BACK)
+                                    .front_face(vk::FrontFace::CLOCKWISE)
+                                    .depth_bias_enable(false),
+                            )
+                            .multisample_state(
+                                &vk::PipelineMultisampleStateCreateInfo::default()
+                                    .sample_shading_enable(false)
+                                    .rasterization_samples(vk::SampleCountFlags::TYPE_1),
+                            )
+                            .color_blend_state(
+                                &vk::PipelineColorBlendStateCreateInfo::default()
+                                    .logic_op_enable(false)
+                                    .attachments(&[]),
+                            )
+                            .depth_stencil_state(
+                                &vk::PipelineDepthStencilStateCreateInfo::default()
+                                    .depth_test_enable(true)
+                                    .depth_write_enable(true)
+                                    .depth_compare_op(vk::CompareOp::GREATER),
+                            )
+                            .layout(pipeline_layout)],
+                        None,
+                    )
+                    .unwrap()
+                    .into_iter()
+                    .next()
+                    .unwrap();
+
                 device.destroy_shader_module(vert_shader, None);
                 device.destroy_shader_module(frag_shader, None);
+                device.destroy_shader_module(overshade_frag_shader, None);
 
-                (pipeline, pipeline_layout)
+                (pipeline, overshade_pipeline, pipeline_layout)
             };
 
             let (overdraw_resolve_pipeline, overdraw_resolve_pipeline_layout) = {
@@ -1098,6 +1176,7 @@ impl Renderer {
                 render_pipeline,
                 overdraw_render_pipeline_layout,
                 overdraw_render_pipeline,
+                overshade_render_pipeline,
                 overdraw_resolve_pipeline_layout,
                 overdraw_resolve_pipeline,
                 build_hzb_pipeline_layout,
@@ -1146,6 +1225,7 @@ impl Renderer {
                 cam_pos: Vec3::new(0., 0., 3.),
                 cam_rot: <_>::default(),
                 overdraw_enabled: false,
+                overshade_enabled: false,
             }
         }
     }
@@ -1258,6 +1338,8 @@ impl Renderer {
         let overdraw_set = self.overdraw_sets[frame_index];
         let frame_global_buffer = &self.frame_global_buffers[frame_index];
         let overdraw_enabled = self.overdraw_enabled;
+        let overshade_enabled = self.overshade_enabled;
+        let debug_draw_enabled = overdraw_enabled || overshade_enabled;
         let hzb_base_width = self.core.surface_extent.width.div_ceil(2).max(1);
         let hzb_base_height = self.core.surface_extent.height.div_ceil(2).max(1);
 
@@ -1289,7 +1371,7 @@ impl Renderer {
             let swapchain_view = self.swapchain.views[image_index as usize];
             let overdraw_image = &overdraw_images[frame_index];
 
-            if self.overdraw_enabled {
+            if debug_draw_enabled {
                 let swapchain_info = [vk::DescriptorImageInfo::default()
                     .image_view(swapchain_view)
                     .image_layout(vk::ImageLayout::GENERAL)];
@@ -1505,7 +1587,7 @@ impl Renderer {
                     .layer_count(1)
                     .depth_attachment(&depth_attachment);
 
-                if overdraw_enabled {
+                if debug_draw_enabled {
                     self.device.cmd_clear_color_image(
                         cmd,
                         overdraw_image.vk_handle(),
@@ -1542,7 +1624,15 @@ impl Renderer {
                         &[global_set, overdraw_set],
                         &[],
                     );
-                    self.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, self.overdraw_render_pipeline);
+                    self.device.cmd_bind_pipeline(
+                        cmd,
+                        vk::PipelineBindPoint::GRAPHICS,
+                        if overshade_enabled {
+                            self.overshade_render_pipeline
+                        } else {
+                            self.overdraw_render_pipeline
+                        },
+                    );
                 } else {
                     // Swapchain image must move from presentable usage to color attachment usage for the normal render
                     // path.
@@ -1756,7 +1846,7 @@ impl Renderer {
                     .layer_count(1)
                     .depth_attachment(&depth_attachment);
 
-                if overdraw_enabled {
+                if debug_draw_enabled {
                     self.device.cmd_begin_rendering(cmd, &render_info.color_attachments(&[]));
                     self.device.cmd_bind_descriptor_sets(
                         cmd,
@@ -1802,7 +1892,7 @@ impl Renderer {
 
                 self.device.cmd_end_rendering(cmd);
 
-                if overdraw_enabled {
+                if debug_draw_enabled {
                     // In overdraw mode, the swapchain image becomes a storage image for the resolve compute pass.
                     self.device.cmd_pipeline_barrier2(
                         cmd,
@@ -1846,7 +1936,7 @@ impl Renderer {
                     );
                 }
 
-                if !overdraw_enabled {
+                if !debug_draw_enabled {
                     // Hand the swapchain image from color attachment output to presentation.
                     self.device.cmd_pipeline_barrier2(
                         cmd,
@@ -1993,7 +2083,7 @@ impl Renderer {
                         .wait_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
                             .semaphore(pipeline_semaphore)
                             .value(PipelineStage::LateDraw.done_value(fif_generation as usize))
-                            .stage_mask(match overdraw_enabled {
+                            .stage_mask(match debug_draw_enabled {
                                 true => vk::PipelineStageFlags2::TOP_OF_PIPE,
                                 false => vk::PipelineStageFlags2::COMPUTE_SHADER,
                             })])

@@ -146,6 +146,16 @@ fn main() {
                         KeyCode::KeyD => &mut d_down,
                         KeyCode::KeyO if state == ElementState::Pressed => {
                             renderer.overdraw_enabled = !renderer.overdraw_enabled;
+                            if renderer.overdraw_enabled {
+                                renderer.overshade_enabled = false;
+                            }
+                            return;
+                        }
+                        KeyCode::KeyP if state == ElementState::Pressed => {
+                            renderer.overshade_enabled = !renderer.overshade_enabled;
+                            if renderer.overshade_enabled {
+                                renderer.overdraw_enabled = false;
+                            }
                             return;
                         }
                         KeyCode::KeyZ if state == ElementState::Pressed => {
