@@ -1338,6 +1338,16 @@ impl Renderer {
                         });
                     }
 
+                    // Sort objects by camera distance.
+                    // TODO: consider gpu sorting?
+                    object_dispatch.sort_unstable_by(|a, b| {
+                        let a_pos = object_data[usize::from(a.0)].position;
+                        let b_pos = object_data[usize::from(b.0)].position;
+                        let a_distance = (self.cam_pos - a_pos).length_squared();
+                        let b_distance = (self.cam_pos - b_pos).length_squared();
+                        a_distance.total_cmp(&b_distance)
+                    });
+
                     // Upload global descriptor data & object data.
                     // Reverse-Z projection: near maps to 1.0, infinity tends toward 0.0.
                     let projection = Mat4::perspective_infinite_reverse_rh(
@@ -1411,7 +1421,6 @@ impl Renderer {
                     );
                 },
             );
-
             record_cmd_buffer(
                 &self.device,
                 &self.profiler,
