@@ -279,7 +279,12 @@ pub struct Renderer {
     frame_global_buffers: [Buffer<GpuFrameGlobal>; MAX_FRAMES_IN_FLIGHT],
 
     // Used for sequencing stages, and other cross-frame syncing.
-    pipeline_semaphore: vk::Semaphore,
+    pipeline_semaphores: [vk::Semaphore; MAX_FRAMES_IN_FLIGHT],
+    visibility_timelines: [vk::Semaphore; VISIBILITY_BUFFER_COUNT],
+
+    // Next generation to launch for each slot.
+    fif_generations: [u64; MAX_FRAMES_IN_FLIGHT],
+    visibility_generations: [u64; VISIBILITY_BUFFER_COUNT],
 
     // Dirty flags for resource regeneration.
     swapchain_resources_dirty: bool,
@@ -308,14 +313,9 @@ impl Drop for Renderer {
 }
 
 impl Renderer {
-    unsafe fn wait_for_pipeline_stage(&self, frame: usize, stage: PipelineStage) {
+    unsafe fn wait_for_timeline(&self, semaphore: vk::Semaphore, value: u64) {
         self.device
-            .wait_semaphores(
-                &vk::SemaphoreWaitInfo::default()
-                    .semaphores(&[self.pipeline_semaphore])
-                    .values(&[stage.start_value(frame)]),
-                u64::MAX,
-            )
+            .wait_semaphores(&vk::SemaphoreWaitInfo::default().semaphores(&[semaphore]).values(&[value]), u64::MAX)
             .unwrap();
     }
 
@@ -956,17 +956,33 @@ impl Renderer {
                     .unwrap()
             });
 
-            // Semaphore for pipeline signalling.
-            let pipeline_semaphore = device
-                .create_semaphore(
-                    &vk::SemaphoreCreateInfo::default().push_next(
-                        &mut vk::SemaphoreTypeCreateInfo::default()
-                            .semaphore_type(vk::SemaphoreType::TIMELINE)
-                            .initial_value(PipelineStage::DataUpload.start_value(STARTING_FRAME)),
-                    ),
-                    None,
-                )
-                .unwrap();
+            // Timeline semaphores for per-FIF stage sequencing.
+            let pipeline_semaphores = std::array::from_fn(|_| {
+                device
+                    .create_semaphore(
+                        &vk::SemaphoreCreateInfo::default().push_next(
+                            &mut vk::SemaphoreTypeCreateInfo::default()
+                                .semaphore_type(vk::SemaphoreType::TIMELINE)
+                                .initial_value(0),
+                        ),
+                        None,
+                    )
+                    .unwrap()
+            });
+
+            // Timeline semaphores for per-visibility-slot reuse.
+            let visibility_timelines = std::array::from_fn(|_| {
+                device
+                    .create_semaphore(
+                        &vk::SemaphoreCreateInfo::default().push_next(
+                            &mut vk::SemaphoreTypeCreateInfo::default()
+                                .semaphore_type(vk::SemaphoreType::TIMELINE)
+                                .initial_value(0),
+                        ),
+                        None,
+                    )
+                    .unwrap()
+            });
 
             // Sampler.
             let hzb_sampler = device
@@ -1114,7 +1130,10 @@ impl Renderer {
                 overdraw_sets,
                 frame_global_buffers,
 
-                pipeline_semaphore,
+                pipeline_semaphores,
+                visibility_timelines,
+                fif_generations: [0; MAX_FRAMES_IN_FLIGHT],
+                visibility_generations: [0; VISIBILITY_BUFFER_COUNT],
                 swapchain_resources_dirty: true,
                 scene_resources_dirty: true,
 
@@ -1149,10 +1168,21 @@ impl Renderer {
         let frame_index = self.frame % MAX_FRAMES_IN_FLIGHT;
         let frame_count = self.frame;
         self.frame += 1;
+        let visibility_write_slot = frame_count % VISIBILITY_BUFFER_COUNT;
 
-        // Wait on the last frame associated with this frame_index to finished.
+        let fif_generation = self.fif_generations[frame_index];
+        let visibility_generation = self.visibility_generations[visibility_write_slot];
+        let pipeline_semaphore = self.pipeline_semaphores[frame_index];
+        let visibility_timeline = self.visibility_timelines[visibility_write_slot];
+
+        // Wait for the previous frame that owned this FIF slot to fully retire.
         unsafe {
-            self.wait_for_pipeline_stage(frame_count - MAX_FRAMES_IN_FLIGHT + 1, PipelineStage::DataUpload);
+            if fif_generation > 0 {
+                self.wait_for_timeline(
+                    pipeline_semaphore,
+                    PipelineStage::FrameEnd.done_value((fif_generation - 1) as usize),
+                );
+            }
         }
 
         // Advance the scene and swapchain generation managers, then free retired generations.
@@ -1230,7 +1260,6 @@ impl Renderer {
         let overdraw_enabled = self.overdraw_enabled;
         let hzb_base_width = self.core.surface_extent.width.div_ceil(2).max(1);
         let hzb_base_height = self.core.surface_extent.height.div_ceil(2).max(1);
-        let visibility_write_slot = frame_count % VISIBILITY_BUFFER_COUNT;
 
         unsafe {
             // TODO: keep this here? It's a per-FIF variable.
@@ -1844,38 +1873,41 @@ impl Renderer {
                     &[vk::SubmitInfo2::default()
                         .command_buffer_infos(&[vk::CommandBufferSubmitInfo::default().command_buffer(data_upload)])
                         .wait_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
-                            .semaphore(self.pipeline_semaphore)
-                            .value(PipelineStage::DataUpload.start_value(frame_count))
+                            .semaphore(pipeline_semaphore)
+                            .value(PipelineStage::DataUpload.start_value(fif_generation as usize))
                             .stage_mask(vk::PipelineStageFlags2::TRANSFER)])
                         .signal_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
-                            .semaphore(self.pipeline_semaphore)
-                            .value(PipelineStage::DataUpload.done_value(frame_count))
+                            .semaphore(pipeline_semaphore)
+                            .value(PipelineStage::DataUpload.done_value(fif_generation as usize))
                             .stage_mask(vk::PipelineStageFlags2::TRANSFER)])],
                     vk::Fence::null(),
                 )
                 .unwrap();
-            self.device
-                .queue_submit2(
-                    self.graphics_queue,
-                    &[vk::SubmitInfo2::default()
-                        .command_buffer_infos(&[vk::CommandBufferSubmitInfo::default().command_buffer(frustum_cull)])
-                        .wait_semaphore_infos(&[
-                            vk::SemaphoreSubmitInfo::default()
-                                .semaphore(self.pipeline_semaphore)
-                                .value(PipelineStage::FrustumCull.start_value(frame_count))
-                                .stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER),
-                            vk::SemaphoreSubmitInfo::default()
-                                .semaphore(self.pipeline_semaphore)
-                                .value(PipelineStage::FrameEnd.done_value(frame_count - VISIBILITY_DEPTH))
-                                .stage_mask(vk::PipelineStageFlags2::TRANSFER),
-                        ])
-                        .signal_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
-                            .semaphore(self.pipeline_semaphore)
-                            .value(PipelineStage::FrustumCull.done_value(frame_count))
-                            .stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)])],
-                    vk::Fence::null(),
-                )
-                .unwrap();
+            let frustum_cmd_infos = [vk::CommandBufferSubmitInfo::default().command_buffer(frustum_cull)];
+            let frustum_signal_infos = [vk::SemaphoreSubmitInfo::default()
+                .semaphore(pipeline_semaphore)
+                .value(PipelineStage::FrustumCull.done_value(fif_generation as usize))
+                .stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)];
+            let mut frustum_waits = Vec::with_capacity(2);
+            frustum_waits.push(
+                vk::SemaphoreSubmitInfo::default()
+                    .semaphore(pipeline_semaphore)
+                    .value(PipelineStage::FrustumCull.start_value(fif_generation as usize))
+                    .stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER),
+            );
+            if visibility_generation > 0 {
+                frustum_waits.push(
+                    vk::SemaphoreSubmitInfo::default()
+                        .semaphore(visibility_timeline)
+                        .value(PipelineStage::OcclusionCull.done_value((visibility_generation - 1) as usize))
+                        .stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER),
+                );
+            }
+            let frustum_submit_infos = [vk::SubmitInfo2::default()
+                .command_buffer_infos(&frustum_cmd_infos)
+                .wait_semaphore_infos(&frustum_waits)
+                .signal_semaphore_infos(&frustum_signal_infos)];
+            self.device.queue_submit2(self.graphics_queue, &frustum_submit_infos, vk::Fence::null()).unwrap();
             self.device
                 .queue_submit2(
                     self.graphics_queue,
@@ -1885,16 +1917,16 @@ impl Renderer {
                             // We can delay this wait until late_draw when overdraw mode is on, but its probably not a
                             // useful optimization.
                             vk::SemaphoreSubmitInfo::default()
-                                .semaphore(self.pipeline_semaphore)
-                                .value(PipelineStage::EarlyDraw.start_value(frame_count))
+                                .semaphore(pipeline_semaphore)
+                                .value(PipelineStage::EarlyDraw.start_value(fif_generation as usize))
                                 .stage_mask(vk::PipelineStageFlags2::DRAW_INDIRECT),
                             vk::SemaphoreSubmitInfo::default()
                                 .semaphore(image_acquired)
                                 .stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE),
                         ])
                         .signal_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
-                            .semaphore(self.pipeline_semaphore)
-                            .value(PipelineStage::EarlyDraw.done_value(frame_count))
+                            .semaphore(pipeline_semaphore)
+                            .value(PipelineStage::EarlyDraw.done_value(fif_generation as usize))
                             .stage_mask(vk::PipelineStageFlags2::BOTTOM_OF_PIPE)])],
                     vk::Fence::null(),
                 )
@@ -1905,12 +1937,12 @@ impl Renderer {
                     &[vk::SubmitInfo2::default()
                         .command_buffer_infos(&[vk::CommandBufferSubmitInfo::default().command_buffer(build_hzb)])
                         .wait_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
-                            .semaphore(self.pipeline_semaphore)
-                            .value(PipelineStage::BuildHzb.start_value(frame_count))
+                            .semaphore(pipeline_semaphore)
+                            .value(PipelineStage::BuildHzb.start_value(fif_generation as usize))
                             .stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)])
                         .signal_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
-                            .semaphore(self.pipeline_semaphore)
-                            .value(PipelineStage::BuildHzb.done_value(frame_count))
+                            .semaphore(pipeline_semaphore)
+                            .value(PipelineStage::BuildHzb.done_value(fif_generation as usize))
                             .stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)])],
                     vk::Fence::null(),
                 )
@@ -1921,13 +1953,19 @@ impl Renderer {
                     &[vk::SubmitInfo2::default()
                         .command_buffer_infos(&[vk::CommandBufferSubmitInfo::default().command_buffer(occlusion_cull)])
                         .wait_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
-                            .semaphore(self.pipeline_semaphore)
-                            .value(PipelineStage::BuildHzb.done_value(frame_count))
+                            .semaphore(pipeline_semaphore)
+                            .value(PipelineStage::BuildHzb.done_value(fif_generation as usize))
                             .stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)])
-                        .signal_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
-                            .semaphore(self.pipeline_semaphore)
-                            .value(PipelineStage::OcclusionCull.done_value(frame_count))
-                            .stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)])],
+                        .signal_semaphore_infos(&[
+                            vk::SemaphoreSubmitInfo::default()
+                                .semaphore(pipeline_semaphore)
+                                .value(PipelineStage::OcclusionCull.done_value(fif_generation as usize))
+                                .stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER),
+                            vk::SemaphoreSubmitInfo::default()
+                                .semaphore(visibility_timeline)
+                                .value(PipelineStage::OcclusionCull.done_value(visibility_generation as usize))
+                                .stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER),
+                        ])],
                     vk::Fence::null(),
                 )
                 .unwrap();
@@ -1937,12 +1975,12 @@ impl Renderer {
                     &[vk::SubmitInfo2::default()
                         .command_buffer_infos(&[vk::CommandBufferSubmitInfo::default().command_buffer(late_draw)])
                         .wait_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
-                            .semaphore(self.pipeline_semaphore)
-                            .value(PipelineStage::OcclusionCull.done_value(frame_count))
+                            .semaphore(pipeline_semaphore)
+                            .value(PipelineStage::OcclusionCull.done_value(fif_generation as usize))
                             .stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)])
                         .signal_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
-                            .semaphore(self.pipeline_semaphore)
-                            .value(PipelineStage::LateDraw.done_value(frame_count))
+                            .semaphore(pipeline_semaphore)
+                            .value(PipelineStage::LateDraw.done_value(fif_generation as usize))
                             .stage_mask(vk::PipelineStageFlags2::BOTTOM_OF_PIPE)])],
                     vk::Fence::null(),
                 )
@@ -1953,16 +1991,16 @@ impl Renderer {
                     &[vk::SubmitInfo2::default()
                         .command_buffer_infos(&[vk::CommandBufferSubmitInfo::default().command_buffer(frame_end)])
                         .wait_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
-                            .semaphore(self.pipeline_semaphore)
-                            .value(PipelineStage::LateDraw.done_value(frame_count))
+                            .semaphore(pipeline_semaphore)
+                            .value(PipelineStage::LateDraw.done_value(fif_generation as usize))
                             .stage_mask(match overdraw_enabled {
                                 true => vk::PipelineStageFlags2::TOP_OF_PIPE,
                                 false => vk::PipelineStageFlags2::COMPUTE_SHADER,
                             })])
                         .signal_semaphore_infos(&[
                             vk::SemaphoreSubmitInfo::default()
-                                .semaphore(self.pipeline_semaphore)
-                                .value(PipelineStage::FrameEnd.done_value(frame_count))
+                                .semaphore(pipeline_semaphore)
+                                .value(PipelineStage::FrameEnd.done_value(fif_generation as usize))
                                 .stage_mask(vk::PipelineStageFlags2::BOTTOM_OF_PIPE),
                             vk::SemaphoreSubmitInfo::default()
                                 .semaphore(render_finished)
@@ -1971,6 +2009,9 @@ impl Renderer {
                     vk::Fence::null(),
                 )
                 .unwrap();
+
+            self.fif_generations[frame_index] += 1;
+            self.visibility_generations[visibility_write_slot] += 1;
 
             // Swap backbuffer.
             self.swapchain
