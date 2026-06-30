@@ -58,6 +58,10 @@ impl StagingBuffer {
         self.len = 0;
     }
 
+    pub fn size(&self) -> u32 {
+        self.len
+    }
+
     fn reserve(&mut self, size: usize, alignment: usize) -> u32 {
         let aligned = ((self.len as usize + alignment - 1) / alignment) * alignment;
         let end = aligned + size;

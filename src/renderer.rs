@@ -2,10 +2,10 @@ use crate::buffer::Buffer;
 use crate::core::Core;
 use crate::glsl_types::*;
 use crate::image::{Image2D, ImageView2D};
-use crate::mesh::{MAX_LODS, Mesh, load_mesh};
+use crate::mesh::{Mesh, load_mesh};
 use crate::profiling::PipelineProfiler;
 use crate::scene::{Generation, GenerationManager, Pending};
-use crate::staging::{Partial, StagingBlock, StagingBuffer, Whole};
+use crate::staging::{StagingBlock, StagingBuffer, Whole};
 use crate::swapchain::Swapchain;
 use crate::util::{const_max, const_min, format_bytes, format_usize_commas};
 use crate::vk_helpers::*;
@@ -174,7 +174,7 @@ impl SwapchainResources {
 /* Resources that need regeneration when object set changes */
 struct SceneResources {
     indirect_cmd_buffer: Buffer<GpuDrawCommandBuffer>,
-    scene_index_buffer: Buffer<[u32]>,
+    scene_index_buffer: Buffer<[GpuIndex]>,
     frustum_passing_meshlet_buffers: [Buffer<GpuFrustumPassingMeshletBuffer>; MAX_HZB_IN_FLIGHT],
     visibility_buffers: HashMap<ObjectHandle, [Buffer<[u32]>; VISIBILITY_BUFFER_COUNT]>,
     maximum_meshlets: u32,
@@ -220,7 +220,7 @@ pub struct Renderer {
 
     /* Command pool: */
     profiler: PipelineProfiler,
-    cmd_pool: vk::CommandPool,
+    _cmd_pool: vk::CommandPool,
 
     /* Desciptor set layouts: */
     _global_set_layout: vk::DescriptorSetLayout,
@@ -251,7 +251,7 @@ pub struct Renderer {
 
     // Some cpu -> gpu resources.
     vertex_buffers: HashMap<MeshHandle, Buffer<[GpuVertex]>>,
-    index_buffers: HashMap<MeshHandle, Buffer<[u32]>>,
+    index_buffers: HashMap<MeshHandle, Buffer<[GpuIndex]>>,
     meshlet_buffers: HashMap<MeshHandle, (Buffer<[GpuMeshlet]>, HashMap<u8, Range<u16>>)>,
 
     /* Staging: */
@@ -1163,7 +1163,7 @@ impl Renderer {
                 swapchain,
 
                 profiler,
-                cmd_pool,
+                _cmd_pool: cmd_pool,
 
                 _global_set_layout: global_set_layout,
                 hzb_set_layout,
@@ -1675,7 +1675,7 @@ impl Renderer {
                 self.device.cmd_draw_indexed_indirect_count(
                     cmd,
                     indirect_cmd_buffer.vk_handle(),
-                    std::mem::size_of::<u32>() as u64,
+                    std::mem::size_of::<GpuIndex>() as u64,
                     indirect_cmd_buffer.vk_handle(),
                     0,
                     *maximum_meshlets,
@@ -1883,7 +1883,7 @@ impl Renderer {
                 self.device.cmd_draw_indexed_indirect_count(
                     cmd,
                     indirect_cmd_buffer.vk_handle(),
-                    std::mem::size_of::<u32>() as u64,
+                    std::mem::size_of::<GpuIndex>() as u64,
                     indirect_cmd_buffer.vk_handle(),
                     0,
                     *maximum_meshlets,
@@ -2145,9 +2145,11 @@ impl Renderer {
 
         //  Cycle the keys back.
         let old_world_keys = &previous_scene.map(|s| s.world_keys.clone()).unwrap_or_default();
+        let added_meshes: Vec<_> = new_world_keys.meshes.difference(&old_world_keys.meshes).copied().collect();
+        let removed_meshes: Vec<_> = old_world_keys.meshes.difference(&new_world_keys.meshes).copied().collect();
 
         // TODO: Write this comment.
-        for mesh_id in new_world_keys.meshes.iter().filter(|k| !old_world_keys.meshes.contains(k)) {
+        for mesh_id in &added_meshes {
             let mesh = self.meshes.get(mesh_id).unwrap();
 
             // Extract vertex and index information for the entire LOD set.
@@ -2200,7 +2202,7 @@ impl Renderer {
             );
 
             // Allocate index buffer.
-            let index_buffer = Buffer::<[u32]>::new(
+            let index_buffer = Buffer::<[GpuIndex]>::new(
                 &self.allocator,
                 indices.len() as u32,
                 // TODO: confirm these.
@@ -2255,7 +2257,7 @@ impl Renderer {
             scene_index_count += index_buffer.len();
         }
 
-        let scene_index_buffer = Buffer::<[u32]>::new(
+        let scene_index_buffer = Buffer::<[GpuIndex]>::new(
             &self.allocator,
             scene_index_count.max(1),
             vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
@@ -2285,7 +2287,7 @@ impl Renderer {
 
         for mesh_id in &new_world_keys.meshes {
             let index_buffer = self.index_buffers.get(mesh_id).unwrap();
-            let dst_offset = scene_index_offsets[mesh_id] as u64 * std::mem::size_of::<u32>() as u64;
+            let dst_offset = scene_index_offsets[mesh_id] as u64 * std::mem::size_of::<GpuIndex>() as u64;
             self.device.cmd_copy_buffer(
                 *staging_cmd_buffer,
                 index_buffer.vk_handle(),
@@ -2352,36 +2354,6 @@ impl Renderer {
             new_visibility_buffers.insert(*object_id, visibility_buffers);
         }
 
-        // Print some information about the scene.
-        // TODO: Move this to the end?
-        /*let object_count = new_world_keys.objects.len();
-        let meshlet_count = new_world_keys
-            .meshes
-            .iter()
-            .map(|mesh_id| self.meshlet_buffers.get(mesh_id).unwrap().0.len() as usize)
-            .sum::<usize>();
-        let new_mesh_count = new_world_keys.meshes.difference(&old_world_keys.meshes).count();
-        let index_upload_bytes = indices.len() * std::mem::size_of::<u32>();
-        let vertex_upload_bytes = new_meshes
-            .iter()
-            .map(|(_, vertices)| {
-                vertices.iter().map(|lod_vertices| lod_vertices.len()).sum::<usize>() * std::mem::size_of::<GpuVertex>()
-            })
-            .sum::<usize>();
-        let meshlet_upload_bytes = meshlet_data.len() * std::mem::size_of::<GpuMeshletInstance>();
-        let total_upload_bytes = index_upload_bytes + vertex_upload_bytes + meshlet_upload_bytes;
-        println!(
-            "New scene data:\n  objects = {}\n  meshlets = {}\n  triangles = {}\n  new_meshes = {}\n  upload = {}\n  indices = {}\n  vertices = {}\n  meshlets = {}",
-            format_usize_commas(object_count),
-            format_usize_commas(meshlet_count),
-            format_usize_commas(triangle_count),
-            format_usize_commas(new_mesh_count),
-            format_bytes(total_upload_bytes),
-            format_bytes(index_upload_bytes),
-            format_bytes(vertex_upload_bytes),
-            format_bytes(meshlet_upload_bytes),
-        );*/
-
         let object_instance_buffer = Buffer::<[GpuObjectInstance]>::new(
             &self.allocator,
             new_world_keys.objects.len() as u32,
@@ -2411,6 +2383,84 @@ impl Renderer {
                 vk_mem::MemoryUsage::AutoPreferDevice,
             )
         });
+
+        let total_meshlet_buffer_count = new_world_keys
+            .meshes
+            .iter()
+            .map(|mesh_id| self.meshlet_buffers.get(mesh_id).unwrap().0.len() as usize)
+            .sum::<usize>();
+        let total_index_count = scene_index_count as usize;
+        let total_triangle_count = total_index_count / 3;
+        let scene_index_copy_bytes = total_index_count * std::mem::size_of::<GpuIndex>();
+        let visibility_buffer_count = new_visibility_buffers.len() * VISIBILITY_BUFFER_COUNT;
+        let visibility_buffer_bytes = new_visibility_buffers
+            .values()
+            .flat_map(|buffers| buffers.iter())
+            .map(|buffer| buffer.size())
+            .sum::<usize>();
+        let object_instance_bytes = object_instance_buffer.size();
+        let indirect_cmd_bytes = indirect_cmd_buffer.size();
+        let frustum_passing_bytes = frustum_passing_meshlet_buffers.iter().map(|buffer| buffer.size()).sum::<usize>();
+        let staging_bytes_used = staging.size() as usize;
+
+        let mesh_upload_bytes = |mesh_id: &MeshHandle| -> usize {
+            self.meshlet_buffers.get(mesh_id).unwrap().0.size()
+                + self.index_buffers.get(mesh_id).unwrap().size()
+                + self.vertex_buffers.get(mesh_id).unwrap().size()
+        };
+        let added_mesh_upload_bytes = added_meshes.iter().map(mesh_upload_bytes).sum::<usize>();
+
+        println!(
+            "Scene {} created ({} staged):\n  objects = {}\n  meshes = {} (+{}, -{}, {} new mesh payload)",
+            generation,
+            format_bytes(staging_bytes_used),
+            format_usize_commas(new_world_keys.objects.len()),
+            format_usize_commas(new_world_keys.meshes.len()),
+            format_usize_commas(added_meshes.len()),
+            format_usize_commas(removed_meshes.len()),
+            format_bytes(added_mesh_upload_bytes),
+        );
+
+        for mesh_id in &added_meshes {
+            let mesh = self.meshes.get(mesh_id).unwrap();
+            let meshlet_count = mesh.lods.iter().map(|lod| lod.len()).sum::<usize>();
+            let max_lod_meshlets = mesh.lods.iter().map(|lod| lod.len()).max().unwrap_or(0);
+            let meshlet_buffer = &self.meshlet_buffers.get(mesh_id).unwrap().0;
+            let index_buffer = self.index_buffers.get(mesh_id).unwrap();
+            let vertex_buffer = self.vertex_buffers.get(mesh_id).unwrap();
+            println!(
+                "    + {:?}: lods = {}, meshlets = {} ({}) max_lod_meshlets = {}, indices = {} ({}), vertices = {} ({}), upload = {}",
+                mesh_id,
+                mesh.lod_count,
+                format_usize_commas(meshlet_count),
+                format_bytes(meshlet_buffer.size()),
+                format_usize_commas(max_lod_meshlets),
+                format_usize_commas(index_buffer.len() as usize),
+                format_bytes(index_buffer.size()),
+                format_usize_commas(vertex_buffer.len() as usize),
+                format_bytes(vertex_buffer.size()),
+                format_bytes(mesh_upload_bytes(mesh_id)),
+            );
+        }
+        for mesh_id in &removed_meshes {
+            println!("    - {:?}", mesh_id);
+        }
+        println!(
+            "  meshlet buffers = {} meshlets\n  max visible meshlets = {}\n  scene indices = {} ({} triangles, {} GPU copy)\n  scene buffers = {} objects ({}), {} indirect commands ({}), {} frustum candidates ({})\n  visibility buffers = {} buffers ({})",
+            format_usize_commas(total_meshlet_buffer_count),
+            format_usize_commas(maximum_scene_meshlets as usize),
+            format_usize_commas(total_index_count),
+            format_usize_commas(total_triangle_count),
+            format_bytes(scene_index_copy_bytes),
+            format_usize_commas(new_world_keys.objects.len()),
+            format_bytes(object_instance_bytes),
+            format_usize_commas(maximum_scene_meshlets as usize),
+            format_bytes(indirect_cmd_bytes),
+            format_usize_commas(maximum_scene_meshlets as usize),
+            format_bytes(frustum_passing_bytes),
+            format_usize_commas(visibility_buffer_count),
+            format_bytes(visibility_buffer_bytes),
+        );
 
         // Submit and let the lifetime manager decide when the upload is safe to retire.
         self.device.end_command_buffer(*staging_cmd_buffer).unwrap();
