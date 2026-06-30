@@ -125,7 +125,6 @@ void main() {
     if (visible && !was_visible) {
         uint pad0, pad1;
         pack(pad0, pad1, lookup.object_index, lookup.meshlet_index);
-        const uint i = atomicAdd(frame_global.draw_cmd_buffer.len, 1);
         const uint draw_index = atomicAdd(frame_global.draw_cmd_buffer.len, 1);
         frame_global.draw_cmd_buffer.data[draw_index] = make_draw_cmd(meshlet, object.scene_index_offset, pad0, pad1);
     }
