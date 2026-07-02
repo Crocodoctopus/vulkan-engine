@@ -232,36 +232,3 @@ fn main() {
 
     std::process::abort();
 }
-
-/*let viking_room_image = Image2D::new()
-    .extent(vk::Extent2D { width: viking_room_tex_w, height: viking_room_tex_h })
-    .format(vk::Format::R8G8B8A8_UNORM)
-    .usage(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST)
-    .build(&renderer.allocator)
-    .unwrap();
-
-let viking_room_view = unsafe {
-    ImageView2D::new()
-        .format(vk::Format::R8G8B8A8_UNORM)
-        .aspect(vk::ImageAspectFlags::COLOR)
-        .build(&renderer.device, &viking_room_image)
-        .unwrap()
-};
-
-let viking_room_sampler = renderer
-.device
-.create_sampler(
-    &vk::SamplerCreateInfo::default()
-        .mag_filter(vk::Filter::LINEAR)
-        .min_filter(vk::Filter::LINEAR)
-        .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-        .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-        .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-        .unnormalized_coordinates(false)
-        .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
-        .mip_lod_bias(0.0)
-        .min_lod(0.0)
-        .max_lod(0.0),
-    None,
-)
-.unwrap();*/

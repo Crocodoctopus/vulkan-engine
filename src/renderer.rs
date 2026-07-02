@@ -1,7 +1,7 @@
 use crate::buffer::Buffer;
 use crate::core::Core;
+use crate::image::{Image, ImageView};
 use crate::glsl_types::*;
-use crate::image::{Image2D, ImageView2D};
 use crate::mesh::{Mesh, load_mesh};
 use crate::profiling::PipelineProfiler;
 use crate::scene::{Generation, GenerationManager, Pending};
@@ -102,17 +102,17 @@ struct SwapchainResources {
     // HZB is per-frame scratch, but the ring only needs to be large enough to
     // cover the live visibility window.
     hzb_descriptor_pool: vk::DescriptorPool,
-    hzb_images: [Image2D; MAX_HZB_IN_FLIGHT],
-    hzb_build_src_views: [Box<[ImageView2D]>; MAX_HZB_IN_FLIGHT],
-    hzb_build_dst_views: [Box<[ImageView2D]>; MAX_HZB_IN_FLIGHT],
+    hzb_images: [Image; MAX_HZB_IN_FLIGHT],
+    hzb_build_src_views: [Box<[ImageView]>; MAX_HZB_IN_FLIGHT],
+    hzb_build_dst_views: [Box<[ImageView]>; MAX_HZB_IN_FLIGHT],
     hzb_sets: [vk::DescriptorSet; MAX_HZB_IN_FLIGHT],
-    overdraw_images: [Image2D; MAX_FRAMES_IN_FLIGHT],
-    overdraw_views: [ImageView2D; MAX_FRAMES_IN_FLIGHT],
+    overdraw_images: [Image; MAX_FRAMES_IN_FLIGHT],
+    overdraw_views: [ImageView; MAX_FRAMES_IN_FLIGHT],
 
     render_finished: Box<[vk::Semaphore]>,
     image_acquired_semaphores: [vk::Semaphore; MAX_FRAMES_IN_FLIGHT],
-    depth_images: [Image2D; MAX_FRAMES_IN_FLIGHT],
-    depth_views: [ImageView2D; MAX_FRAMES_IN_FLIGHT],
+    depth_images: [Image; MAX_FRAMES_IN_FLIGHT],
+    depth_views: [ImageView; MAX_FRAMES_IN_FLIGHT],
 }
 
 impl SwapchainResources {
@@ -135,22 +135,22 @@ impl SwapchainResources {
 
         for views in hzb_build_src_views {
             for view in views {
-                view.destroy(device);
+                device.destroy_image_view(view.view, None);
             }
         }
         for views in hzb_build_dst_views {
             for view in views {
-                view.destroy(device);
+                device.destroy_image_view(view.view, None);
             }
         }
-        for image in hzb_images {
-            image.destroy(allocator);
+        for mut image in hzb_images {
+            unsafe { allocator.destroy_image(image.image, &mut image.alloc) }
         }
         for view in overdraw_views {
-            view.destroy(device);
+            device.destroy_image_view(view.view, None);
         }
-        for image in overdraw_images {
-            image.destroy(allocator);
+        for mut image in overdraw_images {
+            unsafe { allocator.destroy_image(image.image, &mut image.alloc) }
         }
 
         for semaphore in render_finished {
@@ -161,10 +161,10 @@ impl SwapchainResources {
         }
 
         for view in depth_views {
-            view.destroy(device);
+            device.destroy_image_view(view.view, None);
         }
-        for image in depth_images {
-            image.destroy(allocator);
+        for mut image in depth_images {
+            unsafe { allocator.destroy_image(image.image, &mut image.alloc) }
         }
 
         device.destroy_descriptor_pool(hzb_descriptor_pool, None);
@@ -1351,10 +1351,10 @@ impl Renderer {
                     .dst_set(hzb_set)
                     .dst_binding(0)
                     .dst_array_element(0)
-                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                    .descriptor_count(1)
-                    .image_info(&[vk::DescriptorImageInfo::default()
-                        .image_view(depth_view.vk_handle())
+                        .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                        .descriptor_count(1)
+                        .image_info(&[vk::DescriptorImageInfo::default()
+                        .image_view(depth_view.view)
                         .sampler(self.hzb_sampler)
                         .image_layout(vk::ImageLayout::DEPTH_READ_ONLY_OPTIMAL)])],
                 &[],
@@ -1567,7 +1567,7 @@ impl Renderer {
 
             record_cmd_buffer(&self.device, &self.profiler, frame_index, PipelineStage::EarlyDraw, early_draw, |cmd| {
                 let depth_attachment = vk::RenderingAttachmentInfo::default()
-                    .image_view(depth_view.vk_handle())
+                    .image_view(depth_view.view)
                     .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
                     .load_op(vk::AttachmentLoadOp::CLEAR)
                     .store_op(vk::AttachmentStoreOp::STORE)
@@ -1590,7 +1590,7 @@ impl Renderer {
                 if debug_draw_enabled {
                     self.device.cmd_clear_color_image(
                         cmd,
-                        overdraw_image.vk_handle(),
+                        overdraw_image.image,
                         vk::ImageLayout::GENERAL,
                         &vk::ClearColorValue { uint32: [0, 0, 0, 0] },
                         &[vk::ImageSubresourceRange::default()
@@ -1609,7 +1609,7 @@ impl Renderer {
                             .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
                             .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER)
                             .dst_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
-                            .image(overdraw_image.vk_handle())
+                            .image(overdraw_image.image)
                             .subresource_range(COLOR_2D_SUBRESOURCE_RANGE)
                             .old_layout(vk::ImageLayout::GENERAL)
                             .new_layout(vk::ImageLayout::GENERAL)]),
@@ -1696,7 +1696,7 @@ impl Renderer {
                             .src_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
                             .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
                             .dst_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
-                            .image(hzb_image.vk_handle())
+                            .image(hzb_image.image)
                             .subresource_range(vk::ImageSubresourceRange {
                                 level_count: vk::REMAINING_MIP_LEVELS,
                                 ..COLOR_2D_SUBRESOURCE_RANGE
@@ -1712,7 +1712,7 @@ impl Renderer {
                             .src_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
                             .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
                             .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                            .image(depth_images[frame_index].vk_handle())
+                            .image(depth_images[frame_index].image)
                             .subresource_range(DEPTH_2D_SUBRESOURCE_RANGE)
                             .old_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
                             .new_layout(vk::ImageLayout::DEPTH_READ_ONLY_OPTIMAL),
@@ -1743,7 +1743,7 @@ impl Renderer {
                             .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
                             .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
                             .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                            .image(hzb_image.vk_handle())
+                            .image(hzb_image.image)
                             .subresource_range(vk::ImageSubresourceRange {
                                 base_mip_level: level,
                                 level_count: 1,
@@ -1770,7 +1770,7 @@ impl Renderer {
                             .src_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
                             .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
                             .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                            .image(hzb_image.vk_handle())
+                            .image(hzb_image.image)
                             .subresource_range(vk::ImageSubresourceRange {
                                 level_count: vk::REMAINING_MIP_LEVELS,
                                 ..COLOR_2D_SUBRESOURCE_RANGE
@@ -1785,7 +1785,7 @@ impl Renderer {
                                     | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
                             )
                             .dst_access_mask(vk::AccessFlags2::DEPTH_STENCIL_ATTACHMENT_WRITE)
-                            .image(depth_images[frame_index].vk_handle())
+                            .image(depth_images[frame_index].image)
                             .subresource_range(DEPTH_2D_SUBRESOURCE_RANGE)
                             .old_layout(vk::ImageLayout::DEPTH_READ_ONLY_OPTIMAL)
                             .new_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL),
@@ -1830,7 +1830,7 @@ impl Renderer {
 
             record_cmd_buffer(&self.device, &self.profiler, frame_index, PipelineStage::LateDraw, late_draw, |cmd| {
                 let depth_attachment = vk::RenderingAttachmentInfo::default()
-                    .image_view(depth_view.vk_handle())
+                    .image_view(depth_view.view)
                     .image_layout(vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL)
                     .load_op(vk::AttachmentLoadOp::LOAD)
                     .store_op(vk::AttachmentStoreOp::STORE);
@@ -2555,27 +2555,64 @@ impl Renderer {
             panic!("HZB mip chain exceeds reserved descriptor range: {mipmaps} mips > {MAX_HZB_MIPS}");
         }
 
+        let create_image = |extent: vk::Extent2D,
+                            format: vk::Format,
+                            usage: vk::ImageUsageFlags,
+                            mip_levels: u32|
+         -> Image {
+            let create_info = image2d_create_info()
+                .extent(extent3d_from_extent2d(extent))
+                .format(format)
+                .usage(usage)
+                .mip_levels(mip_levels);
+            let (image, alloc) =
+                unsafe { vk_mem::Alloc::create_image(&self.allocator, &create_info, &device_local_alloc()).unwrap() };
+            Image { image, alloc }
+        };
+
+        let create_view = |image: vk::Image,
+                           format: vk::Format,
+                           aspect: vk::ImageAspectFlags,
+                           base_mip_level: u32,
+                           level_count: u32|
+         -> ImageView {
+            unsafe {
+                let view = self
+                    .device
+                    .create_image_view(
+                        &vk::ImageViewCreateInfo::default()
+                            .image(image)
+                            .view_type(vk::ImageViewType::TYPE_2D)
+                            .format(format)
+                            .subresource_range(vk::ImageSubresourceRange {
+                                aspect_mask: aspect,
+                                base_mip_level,
+                                level_count,
+                                base_array_layer: 0,
+                                layer_count: 1,
+                            }),
+                        None,
+                    )
+                    .unwrap();
+                ImageView { view }
+            }
+        };
+
         /* Build the HZB images and image views: */
         let hzb_images = std::array::from_fn(|_| {
-            Image2D::new()
-                .extent(vk::Extent2D { width: hzb_width, height: hzb_height })
-                .mip_levels(mipmaps)
-                .format(vk::Format::R32_SFLOAT)
-                .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::STORAGE)
-                .build(&self.allocator)
-                .unwrap()
+            create_image(
+                vk::Extent2D { width: hzb_width, height: hzb_height },
+                vk::Format::R32_SFLOAT,
+                vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::STORAGE,
+                mipmaps,
+            )
         });
 
         let hzb_build_src_views = std::array::from_fn(|slot| {
             (0..mipmaps)
                 .into_iter()
                 .map(|level| {
-                    ImageView2D::new()
-                        .format(vk::Format::R32_SFLOAT)
-                        .aspect(vk::ImageAspectFlags::COLOR)
-                        .base_mip_level(level)
-                        .build(&self.device, &hzb_images[slot])
-                        .unwrap()
+                    create_view(hzb_images[slot].image, vk::Format::R32_SFLOAT, vk::ImageAspectFlags::COLOR, level, 1)
                 })
                 .collect::<Vec<_>>()
                 .into_boxed_slice()
@@ -2585,12 +2622,7 @@ impl Renderer {
             (0..mipmaps)
                 .into_iter()
                 .map(|level| {
-                    ImageView2D::new()
-                        .format(vk::Format::R32_SFLOAT)
-                        .aspect(vk::ImageAspectFlags::COLOR)
-                        .base_mip_level(level)
-                        .build(&self.device, &hzb_images[slot])
-                        .unwrap()
+                    create_view(hzb_images[slot].image, vk::Format::R32_SFLOAT, vk::ImageAspectFlags::COLOR, level, 1)
                 })
                 .collect::<Vec<_>>()
                 .into_boxed_slice()
@@ -2606,37 +2638,29 @@ impl Renderer {
 
         // Create depth attachment for rendering.
         let depth_images = std::array::from_fn(|_| {
-            Image2D::new()
-                .extent(self.core.surface_extent)
-                .format(vk::Format::D32_SFLOAT)
-                .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
-                .build(&self.allocator)
-                .unwrap()
+            create_image(
+                self.core.surface_extent,
+                vk::Format::D32_SFLOAT,
+                vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED,
+                1,
+            )
         });
 
         let depth_views = std::array::from_fn(|i| {
-            ImageView2D::new()
-                .format(vk::Format::D32_SFLOAT)
-                .aspect(vk::ImageAspectFlags::DEPTH)
-                .build(&self.device, &depth_images[i])
-                .unwrap()
+            create_view(depth_images[i].image, vk::Format::D32_SFLOAT, vk::ImageAspectFlags::DEPTH, 0, 1)
         });
 
         let overdraw_images = std::array::from_fn(|_| {
-            Image2D::new()
-                .extent(self.core.surface_extent)
-                .format(vk::Format::R32_UINT)
-                .usage(vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_DST)
-                .build(&self.allocator)
-                .unwrap()
+            create_image(
+                self.core.surface_extent,
+                vk::Format::R32_UINT,
+                vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_DST,
+                1,
+            )
         });
 
         let overdraw_views = std::array::from_fn(|i| {
-            ImageView2D::new()
-                .format(vk::Format::R32_UINT)
-                .aspect(vk::ImageAspectFlags::COLOR)
-                .build(&self.device, &overdraw_images[i])
-                .unwrap()
+            create_view(overdraw_images[i].image, vk::Format::R32_UINT, vk::ImageAspectFlags::COLOR, 0, 1)
         });
 
         // Write descriptors for each HZB scratch slot.
@@ -2645,7 +2669,7 @@ impl Renderer {
                 .iter()
                 .map(|image_view| {
                     vk::DescriptorImageInfo::default()
-                        .image_view(image_view.vk_handle())
+                        .image_view(image_view.view)
                         .sampler(self.hzb_sampler)
                         .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
                 })
@@ -2655,13 +2679,13 @@ impl Renderer {
                 .iter()
                 .map(|image_view| {
                     vk::DescriptorImageInfo::default()
-                        .image_view(image_view.vk_handle())
+                        .image_view(image_view.view)
                         .image_layout(vk::ImageLayout::GENERAL)
                 })
                 .collect();
 
             let depth_info = [vk::DescriptorImageInfo::default()
-                .image_view(depth_views[slot].vk_handle())
+                .image_view(depth_views[slot].view)
                 .sampler(self.hzb_sampler)
                 .image_layout(vk::ImageLayout::DEPTH_READ_ONLY_OPTIMAL)];
 
@@ -2695,7 +2719,7 @@ impl Renderer {
 
         for slot in 0..MAX_FRAMES_IN_FLIGHT {
             let overdraw_info = [vk::DescriptorImageInfo::default()
-                .image_view(overdraw_views[slot].vk_handle())
+                .image_view(overdraw_views[slot].view)
                 .image_layout(vk::ImageLayout::GENERAL)];
 
             self.device.update_descriptor_sets(
@@ -2720,7 +2744,7 @@ impl Renderer {
                         .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
                         .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
                         .dst_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
-                        .image(hzb_images[slot].vk_handle())
+                        .image(hzb_images[slot].image)
                         .subresource_range(COLOR_2D_SUBRESOURCE_RANGE.level_count(vk::REMAINING_MIP_LEVELS))
                         .old_layout(vk::ImageLayout::UNDEFINED)
                         .new_layout(vk::ImageLayout::GENERAL),
@@ -2732,7 +2756,7 @@ impl Renderer {
                     .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
                     .dst_stage_mask(vk::PipelineStageFlags2::FRAGMENT_SHADER | vk::PipelineStageFlags2::COMPUTE_SHADER)
                     .dst_access_mask(vk::AccessFlags2::SHADER_STORAGE_WRITE)
-                    .image(overdraw_images[i].vk_handle())
+                    .image(overdraw_images[i].image)
                     .subresource_range(COLOR_2D_SUBRESOURCE_RANGE)
                     .old_layout(vk::ImageLayout::UNDEFINED)
                     .new_layout(vk::ImageLayout::GENERAL)
@@ -2745,7 +2769,7 @@ impl Renderer {
                     .dst_stage_mask(
                         vk::PipelineStageFlags2::EARLY_FRAGMENT_TESTS | vk::PipelineStageFlags2::LATE_FRAGMENT_TESTS,
                     )
-                    .image(depth_images[i].vk_handle())
+                    .image(depth_images[i].image)
                     .subresource_range(
                         vk::ImageSubresourceRange::default()
                             .aspect_mask(vk::ImageAspectFlags::DEPTH)
@@ -2766,7 +2790,7 @@ impl Renderer {
             for slot in 0..SwapchainResources::HZB_SLOT_COUNT {
                 self.device.cmd_clear_color_image(
                     *staging_cmd_buffer,
-                    hzb_images[slot].vk_handle(),
+                    hzb_images[slot].image,
                     vk::ImageLayout::GENERAL,
                     &vk::ClearColorValue { float32: [0.0, 0.0, 0.0, 0.0] },
                     &[vk::ImageSubresourceRange::default()
@@ -2784,7 +2808,7 @@ impl Renderer {
                     .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
                     .dst_stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)
                     .dst_access_mask(vk::AccessFlags2::SHADER_SAMPLED_READ)
-                    .image(hzb_images[slot].vk_handle())
+                    .image(hzb_images[slot].image)
                     .subresource_range(
                         vk::ImageSubresourceRange::default()
                             .aspect_mask(vk::ImageAspectFlags::COLOR)
