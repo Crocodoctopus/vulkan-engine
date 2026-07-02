@@ -19,10 +19,22 @@ use std::path::Path;
 use std::path::PathBuf;
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
+#[derive(Debug)]
+pub struct HandleCounter(u32);
+
 #[derive(Copy, Clone, Hash, Eq, PartialEq, Ord, PartialOrd, Debug)]
-pub struct MeshHandle(pub(crate) u32);
-#[derive(Copy, Clone, Hash, Eq, PartialEq, Ord, PartialOrd, Debug)]
-pub struct ObjectHandle(pub(crate) u32);
+pub struct Handle(u32);
+
+impl Iterator for HandleCounter {
+    type Item = Handle;
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0 += 1;
+        return Some(Handle(self.0))
+    }
+}
+
+type MeshHandle = Handle;
+type ObjectHandle = Handle;
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Object {
@@ -245,7 +257,7 @@ pub struct Renderer {
 
     /* Generic resource containers: */
     cwd: PathBuf,
-    resource_counter: u32,
+    resource_counter: HandleCounter,
     objects: BTreeMap<ObjectHandle, Object>,
     meshes: BTreeMap<MeshHandle, Mesh>,
 
@@ -1185,7 +1197,7 @@ impl Renderer {
                 occlusion_cull_pipeline,
 
                 cwd: cwd.as_ref().to_owned(),
-                resource_counter: 0,
+                resource_counter: HandleCounter(0),
                 objects: BTreeMap::new(),
                 meshes: BTreeMap::new(),
 
@@ -2875,16 +2887,14 @@ impl Renderer {
         orientation: Quat,
     ) -> Option<ObjectHandle> {
         self.scene_resources_dirty = true;
-        let handle = ObjectHandle(self.resource_counter);
-        self.resource_counter += 1;
+        let handle = self.resource_counter.next().unwrap();
         self.objects.insert(handle, Object { mesh, position, scale, orientation });
         Some(handle)
     }
 
     pub fn load_mesh(&mut self, filename: impl AsRef<Path>) -> Option<MeshHandle> {
         let mesh = load_mesh(self.cwd.join(filename))?;
-        let handle = MeshHandle(self.resource_counter);
-        self.resource_counter += 1;
+        let handle = self.resource_counter.next().unwrap();
         self.meshes.insert(handle, mesh);
         return Some(handle);
     }
