@@ -1,3 +1,5 @@
+use ash::vk;
+
 pub const fn const_max<const N: usize>(values: [usize; N]) -> usize {
     let mut i = 0;
     let mut max = 0;
@@ -60,4 +62,24 @@ pub fn format_bytes(bytes: usize) -> String {
     }
 
     if unit == 0 { format!("{bytes} {}", UNITS[unit]) } else { format!("{value:.1} {}", UNITS[unit]) }
+}
+
+// Vulkan's wait any for timelines is unreliable.
+pub(crate) unsafe fn wait_semaphores_any_fallback(
+    device: &ash::Device,
+    semaphores: &[vk::Semaphore],
+    values: &[u64],
+) -> Result<(), vk::Result> {
+    debug_assert_eq!(semaphores.len(), values.len());
+
+    loop {
+        for i in 0..semaphores.len() {
+            if device.get_semaphore_counter_value(semaphores[i])? >= values[i] {
+                return Ok(());
+            }
+        }
+
+        std::hint::spin_loop();
+        std::thread::yield_now();
+    }
 }

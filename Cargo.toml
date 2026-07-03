@@ -13,3 +13,12 @@ tobj = "0.1.7"
 png = "0.17.13"
 itertools = "0.13.0"
 meshopt = "0.4.1"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+
+[profile.test]
+panic = "abort"

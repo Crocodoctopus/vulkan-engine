@@ -20,11 +20,8 @@ fn main() {
         let input = format!("resources/shaders/{shader}");
         let output_path = format!("src/{shader}.spirv");
 
-        let output = Command::new("glslc")
-            .arg(&input)
-            .args(["--target-env=vulkan1.1", "-o", &output_path])
-            .output()
-            .unwrap();
+        let output =
+            Command::new("glslc").arg(&input).args(["--target-env=vulkan1.1", "-o", &output_path]).output().unwrap();
         if !output.status.success() {
             panic!("{}", String::from_utf8_lossy(&output.stderr));
         }

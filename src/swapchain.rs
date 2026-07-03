@@ -20,6 +20,7 @@ impl Swapchain {
         } = core;
 
         // Swapchain.
+        // Ideally, we want: Mailbox, FIFO is acceptable.
         let swapchain_device = khr::swapchain::Device::new(&instance, device);
         let swapchain_image_count = 3.max(surface_capabilities.min_image_count);
         let swapchain = swapchain_device
@@ -34,7 +35,7 @@ impl Swapchain {
                     .image_sharing_mode(vk::SharingMode::EXCLUSIVE)
                     .pre_transform(surface_capabilities.current_transform)
                     .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
-                    .present_mode(vk::PresentModeKHR::FIFO)
+                    .present_mode(vk::PresentModeKHR::MAILBOX)
                     .clipped(true)
                     .image_array_layers(1),
                 None,

@@ -2,7 +2,6 @@ use ash::prelude::VkResult;
 use ash::vk;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use std::rc::Rc;
 
 use crate::renderer::MAX_FRAMES_IN_FLIGHT;
 use crate::staging::{StagingBlock, StagingBuffer};
@@ -13,28 +12,27 @@ pub(crate) struct Pending {
     pub cmd: vk::CommandBuffer,
     pub staging: StagingBuffer,
     pub timeline: vk::Semaphore,
-    pub fence: Rc<vk::Fence>,
+    pub signal_value: Generation,
 }
 
 impl Pending {
     unsafe fn free(self, device: &ash::Device, staging: &mut StagingBlock, cmd_pool: vk::CommandPool) {
         device.free_command_buffers(cmd_pool, &[self.cmd]);
         self.staging.free(staging);
-        device.destroy_fence(*self.fence, None);
     }
 }
 
-pub(crate) struct GenerationManager {
+pub(crate) struct GenerationQueue {
     current_generation: Generation,
     next_generation: Generation,
     retired_generations: BTreeSet<Generation>,
     pending_generations: BTreeMap<Generation, Pending>,
     cmd_pool: vk::CommandPool,
-    timeline_semaphore: vk::Semaphore,
+    semaphore: vk::Semaphore,
     fif_generations: [Generation; MAX_FRAMES_IN_FLIGHT],
 }
 
-impl GenerationManager {
+impl GenerationQueue {
     pub(crate) unsafe fn new(device: &ash::Device, queue_family_index: u32) -> Self {
         let cmd_pool = device
             .create_command_pool(
@@ -54,18 +52,21 @@ impl GenerationManager {
             retired_generations: BTreeSet::new(),
             pending_generations: BTreeMap::new(),
             cmd_pool,
-            timeline_semaphore,
+            semaphore: timeline_semaphore,
             fif_generations: [0; MAX_FRAMES_IN_FLIGHT],
         }
     }
 
     unsafe fn wait_for_first_pending(&mut self, device: &ash::Device) -> Option<Generation> {
         let Some((&first_pending_generation, pending)) = self.pending_generations.first_key_value() else {
-            println!("Nothing to wait on");
             return None;
         };
-        println!("Waiting for first pending generation...");
-        device.wait_for_fences(&[*pending.fence], true, u64::MAX).unwrap();
+        device
+            .wait_semaphores(
+                &vk::SemaphoreWaitInfo::default().semaphores(&[pending.timeline]).values(&[pending.signal_value]),
+                u64::MAX,
+            )
+            .unwrap();
         Some(first_pending_generation)
     }
 
@@ -110,14 +111,14 @@ impl GenerationManager {
             }
         };
 
+        let generation = self.next_generation;
         let pending = Pending {
             cmd: cmd_buffer,
             staging,
-            timeline: self.timeline_semaphore,
-            fence: Rc::new(device.create_fence(&vk::FenceCreateInfo::default(), None).unwrap()),
+            timeline: self.semaphore,
+            signal_value: generation + 1,
         };
 
-        let generation = self.next_generation;
         self.pending_generations.insert(generation, pending);
         self.next_generation = self.next_generation.wrapping_add(1);
         let pending = self.pending_generations.get_mut(&generation).unwrap();
@@ -126,7 +127,7 @@ impl GenerationManager {
 
     unsafe fn update(&mut self, device: &ash::Device, staging: &mut StagingBlock) {
         while let Some((&generation, pending)) = self.pending_generations.first_key_value() {
-            if !device.get_fence_status(*pending.fence).unwrap() {
+            if device.get_semaphore_counter_value(pending.timeline).unwrap() < pending.signal_value {
                 break;
             }
 
@@ -171,19 +172,20 @@ impl GenerationManager {
             retired_generations,
             pending_generations,
             cmd_pool,
-            timeline_semaphore,
+            semaphore: timeline_semaphore,
             ..
         } = self;
         let pending_generation_keys: Vec<_> = pending_generations.keys().copied().collect();
 
-        // Final shutdown waits for all pending work, then destroys the pool.
-        println!("Waiting for all pending generations to finish before shutdown...");
-        let pending_fences: Vec<_> = pending_generations
-            .values()
-            .map(|pending| *pending.fence)
-            .collect();
-        if !pending_fences.is_empty() {
-            device.wait_for_fences(&pending_fences, true, u64::MAX).unwrap();
+        if let Some(max_pending_signal_value) = pending_generations.values().map(|pending| pending.signal_value).max() {
+            device
+                .wait_semaphores(
+                    &vk::SemaphoreWaitInfo::default()
+                        .semaphores(&[timeline_semaphore])
+                        .values(&[max_pending_signal_value]),
+                    u64::MAX,
+                )
+                .unwrap();
         }
 
         // Free all pending resources once they are done.

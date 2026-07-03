@@ -4,11 +4,11 @@ use crate::glsl_types::*;
 use crate::image::{Image, ImageView};
 use crate::mesh::{Mesh, load_mesh};
 use crate::profiling::PipelineProfiler;
-use crate::resource_queue::{ResourceQueue, WaitStrategy};
-use crate::scene::{Generation, GenerationManager, Pending};
+use crate::rw_queue::{ResourceQueue, WaitStrategy};
+use crate::generation_queue::{Generation, GenerationQueue, Pending};
 use crate::staging::{StagingBlock, StagingBuffer, Whole};
 use crate::swapchain::Swapchain;
-use crate::util::{const_max, const_min, format_bytes, format_usize_commas};
+use crate::util::{format_bytes, format_usize_commas, wait_semaphores_any_fallback};
 use crate::vk_helpers::*;
 use ash::vk;
 use glam::*;
@@ -18,7 +18,6 @@ use std::mem::offset_of;
 use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
-use std::rc::Rc;
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 #[derive(Debug)]
@@ -67,17 +66,13 @@ pub(crate) const STAGING_PENDING_BLOCK_SIZE: u64 = 64 * MiB;
 
 pub(crate) const MAX_FRAMES_IN_FLIGHT: usize = 2;
 pub(crate) const VISIBILITY_DEPTH: usize = 2;
-pub(crate) const VISIBILITY_RESOURCE_QUEUE_LEN: usize = MAX_FRAMES_IN_FLIGHT * 3;
-pub(crate) const STARTING_FRAME: usize = const_max([MAX_FRAMES_IN_FLIGHT, VISIBILITY_DEPTH]);
+pub(crate) const VISIBILITY_RESOURCE_QUEUE_LEN: usize = VISIBILITY_DEPTH + MAX_FRAMES_IN_FLIGHT;
 
 // Dedicated HZB/occlusion descriptor set.
 pub(crate) const MAX_HZB_DIMENSION: u32 = 8192;
 pub(crate) const MAX_HZB_MIPS: u32 = MAX_HZB_DIMENSION.div_ceil(2).ilog2() + 1;
 pub(crate) const HZB_SAMPLED_IMAGE_CAPACITY: u32 = 1 + MAX_HZB_MIPS;
 pub(crate) const HZB_STORAGE_IMAGE_CAPACITY: u32 = MAX_HZB_MIPS;
-
-// The maximum number of FIF that can be in the BuildHzb of OcclusionCull phase of the pipeline.
-pub(crate) const MAX_HZB_IN_FLIGHT: usize = const_min([MAX_FRAMES_IN_FLIGHT, VISIBILITY_DEPTH]);
 
 /*Generate index
 Plan:
@@ -103,12 +98,12 @@ pub(crate) enum PipelineStage {
 impl PipelineStage {
     const COUNT: usize = Self::FrameEnd as usize + 1;
 
-    const fn start_value(self, frame: usize) -> u64 {
-        frame as u64 * Self::COUNT as u64 + self as u64
+    const fn wait_value(self, base: u64) -> u64 {
+        base as u64 as u64 + self as u64
     }
 
-    const fn done_value(self, frame: usize) -> u64 {
-        self.start_value(frame) + 1
+    const fn signal_value(self, base: u64) -> u64 {
+        self.wait_value(base) + 1
     }
 }
 
@@ -116,10 +111,10 @@ struct SwapchainResources {
     // HZB is per-frame scratch, but the ring only needs to be large enough to
     // cover the live visibility window.
     hzb_descriptor_pool: vk::DescriptorPool,
-    hzb_images: [Image; MAX_HZB_IN_FLIGHT],
-    hzb_build_src_views: [Box<[ImageView]>; MAX_HZB_IN_FLIGHT],
-    hzb_build_dst_views: [Box<[ImageView]>; MAX_HZB_IN_FLIGHT],
-    hzb_sets: [vk::DescriptorSet; MAX_HZB_IN_FLIGHT],
+    hzb_images: [Image; MAX_FRAMES_IN_FLIGHT],
+    hzb_build_src_views: [Box<[ImageView]>; MAX_FRAMES_IN_FLIGHT],
+    hzb_build_dst_views: [Box<[ImageView]>; MAX_FRAMES_IN_FLIGHT],
+    hzb_sets: [vk::DescriptorSet; MAX_FRAMES_IN_FLIGHT],
     overdraw_images: [Image; MAX_FRAMES_IN_FLIGHT],
     overdraw_views: [ImageView; MAX_FRAMES_IN_FLIGHT],
 
@@ -130,8 +125,6 @@ struct SwapchainResources {
 }
 
 impl SwapchainResources {
-    const HZB_SLOT_COUNT: usize = MAX_HZB_IN_FLIGHT;
-
     unsafe fn free(self, device: &ash::Device, allocator: &vk_mem::Allocator) {
         let Self {
             hzb_descriptor_pool,
@@ -189,7 +182,7 @@ impl SwapchainResources {
 struct SceneResources {
     indirect_cmd_buffer: Buffer<GpuDrawCommandBuffer>,
     scene_index_buffer: Buffer<[GpuIndex]>,
-    frustum_passing_meshlet_buffers: [Buffer<GpuFrustumPassingMeshletBuffer>; MAX_HZB_IN_FLIGHT],
+    frustum_passing_meshlet_buffers: [Buffer<GpuFrustumPassingMeshletBuffer>; MAX_FRAMES_IN_FLIGHT],
     visibility_buffers: HashMap<ObjectHandle, ResourceQueue<Buffer<[u32]>>>,
     maximum_meshlets: u32,
 
@@ -295,18 +288,20 @@ pub struct Renderer {
 
     // Used for sequencing stages, and other cross-frame syncing.
     pipeline_semaphores: [vk::Semaphore; MAX_FRAMES_IN_FLIGHT],
-    fif_fences: [vk::Fence; MAX_FRAMES_IN_FLIGHT],
 
-    // Next generation to launch for each slot.
-    fif_generations: [u64; MAX_FRAMES_IN_FLIGHT],
+    // Scene generation currently associated with each FIF slot.
+    fif_scene_generations: [Generation; MAX_FRAMES_IN_FLIGHT],
+
+    // Next frame timeline wait value for each slot.
+    fif_timeline_waits: [u64; MAX_FRAMES_IN_FLIGHT],
 
     // Dirty flags for resource regeneration.
     swapchain_resources_dirty: bool,
     scene_resources_dirty: bool,
 
     // When rendering a FIF.
-    scene_generation_manager: GenerationManager,
-    swapchain_generation_manager: GenerationManager,
+    scene_generation_manager: GenerationQueue,
+    swapchain_generation_manager: GenerationQueue,
     scene_resources: BTreeMap<Generation, SceneResources>,
     swapchain_resources: BTreeMap<Generation, SwapchainResources>,
 
@@ -328,12 +323,6 @@ impl Drop for Renderer {
 }
 
 impl Renderer {
-    unsafe fn wait_for_timeline(&self, semaphore: vk::Semaphore, value: u64) {
-        self.device
-            .wait_semaphores(&vk::SemaphoreWaitInfo::default().semaphores(&[semaphore]).values(&[value]), u64::MAX)
-            .unwrap();
-    }
-
     pub fn new(
         cwd: impl AsRef<Path>,
         viewport_w: u32,
@@ -422,7 +411,7 @@ impl Renderer {
             // Build swapchain from core.
             let swapchain = Swapchain::new(&core, &device);
 
-            let profiler = PipelineProfiler::new(&device);
+            let profiler = PipelineProfiler::new(&device, queue_family_index, graphics_queue);
 
             // Descriptor set layout for all programs.
             let global_set_layout = device
@@ -970,29 +959,6 @@ impl Renderer {
             let mut staging = StagingBlock::new(&allocator, STAGING_ARENA_SIZE);
             let staging_buffers = std::array::from_fn(|_| StagingBuffer::new(&mut staging, STAGING_FIF_BLOCK_SIZE));
 
-            let staging_cmd_buffer = device
-                .allocate_command_buffers(
-                    &vk::CommandBufferAllocateInfo::default()
-                        .command_pool(cmd_pool)
-                        .level(vk::CommandBufferLevel::PRIMARY)
-                        .command_buffer_count(1),
-                )
-                .unwrap()[0];
-
-            // The renderer starts at STARTING_FRAME so the steady-state render path
-            // can read the previous timestamp slot without startup branches.
-            device.begin_command_buffer(staging_cmd_buffer, &vk::CommandBufferBeginInfo::default()).unwrap();
-            profiler.bootstrap_queries(&device, staging_cmd_buffer);
-            device.end_command_buffer(staging_cmd_buffer).unwrap();
-            device
-                .queue_submit(
-                    graphics_queue,
-                    &[vk::SubmitInfo::default().command_buffers(&[staging_cmd_buffer])],
-                    vk::Fence::null(),
-                )
-                .unwrap();
-            device.queue_wait_idle(graphics_queue).unwrap();
-
             //
             let global_descriptor_pool = device
                 .create_descriptor_pool(
@@ -1000,14 +966,12 @@ impl Renderer {
                         .pool_sizes(&[
                             vk::DescriptorPoolSize::default()
                                 .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                                .descriptor_count(
-                                    1024 + (SwapchainResources::HZB_SLOT_COUNT as u32 * HZB_SAMPLED_IMAGE_CAPACITY),
-                                ),
-                            vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_IMAGE).descriptor_count(
-                                1024 + (SwapchainResources::HZB_SLOT_COUNT as u32 * HZB_STORAGE_IMAGE_CAPACITY),
-                            ),
+                                .descriptor_count(1024 + (MAX_FRAMES_IN_FLIGHT as u32 * HZB_SAMPLED_IMAGE_CAPACITY)),
+                            vk::DescriptorPoolSize::default()
+                                .ty(vk::DescriptorType::STORAGE_IMAGE)
+                                .descriptor_count(1024 + (MAX_FRAMES_IN_FLIGHT as u32 * HZB_STORAGE_IMAGE_CAPACITY)),
                         ])
-                        .max_sets(1 + SwapchainResources::HZB_SLOT_COUNT as u32)
+                        .max_sets(1 + MAX_FRAMES_IN_FLIGHT as u32)
                         .flags(vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND),
                     None,
                 )
@@ -1058,12 +1022,6 @@ impl Renderer {
                         ),
                         None,
                     )
-                    .unwrap()
-            });
-
-            let fif_fences = std::array::from_fn(|_| {
-                device
-                    .create_fence(&vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED), None)
                     .unwrap()
             });
 
@@ -1123,8 +1081,8 @@ impl Renderer {
                     vk_mem::MemoryUsage::AutoPreferDevice,
                 )
             });
-            let scene_generation_manager = GenerationManager::new(&device, queue_family_index);
-            let swapchain_generation_manager = GenerationManager::new(&device, queue_family_index);
+            let scene_generation_manager = GenerationQueue::new(&device, queue_family_index);
+            let swapchain_generation_manager = GenerationQueue::new(&device, queue_family_index);
 
             for fif in 0..MAX_FRAMES_IN_FLIGHT {
                 let descriptor_buffer_infos = [vk::DescriptorBufferInfo::default()
@@ -1215,8 +1173,8 @@ impl Renderer {
                 frame_global_buffers,
 
                 pipeline_semaphores,
-                fif_fences,
-                fif_generations: [0; MAX_FRAMES_IN_FLIGHT],
+                fif_scene_generations: [0; MAX_FRAMES_IN_FLIGHT],
+                fif_timeline_waits: [0; MAX_FRAMES_IN_FLIGHT],
                 swapchain_resources_dirty: true,
                 scene_resources_dirty: true,
 
@@ -1225,7 +1183,7 @@ impl Renderer {
                 scene_resources: BTreeMap::new(),
                 swapchain_resources: BTreeMap::new(),
 
-                frame: STARTING_FRAME,
+                frame: 0,
                 cam_pos: Vec3::new(0., 0., 3.),
                 cam_rot: <_>::default(),
                 overdraw_enabled: false,
@@ -1235,6 +1193,8 @@ impl Renderer {
     }
 
     pub fn render(&mut self, _timestamp: f32) {
+        self.frame += 1;
+
         if self.swapchain_resources_dirty {
             self.swapchain_resources_dirty = false;
             unsafe {
@@ -1248,32 +1208,42 @@ impl Renderer {
                 self.build_scene();
             }
         }
-        let frame_index = self.frame % MAX_FRAMES_IN_FLIGHT;
-        let frame_count = self.frame;
-        let fif_fence = self.fif_fences[frame_index];
-        self.frame += 1;
 
-        let fif_generation = self.fif_generations[frame_index];
+        // Wait for an availiable FIF slot.
+        let (frame_index, frame_timeline_base) = unsafe {
+            wait_semaphores_any_fallback(&self.device, &self.pipeline_semaphores, &self.fif_timeline_waits).unwrap();
+
+            let index = self
+                .pipeline_semaphores
+                .iter()
+                .zip(self.fif_timeline_waits.iter())
+                .enumerate()
+                .find(|(_, (semaphore, wait))| self.device.get_semaphore_counter_value(**semaphore).unwrap() == **wait)
+                .unwrap()
+                .0;
+
+            let timeline = self.fif_timeline_waits[index];
+            self.fif_timeline_waits[index] += PipelineStage::COUNT as u64;
+            (index, timeline)
+        };
+
         let pipeline_semaphore = self.pipeline_semaphores[frame_index];
-
-        unsafe {
-            self.device.wait_for_fences(&[fif_fence], true, u64::MAX).unwrap();
-        }
 
         // Advance the scene and swapchain generation managers, then free retired generations.
         let scene_generation =
             unsafe { self.scene_generation_manager.next(&self.device, &mut self.staging, frame_index) };
         let swapchain_generation =
             unsafe { self.swapchain_generation_manager.next(&self.device, &mut self.staging, frame_index) };
+        self.fif_scene_generations[frame_index] = scene_generation;
 
         // Clean any old generations.
         unsafe {
             // Scene:
-            self.scene_generation_manager.retired_scenes(&self.device, &mut self.staging).for_each(|generation| {                
-                self.scene_resources.remove(&generation).expect("Scene {generation} should exist!").free(
-                    &self.device,
-                    &self.allocator,
-                );
+            self.scene_generation_manager.retired_scenes(&self.device, &mut self.staging).for_each(|generation| {
+                self.scene_resources
+                    .remove(&generation)
+                    .expect("Scene {generation} should exist!")
+                    .free(&self.device, &self.allocator);
             });
 
             // Swapchain:
@@ -1284,7 +1254,7 @@ impl Renderer {
                     .free(&self.device, &self.allocator)
             });
         }
-        
+
         /* Post generation reserve resource extraction: */
 
         let SceneResources {
@@ -1312,13 +1282,14 @@ impl Renderer {
         } = self.swapchain_resources.get(&swapchain_generation).unwrap();
 
         let image_acquired = image_acquired_semaphores[frame_index];
-        let hzb_slot = frame_count % SwapchainResources::HZB_SLOT_COUNT;
-        let hzb_image = &hzb_images[hzb_slot];
-        let hzb_set = hzb_sets[hzb_slot];
-        let hzb_build_src_views = &hzb_build_src_views[hzb_slot];
-        let frustum_passing_meshlet_buffer = &frustum_passing_meshlet_buffers[hzb_slot];
-        let visibility_wait_strategy =
-            WaitStrategy::Timeline(pipeline_semaphore, PipelineStage::OcclusionCull.done_value(fif_generation as usize));
+        let hzb_image = &hzb_images[frame_index];
+        let hzb_set = hzb_sets[frame_index];
+        let hzb_build_src_views = &hzb_build_src_views[frame_index];
+        let frustum_passing_meshlet_buffer = &frustum_passing_meshlet_buffers[frame_index];
+        let visibility_wait_strategy = WaitStrategy {
+            semaphore: pipeline_semaphore,
+            value: PipelineStage::OcclusionCull.signal_value(frame_timeline_base),
+        };
 
         // Command buffer associated with this frame.
         let data_upload = self.cmd_buffers[frame_index][PipelineStage::DataUpload as usize];
@@ -1429,9 +1400,9 @@ impl Renderer {
                         let (visibility_buffer, previous_visibility_buffer, waits) = {
                             let visibility_queue = visibility_buffers.get_mut(handle).unwrap();
                             let previous_visibility_buffer =
-                                visibility_queue.read(&self.device, fif_fence, visibility_wait_strategy).vk_handle();
+                                visibility_queue.read(&self.device, visibility_wait_strategy).vk_handle();
                             let (visibility_buffer, waits) =
-                                visibility_queue.write(&self.device, fif_fence, visibility_wait_strategy);
+                                visibility_queue.write(&self.device, frame_index, visibility_wait_strategy).unwrap();
                             (visibility_buffer.vk_handle(), previous_visibility_buffer, waits)
                         };
                         visibility_resource_waits.extend(waits);
@@ -1972,11 +1943,11 @@ impl Renderer {
                         .command_buffer_infos(&[vk::CommandBufferSubmitInfo::default().command_buffer(data_upload)])
                         .wait_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
                             .semaphore(pipeline_semaphore)
-                            .value(PipelineStage::DataUpload.start_value(fif_generation as usize))
+                            .value(PipelineStage::DataUpload.wait_value(frame_timeline_base))
                             .stage_mask(vk::PipelineStageFlags2::TRANSFER)])
                         .signal_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
                             .semaphore(pipeline_semaphore)
-                            .value(PipelineStage::DataUpload.done_value(fif_generation as usize))
+                            .value(PipelineStage::DataUpload.signal_value(frame_timeline_base))
                             .stage_mask(vk::PipelineStageFlags2::TRANSFER)])],
                     vk::Fence::null(),
                 )
@@ -1984,13 +1955,13 @@ impl Renderer {
             let frustum_cmd_infos = [vk::CommandBufferSubmitInfo::default().command_buffer(frustum_cull)];
             let frustum_signal_infos = [vk::SemaphoreSubmitInfo::default()
                 .semaphore(pipeline_semaphore)
-                .value(PipelineStage::FrustumCull.done_value(fif_generation as usize))
+                .value(PipelineStage::FrustumCull.signal_value(frame_timeline_base))
                 .stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)];
             let mut frustum_waits = Vec::with_capacity(2 + visibility_resource_waits.len());
             frustum_waits.push(
                 vk::SemaphoreSubmitInfo::default()
                     .semaphore(pipeline_semaphore)
-                    .value(PipelineStage::FrustumCull.start_value(fif_generation as usize))
+                    .value(PipelineStage::FrustumCull.wait_value(frame_timeline_base))
                     .stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER),
             );
             frustum_waits.extend(visibility_resource_waits);
@@ -2009,7 +1980,7 @@ impl Renderer {
                             // useful optimization.
                             vk::SemaphoreSubmitInfo::default()
                                 .semaphore(pipeline_semaphore)
-                                .value(PipelineStage::EarlyDraw.start_value(fif_generation as usize))
+                                .value(PipelineStage::EarlyDraw.wait_value(frame_timeline_base))
                                 .stage_mask(vk::PipelineStageFlags2::DRAW_INDIRECT),
                             vk::SemaphoreSubmitInfo::default()
                                 .semaphore(image_acquired)
@@ -2017,7 +1988,7 @@ impl Renderer {
                         ])
                         .signal_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
                             .semaphore(pipeline_semaphore)
-                            .value(PipelineStage::EarlyDraw.done_value(fif_generation as usize))
+                            .value(PipelineStage::EarlyDraw.signal_value(frame_timeline_base))
                             .stage_mask(vk::PipelineStageFlags2::BOTTOM_OF_PIPE)])],
                     vk::Fence::null(),
                 )
@@ -2029,11 +2000,11 @@ impl Renderer {
                         .command_buffer_infos(&[vk::CommandBufferSubmitInfo::default().command_buffer(build_hzb)])
                         .wait_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
                             .semaphore(pipeline_semaphore)
-                            .value(PipelineStage::BuildHzb.start_value(fif_generation as usize))
+                            .value(PipelineStage::BuildHzb.wait_value(frame_timeline_base))
                             .stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)])
                         .signal_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
                             .semaphore(pipeline_semaphore)
-                            .value(PipelineStage::BuildHzb.done_value(fif_generation as usize))
+                            .value(PipelineStage::BuildHzb.signal_value(frame_timeline_base))
                             .stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)])],
                     vk::Fence::null(),
                 )
@@ -2045,14 +2016,12 @@ impl Renderer {
                         .command_buffer_infos(&[vk::CommandBufferSubmitInfo::default().command_buffer(occlusion_cull)])
                         .wait_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
                             .semaphore(pipeline_semaphore)
-                            .value(PipelineStage::BuildHzb.done_value(fif_generation as usize))
+                            .value(PipelineStage::BuildHzb.signal_value(frame_timeline_base))
                             .stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)])
-                        .signal_semaphore_infos(&[
-                            vk::SemaphoreSubmitInfo::default()
-                                .semaphore(pipeline_semaphore)
-                                .value(PipelineStage::OcclusionCull.done_value(fif_generation as usize))
-                                .stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER),
-                        ])],
+                        .signal_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
+                            .semaphore(pipeline_semaphore)
+                            .value(PipelineStage::OcclusionCull.signal_value(frame_timeline_base))
+                            .stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)])],
                     vk::Fence::null(),
                 )
                 .unwrap();
@@ -2063,17 +2032,15 @@ impl Renderer {
                         .command_buffer_infos(&[vk::CommandBufferSubmitInfo::default().command_buffer(late_draw)])
                         .wait_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
                             .semaphore(pipeline_semaphore)
-                            .value(PipelineStage::OcclusionCull.done_value(fif_generation as usize))
+                            .value(PipelineStage::OcclusionCull.signal_value(frame_timeline_base))
                             .stage_mask(vk::PipelineStageFlags2::COMPUTE_SHADER)])
                         .signal_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
                             .semaphore(pipeline_semaphore)
-                            .value(PipelineStage::LateDraw.done_value(fif_generation as usize))
+                            .value(PipelineStage::LateDraw.signal_value(frame_timeline_base))
                             .stage_mask(vk::PipelineStageFlags2::BOTTOM_OF_PIPE)])],
                     vk::Fence::null(),
                 )
                 .unwrap();
-            // This fence may explode.
-            self.device.reset_fences(&[fif_fence]).unwrap();
             self.device
                 .queue_submit2(
                     self.graphics_queue,
@@ -2081,7 +2048,7 @@ impl Renderer {
                         .command_buffer_infos(&[vk::CommandBufferSubmitInfo::default().command_buffer(frame_end)])
                         .wait_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
                             .semaphore(pipeline_semaphore)
-                            .value(PipelineStage::LateDraw.done_value(fif_generation as usize))
+                            .value(PipelineStage::LateDraw.signal_value(frame_timeline_base))
                             .stage_mask(match debug_draw_enabled {
                                 true => vk::PipelineStageFlags2::TOP_OF_PIPE,
                                 false => vk::PipelineStageFlags2::COMPUTE_SHADER,
@@ -2089,17 +2056,15 @@ impl Renderer {
                         .signal_semaphore_infos(&[
                             vk::SemaphoreSubmitInfo::default()
                                 .semaphore(pipeline_semaphore)
-                                .value(PipelineStage::FrameEnd.done_value(fif_generation as usize))
+                                .value(PipelineStage::FrameEnd.signal_value(frame_timeline_base))
                                 .stage_mask(vk::PipelineStageFlags2::BOTTOM_OF_PIPE),
                             vk::SemaphoreSubmitInfo::default()
                                 .semaphore(render_finished)
                                 .stage_mask(vk::PipelineStageFlags2::BOTTOM_OF_PIPE),
                         ])],
-                    fif_fence,
+                    vk::Fence::null(),
                 )
                 .unwrap();
-
-            self.fif_generations[frame_index] += 1;
 
             // Swap backbuffer.
             self.swapchain
@@ -2119,9 +2084,9 @@ impl Renderer {
         // Register generation.
         let (generation, pending) =
             self.scene_generation_manager.register(&self.device, &mut self.staging, STAGING_PENDING_BLOCK_SIZE);
-        let Pending { cmd, staging, timeline, fence } = pending;
+        let Pending { cmd, staging, timeline, signal_value } = pending;
         let timeline_wait_value = generation;
-        let timeline_signal_value = generation + 1;
+        let timeline_signal_value = *signal_value;
 
         staging.reset();
         self.device.reset_command_buffer(*cmd, vk::CommandBufferResetFlags::empty()).unwrap();
@@ -2319,7 +2284,7 @@ impl Renderer {
                 .and_then(|s| s.visibility_buffers.get_mut(object_id))
                 .map(|queue| {
                     let buffer =
-                        queue.read(&self.device, Rc::downgrade(&fence), WaitStrategy::Timeline(*timeline, timeline_signal_value));
+                        queue.read(&self.device, WaitStrategy { semaphore: *timeline, value: timeline_signal_value });
                     (buffer.vk_handle(), buffer.size())
                 });
 
@@ -2361,10 +2326,7 @@ impl Renderer {
                 }
             }
 
-            new_visibility_buffers.insert(
-                *object_id,
-                ResourceQueue::new(visibility_buffers),
-            );
+            new_visibility_buffers.insert(*object_id, ResourceQueue::new(MAX_FRAMES_IN_FLIGHT, visibility_buffers));
         }
 
         let object_instance_buffer = Buffer::<[GpuObjectInstance]>::new(
@@ -2473,19 +2435,19 @@ impl Renderer {
         // Submit and let the lifetime manager decide when the upload is safe to retire.
         self.device.end_command_buffer(*cmd).unwrap();
         self.device
-                .queue_submit2(
+            .queue_submit2(
                 self.graphics_queue,
                 &[vk::SubmitInfo2::default()
                     .command_buffer_infos(&[vk::CommandBufferSubmitInfo::default().command_buffer(*cmd)])
-                        .wait_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
+                    .wait_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
                         .semaphore(*timeline)
                         .value(timeline_wait_value)
                         .stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)])
-                        .signal_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
-                            .semaphore(*timeline)
-                            .value(timeline_signal_value)
-                            .stage_mask(vk::PipelineStageFlags2::BOTTOM_OF_PIPE)])],
-                **fence,
+                    .signal_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
+                        .semaphore(*timeline)
+                        .value(timeline_signal_value)
+                        .stage_mask(vk::PipelineStageFlags2::BOTTOM_OF_PIPE)])],
+                vk::Fence::null(),
             )
             .unwrap();
 
@@ -2512,11 +2474,11 @@ impl Renderer {
         let Pending {
             cmd: staging_cmd_buffer,
             timeline: timeline_semaphore,
-            fence: upload_fence,
+            signal_value: timeline_signal_value,
             ..
         } = pending;
         let timeline_wait_value = generation;
-        let timeline_signal_value = generation + 1;
+        let timeline_signal_value = *timeline_signal_value;
 
         /* Write command buffer and queue. */
         self.device.reset_command_buffer(*staging_cmd_buffer, vk::CommandBufferResetFlags::empty()).unwrap();
@@ -2529,22 +2491,22 @@ impl Renderer {
                     .pool_sizes(&[
                         vk::DescriptorPoolSize::default()
                             .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-                            .descriptor_count(SwapchainResources::HZB_SLOT_COUNT as u32 * HZB_SAMPLED_IMAGE_CAPACITY),
+                            .descriptor_count(MAX_FRAMES_IN_FLIGHT as u32 * HZB_SAMPLED_IMAGE_CAPACITY),
                         vk::DescriptorPoolSize::default()
                             .ty(vk::DescriptorType::STORAGE_IMAGE)
-                            .descriptor_count(SwapchainResources::HZB_SLOT_COUNT as u32 * HZB_STORAGE_IMAGE_CAPACITY),
+                            .descriptor_count(MAX_FRAMES_IN_FLIGHT as u32 * HZB_STORAGE_IMAGE_CAPACITY),
                     ])
-                    .max_sets(SwapchainResources::HZB_SLOT_COUNT as u32)
+                    .max_sets(MAX_FRAMES_IN_FLIGHT as u32)
                     .flags(vk::DescriptorPoolCreateFlags::UPDATE_AFTER_BIND),
                 None,
             )
             .unwrap();
-        let hzb_sets: [vk::DescriptorSet; SwapchainResources::HZB_SLOT_COUNT] = self
+        let hzb_sets: [vk::DescriptorSet; MAX_FRAMES_IN_FLIGHT] = self
             .device
             .allocate_descriptor_sets(
                 &vk::DescriptorSetAllocateInfo::default()
                     .descriptor_pool(hzb_descriptor_pool)
-                    .set_layouts(&[self.hzb_set_layout; SwapchainResources::HZB_SLOT_COUNT]),
+                    .set_layouts(&[self.hzb_set_layout; MAX_FRAMES_IN_FLIGHT]),
             )
             .unwrap()
             .try_into()
@@ -2671,7 +2633,7 @@ impl Renderer {
         });
 
         // Write descriptors for each HZB scratch slot.
-        for slot in 0..SwapchainResources::HZB_SLOT_COUNT {
+        for slot in 0..MAX_FRAMES_IN_FLIGHT {
             let hzb_src_infos: Box<_> = hzb_build_src_views[slot]
                 .iter()
                 .map(|image_view| {
@@ -2744,8 +2706,8 @@ impl Renderer {
         // Transition some of the resouces we just made.
         {
             // Start with hzb transition.
-            let mut tmp = Vec::with_capacity(SwapchainResources::HZB_SLOT_COUNT + MAX_FRAMES_IN_FLIGHT * 2);
-            for slot in 0..SwapchainResources::HZB_SLOT_COUNT {
+            let mut tmp = Vec::new();
+            for slot in 0..MAX_FRAMES_IN_FLIGHT {
                 tmp.push(
                     vk::ImageMemoryBarrier2::default()
                         .src_stage_mask(vk::PipelineStageFlags2::TOP_OF_PIPE)
@@ -2794,7 +2756,7 @@ impl Renderer {
             self.device
                 .cmd_pipeline_barrier2(*staging_cmd_buffer, &vk::DependencyInfo::default().image_memory_barriers(&tmp));
 
-            for slot in 0..SwapchainResources::HZB_SLOT_COUNT {
+            for slot in 0..MAX_FRAMES_IN_FLIGHT {
                 self.device.cmd_clear_color_image(
                     *staging_cmd_buffer,
                     hzb_images[slot].image,
@@ -2809,7 +2771,7 @@ impl Renderer {
                 );
             }
 
-            let tmp = Vec::from_iter((0..SwapchainResources::HZB_SLOT_COUNT).map(|slot| {
+            let tmp = Vec::from_iter((0..MAX_FRAMES_IN_FLIGHT).map(|slot| {
                 vk::ImageMemoryBarrier2::default()
                     .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
                     .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
@@ -2834,9 +2796,9 @@ impl Renderer {
             self.device.end_command_buffer(*staging_cmd_buffer).unwrap();
             self.device
                 .queue_submit2(
-                self.graphics_queue,
-                &[vk::SubmitInfo2::default()
-                    .command_buffer_infos(&[
+                    self.graphics_queue,
+                    &[vk::SubmitInfo2::default()
+                        .command_buffer_infos(&[
                             vk::CommandBufferSubmitInfo::default().command_buffer(*staging_cmd_buffer)
                         ])
                         .wait_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
@@ -2847,7 +2809,7 @@ impl Renderer {
                             .semaphore(*timeline_semaphore)
                             .value(timeline_signal_value)
                             .stage_mask(vk::PipelineStageFlags2::BOTTOM_OF_PIPE)])],
-                    **upload_fence,
+                    vk::Fence::null(),
                 )
                 .unwrap();
         };

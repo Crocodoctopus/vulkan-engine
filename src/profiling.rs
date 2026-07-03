@@ -11,7 +11,7 @@ pub(crate) struct PipelineProfiler {
 impl PipelineProfiler {
     const QUERIES_PER_FRAME: usize = 2 + PipelineStage::FrameEnd as usize * 2;
 
-    pub(crate) unsafe fn new(device: &ash::Device) -> Self {
+    pub(crate) unsafe fn new(device: &ash::Device, queue_family_index: u32, queue: vk::Queue) -> Self {
         let query_pool = device
             .create_query_pool(
                 &vk::QueryPoolCreateInfo::default()
@@ -20,6 +20,40 @@ impl PipelineProfiler {
                 None,
             )
             .unwrap();
+
+        let cmd_pool = device
+            .create_command_pool(
+                &vk::CommandPoolCreateInfo::default()
+                    .queue_family_index(queue_family_index)
+                    .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
+                None,
+            )
+            .unwrap();
+
+        let cmd = device
+            .allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(cmd_pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )
+            .unwrap()[0];
+
+        device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
+        device.cmd_reset_query_pool(cmd, query_pool, 0, (MAX_FRAMES_IN_FLIGHT * Self::QUERIES_PER_FRAME) as u32);
+        for fif in 0..MAX_FRAMES_IN_FLIGHT {
+            Self::write_total_start_to(device, query_pool, cmd, fif);
+            Self::write_total_end_to(device, query_pool, cmd, fif);
+            for stage in 0..PipelineStage::FrameEnd as usize {
+                let query = Self::query_base(fif) + 2 + stage as u32 * 2;
+                device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, query_pool, query);
+                device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, query_pool, query + 1);
+            }
+        }
+        device.end_command_buffer(cmd).unwrap();
+        device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], vk::Fence::null()).unwrap();
+        device.queue_wait_idle(queue).unwrap();
+        device.destroy_command_pool(cmd_pool, None);
 
         Self {
             query_pool,
@@ -94,17 +128,22 @@ impl PipelineProfiler {
         );
     }
 
-    pub(crate) unsafe fn bootstrap_queries(&self, device: &ash::Device, cmd: vk::CommandBuffer) {
-        device.cmd_reset_query_pool(cmd, self.query_pool, 0, (MAX_FRAMES_IN_FLIGHT * Self::QUERIES_PER_FRAME) as u32);
-        for fif in 0..MAX_FRAMES_IN_FLIGHT {
-            self.write_total_start(device, cmd, fif);
-            self.write_total_end(device, cmd, fif);
-            for stage in 0..PipelineStage::FrameEnd as usize {
-                let query = Self::query_base(fif) + 2 + stage as u32 * 2;
-                device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, self.query_pool, query);
-                device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, self.query_pool, query + 1);
-            }
-        }
+    unsafe fn write_total_start_to(device: &ash::Device, query_pool: vk::QueryPool, cmd: vk::CommandBuffer, frame_index: usize) {
+        device.cmd_write_timestamp(
+            cmd,
+            vk::PipelineStageFlags::TOP_OF_PIPE,
+            query_pool,
+            Self::query_base(frame_index),
+        );
+    }
+
+    unsafe fn write_total_end_to(device: &ash::Device, query_pool: vk::QueryPool, cmd: vk::CommandBuffer, frame_index: usize) {
+        device.cmd_write_timestamp(
+            cmd,
+            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
+            query_pool,
+            Self::query_base(frame_index) + 1,
+        );
     }
 
     pub(crate) unsafe fn read_and_accumulate(

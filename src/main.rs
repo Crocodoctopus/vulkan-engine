@@ -17,8 +17,8 @@ mod image;
 mod mesh;
 mod profiling;
 mod renderer;
-mod resource_queue;
-mod scene;
+mod rw_queue;
+mod generation_queue;
 mod staging;
 mod swapchain;
 mod util;
@@ -69,19 +69,20 @@ fn main() {
         .unwrap();
     let bunny_spacing = 0.25_f32;
     let bunny_scale = 1.4_f32;
+    const BUNNY_SIDE: usize = 16;
     let bunny_offset = Vec3::new(
-        1.5 - ((8 - 1) as f32) * 0.5 * bunny_spacing,
-        -0.25 - ((8 - 1) as f32) * 0.5 * bunny_spacing,
-        -4.0 - ((8 - 1) as f32) * 0.5 * bunny_spacing,
+        1.5 - ((BUNNY_SIDE - 1) as f32) * 0.5 * bunny_spacing,
+        -0.25 - ((BUNNY_SIDE - 1) as f32) * 0.5 * bunny_spacing,
+        -4.0 - ((BUNNY_SIDE - 1) as f32) * 0.5 * bunny_spacing,
     );
     // Deterministic per-instance jitter keeps the scene stable across runs while breaking up uniform silhouettes.
     let next_unit = |seed: &mut u32| -> f32 {
         *seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
         ((*seed >> 8) as f32) / (((u32::MAX >> 8) as f32).max(1.0))
     };
-    for z in 0..8 {
-        for y in 0..8 {
-            for x in 0..8 {
+    for z in 0..BUNNY_SIDE {
+        for y in 0..BUNNY_SIDE {
+            for x in 0..BUNNY_SIDE {
                 let position = bunny_offset
                     + Vec3::new(x as f32 * bunny_spacing, y as f32 * bunny_spacing, z as f32 * bunny_spacing);
                 let mut seed = (x as u32).wrapping_mul(73856093)
