@@ -49,6 +49,7 @@ struct ObjectInstance {
     VertexBuffer vertex_buffer;
     MeshletBuffer meshlet_buffer;
     VisibilityBuffer visibility_buffer;
+    VisibilityBuffer previous_visibility_buffer;
     uint tex_id;
     uint scene_index_offset;
 };

@@ -111,6 +111,7 @@ pub(super) struct GpuObjectInstance {
     pub vertex_buffer: vk::DeviceAddress,
     pub meshlet_buffer: vk::DeviceAddress,
     pub visibility_buffer: vk::DeviceAddress,
+    pub previous_visibility_buffer: vk::DeviceAddress,
     pub texture_id: u32,
     pub scene_index_offset: u32,
 }

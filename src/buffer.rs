@@ -14,7 +14,7 @@ pub(crate) struct Buffer<T: ?Sized> {
 impl<T: ?Sized> Drop for Buffer<T> {
     fn drop(&mut self) {
         if self.alloc.is_some() {
-            panic!("Active {} dropped implicitly", std::any::type_name::<Self>());
+            println!("WARNING: {} dropped implicitly!", std::any::type_name::<Self>());
         }
     }
 }

@@ -117,8 +117,9 @@ void main() {
     ObjectInstance object = frame_global.object_buffer.data[lookup.object_index];
     Meshlet meshlet = object.meshlet_buffer.data[lookup.meshlet_index];
     #define VISIBILITY (object.visibility_buffer.data[lookup.meshlet_index])
+    #define PREVIOUS_VISIBILITY (object.previous_visibility_buffer.data[lookup.meshlet_index])
 
-    bool was_visible = VISIBILITY != 0u;
+    bool was_visible = PREVIOUS_VISIBILITY != 0u;
     bool visible = !sphere_occluded(meshlet, object);
     VISIBILITY = uint(visible);
 

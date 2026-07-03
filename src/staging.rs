@@ -258,6 +258,6 @@ impl<D: ?Sized> UploadOp<D> for Raw<'_> {
 
 impl Drop for StagingBuffer {
     fn drop(&mut self) {
-        panic!("{} dropped implicitly; destroy staging spans explicitly", std::any::type_name::<Self>());
+        println!("WARNING: {} dropped implicitly!", std::any::type_name::<Self>());
     }
 }

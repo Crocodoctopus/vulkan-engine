@@ -17,6 +17,7 @@ mod image;
 mod mesh;
 mod profiling;
 mod renderer;
+mod resource_queue;
 mod scene;
 mod staging;
 mod swapchain;

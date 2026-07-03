@@ -29,6 +29,7 @@ void main() {
     ObjectInstance object = frame_global.object_buffer.data[object_index];
     Meshlet meshlet = object.meshlet_buffer.data[meshlet_index];
     #define VISIBILITY (object.visibility_buffer.data[meshlet_index])
+    #define PREVIOUS_VISIBILITY (object.previous_visibility_buffer.data[meshlet_index])
     
     // Frustum cull (view-space sphere test).
     vec3 center_ws = object.position + object.scale * rotate_quat(meshlet.center, object.orientation);
@@ -64,7 +65,7 @@ void main() {
     }
 
     // If it wasn't visible N frames ago, defer the draw to the late pass.
-    if (VISIBILITY == 0u) {
+    if (PREVIOUS_VISIBILITY == 0u) {
         return;
     }
 
