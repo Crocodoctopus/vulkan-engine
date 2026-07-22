@@ -20,14 +20,13 @@ struct Meshlet {
     // Culling.
     vec3 center;
     float radius;
-    vec3 cone_apex;
-    float pad0;
-    vec3 cone_axis;
+    vec3 aabb_min;
     float cone_cutoff;
-
-    // Draw cmd.
+    vec3 aabb_max;
     uint index_count;
+    vec3 cone_apex;
     uint first_index;
+    vec3 cone_axis;
 };
 
 layout (buffer_reference, scalar) readonly buffer VertexBuffer {

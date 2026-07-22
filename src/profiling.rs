@@ -128,16 +128,21 @@ impl PipelineProfiler {
         );
     }
 
-    unsafe fn write_total_start_to(device: &ash::Device, query_pool: vk::QueryPool, cmd: vk::CommandBuffer, frame_index: usize) {
-        device.cmd_write_timestamp(
-            cmd,
-            vk::PipelineStageFlags::TOP_OF_PIPE,
-            query_pool,
-            Self::query_base(frame_index),
-        );
+    unsafe fn write_total_start_to(
+        device: &ash::Device,
+        query_pool: vk::QueryPool,
+        cmd: vk::CommandBuffer,
+        frame_index: usize,
+    ) {
+        device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, query_pool, Self::query_base(frame_index));
     }
 
-    unsafe fn write_total_end_to(device: &ash::Device, query_pool: vk::QueryPool, cmd: vk::CommandBuffer, frame_index: usize) {
+    unsafe fn write_total_end_to(
+        device: &ash::Device,
+        query_pool: vk::QueryPool,
+        cmd: vk::CommandBuffer,
+        frame_index: usize,
+    ) {
         device.cmd_write_timestamp(
             cmd,
             vk::PipelineStageFlags::BOTTOM_OF_PIPE,

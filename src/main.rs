@@ -12,13 +12,13 @@ extern crate winit;
 
 mod buffer;
 mod core;
+mod generation_queue;
 mod glsl_types;
 mod image;
 mod mesh;
 mod profiling;
 mod renderer;
 mod rw_queue;
-mod generation_queue;
 mod staging;
 mod swapchain;
 mod util;

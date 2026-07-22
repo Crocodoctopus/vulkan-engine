@@ -32,7 +32,7 @@ pub(crate) struct ResourceQueue<T> {
     tails: VecDeque<TailEntry<T>>,
 }
 
-impl<T> ResourceQueue<T> {    
+impl<T> ResourceQueue<T> {
     pub(crate) fn new<I>(max_heads: usize, items: I) -> Self
     where
         I: IntoIterator<Item = T>,
@@ -53,7 +53,7 @@ impl<T> ResourceQueue<T> {
         // Check for head demotes.
         for index in 0..self.heads.len() {
             let head = &mut self.heads[index];
-            
+
             // Extract a head @ index, or skip.
             let Some(HeadEntry { wait: WaitStrategy { semaphore, value }, .. }) = head else {
                 continue;
@@ -90,7 +90,6 @@ impl<T> ResourceQueue<T> {
             for wait in tail.waits {
                 semaphores.push(wait.semaphore);
                 values.push(wait.value);
-                
             }
             items.push(tail.t);
         }
@@ -102,7 +101,7 @@ impl<T> ResourceQueue<T> {
                 .unwrap();
         }
 
-        items   
+        items
     }
 
     pub(crate) unsafe fn read(&mut self, device: &ash::Device, wait_strategy: WaitStrategy) -> &mut T {
@@ -143,6 +142,6 @@ impl<T> ResourceQueue<T> {
         self.heads[index] = Some(HeadEntry { t, wait: wait_strategy });
         let submit_infos = waits.into_iter().map(|wait_strategy| wait_strategy.submit_info()).collect::<Vec<_>>();
         // Surely we can make this not ugly.
-        Some((&mut self.heads.get_mut(index).unwrap().as_mut().unwrap().t, submit_infos)) 
+        Some((&mut self.heads.get_mut(index).unwrap().as_mut().unwrap().t, submit_infos))
     }
 }

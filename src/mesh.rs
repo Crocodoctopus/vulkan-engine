@@ -9,6 +9,8 @@ pub(crate) const MAX_LODS: usize = 8;
 pub(crate) struct Meshlet {
     pub center: [f32; 3],
     pub radius: f32,
+    pub aabb_min: [f32; 3],
+    pub aabb_max: [f32; 3],
     pub cone_apex: [f32; 3],
     pub cone_axis: [f32; 3],
     pub cone_cutoff: f32,
@@ -141,11 +143,20 @@ pub(crate) fn load_mesh(filename: impl AsRef<Path>) -> Option<Mesh> {
             .iter()
             .map(|meshlet| {
                 let bounds = meshopt::compute_meshlet_bounds_decoder(meshlet, &lod_vertices);
+                let (aabb_min, aabb_max) = meshlet.vertices.iter().fold(
+                    (Vec3::splat(f32::INFINITY), Vec3::splat(f32::NEG_INFINITY)),
+                    |(aabb_min, aabb_max), &i| {
+                        let position = lod_vertices[i as usize].position / scale;
+                        (aabb_min.min(position), aabb_max.max(position))
+                    },
+                );
                 Meshlet {
                     // Vertex positions are quantized in normalized mesh space, so bounds need
                     // to use the same normalization to stay consistent in shaders.
                     center: (Vec3::from_array(bounds.center) / scale).to_array(),
                     radius: bounds.radius / scale,
+                    aabb_min: aabb_min.to_array(),
+                    aabb_max: aabb_max.to_array(),
                     cone_apex: (Vec3::from_array(bounds.cone_apex) / scale).to_array(),
                     cone_axis: bounds.cone_axis,
                     cone_cutoff: bounds.cone_cutoff,

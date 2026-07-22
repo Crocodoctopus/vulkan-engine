@@ -1,11 +1,11 @@
 use crate::buffer::Buffer;
 use crate::core::Core;
+use crate::generation_queue::{Generation, GenerationQueue, Pending};
 use crate::glsl_types::*;
 use crate::image::{Image, ImageView};
 use crate::mesh::{Mesh, load_mesh};
 use crate::profiling::PipelineProfiler;
 use crate::rw_queue::{ResourceQueue, WaitStrategy};
-use crate::generation_queue::{Generation, GenerationQueue, Pending};
 use crate::staging::{StagingBlock, StagingBuffer, Whole};
 use crate::swapchain::Swapchain;
 use crate::util::{format_bytes, format_usize_commas, wait_semaphores_any_fallback};
@@ -2126,12 +2126,13 @@ impl Renderer {
                     meshlets.push(GpuMeshlet {
                         center: Vec3::from(meshlet.center),
                         radius: meshlet.radius,
-                        cone_apex: Vec3::from(meshlet.cone_apex),
-                        pad0: 0.,
-                        cone_axis: Vec3::from(meshlet.cone_axis),
+                        aabb_min: Vec3::from(meshlet.aabb_min),
                         cone_cutoff: meshlet.cone_cutoff,
+                        aabb_max: Vec3::from(meshlet.aabb_max),
                         index_count: meshlet.indices.len() as u32,
+                        cone_apex: Vec3::from(meshlet.cone_apex),
                         first_index: indices.len() as u32,
+                        cone_axis: Vec3::from(meshlet.cone_axis),
                     });
 
                     // Push this meshlet's indices.

@@ -92,14 +92,13 @@ pub(crate) struct GpuMeshlet {
     // Culling.
     pub center: Vec3,
     pub radius: f32,
-    pub cone_apex: Vec3,
-    pub pad0: f32,
-    pub cone_axis: Vec3,
+    pub aabb_min: Vec3,
     pub cone_cutoff: f32,
-
-    // Draw cmd.
+    pub aabb_max: Vec3,
     pub index_count: u32,
+    pub cone_apex: Vec3,
     pub first_index: u32,
+    pub cone_axis: Vec3,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
