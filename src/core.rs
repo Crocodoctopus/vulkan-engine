@@ -2,27 +2,31 @@ use ash::{khr, vk};
 use std::ffi::CStr;
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
-pub(crate) struct Core {
+pub(crate) struct VulkanCore {
     // Various Vulkan state data.
     pub _entry: ash::Entry,
     pub instance: ash::Instance,
     pub physical_device: vk::PhysicalDevice,
     pub physical_device_properties: vk::PhysicalDeviceProperties,
     pub queue_family_index: u32,
+    pub device: ash::Device,
+    pub graphics_queue: vk::Queue,
+    pub present_queue: vk::Queue,
+    pub allocator: vk_mem::Allocator,
 
     pub _surface_instance: khr::surface::Instance,
     pub surface: vk::SurfaceKHR,
     pub surface_format: vk::SurfaceFormatKHR,
     pub surface_capabilities: vk::SurfaceCapabilitiesKHR,
-    pub surface_extent: vk::Extent2D,
 }
 
-impl Core {
-    pub(crate) unsafe fn new(
-        viewport_w: u32,
-        viewport_h: u32,
-        display: impl HasDisplayHandle + HasWindowHandle,
-    ) -> Self {
+impl VulkanCore {
+    pub(crate) unsafe fn new(display: impl HasDisplayHandle + HasWindowHandle) -> Self {
+        let device_extensions = [
+            c"VK_KHR_dynamic_rendering",
+            c"VK_EXT_descriptor_indexing",
+            c"VK_KHR_swapchain",
+        ];
         let raw_display_handle = display.display_handle().unwrap().as_raw();
         let raw_window_handle = display.window_handle().unwrap().as_raw();
 
@@ -117,18 +121,76 @@ impl Core {
         })
         .expect("Could not find a suitable graphics queue.");*/
 
+        let features = vk::PhysicalDeviceFeatures::default()
+            .multi_draw_indirect(true)
+            .shader_int16(true)
+            .fragment_stores_and_atomics(true)
+            .vertex_pipeline_stores_and_atomics(true);
+        let extensions = device_extensions.map(|x: &CStr| x.as_ptr());
+
+        let device = {
+            let mut vk11features = vk::PhysicalDeviceVulkan11Features::default()
+                .shader_draw_parameters(true)
+                .storage_buffer16_bit_access(true)
+                .storage_push_constant16(true);
+
+            let mut vk12features = vk::PhysicalDeviceVulkan12Features::default()
+                .shader_int8(true)
+                .storage_buffer8_bit_access(true)
+                .draw_indirect_count(true)
+                .buffer_device_address(true)
+                .descriptor_binding_uniform_buffer_update_after_bind(true)
+                .descriptor_binding_storage_buffer_update_after_bind(true)
+                .descriptor_binding_storage_image_update_after_bind(true)
+                .descriptor_binding_partially_bound(true)
+                .descriptor_binding_sampled_image_update_after_bind(true)
+                .descriptor_indexing(true)
+                .shader_sampled_image_array_non_uniform_indexing(true)
+                .runtime_descriptor_array(true)
+                .timeline_semaphore(true);
+
+            let mut vk13features =
+                vk::PhysicalDeviceVulkan13Features::default().dynamic_rendering(true).synchronization2(true);
+
+            let priority = [1.0];
+
+            let queue_cinfo = [vk::DeviceQueueCreateInfo::default()
+                .queue_family_index(queue_family_index)
+                .queue_priorities(&priority)];
+
+            let device_cinfo = vk::DeviceCreateInfo::default()
+                .push_next(&mut vk11features)
+                .push_next(&mut vk12features)
+                .push_next(&mut vk13features)
+                .queue_create_infos(&queue_cinfo)
+                .enabled_extension_names(&extensions)
+                .enabled_features(&features);
+
+            instance.create_device(physical_device, &device_cinfo, None).unwrap()
+        };
+
+        let graphics_queue = device.get_device_queue(queue_family_index, 0);
+        let present_queue = device.get_device_queue(queue_family_index, 0);
+
+        let mut allocator_cinfo = vk_mem::AllocatorCreateInfo::new(&instance, &device, physical_device);
+        allocator_cinfo.flags |= vk_mem::AllocatorCreateFlags::BUFFER_DEVICE_ADDRESS;
+        let allocator = vk_mem::Allocator::new(allocator_cinfo).unwrap();
+
         Self {
             _entry: entry,
             instance,
             physical_device,
             queue_family_index,
             physical_device_properties,
+            device,
+            graphics_queue,
+            present_queue,
+            allocator,
 
             _surface_instance: surface_instance,
             surface,
             surface_format,
             surface_capabilities,
-            surface_extent: vk::Extent2D { width: viewport_w, height: viewport_h },
         }
     }
 }
