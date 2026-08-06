@@ -550,11 +550,12 @@ struct PendingSceneState {
 
 /* Resources that need regeneration when object set changes */
 struct SceneState {
-    // Scene stable buffers.
+    // Scene-wide semi-stable buffers.
     scene_index_buffer: Buffer<[GpuIndex]>,
-    object_instance_buffer: Buffer<[GpuObjectInstance]>,
+    scene_object_instance_buffer: Buffer<[GpuObjectInstance]>,
 
     // FIF local buffers.
+    object_instance_buffer: [Buffer<[GpuObjectInstance]>; MAX_FRAMES_IN_FLIGHT],
     indirect_cmd_buffers: [Buffer<GpuDrawCommandBuffer>; MAX_FRAMES_IN_FLIGHT],
     frustum_passing_meshlet_buffers: [Buffer<GpuFrustumPassingMeshletBuffer>; MAX_FRAMES_IN_FLIGHT],
     visibility_buffers: HashMap<ObjectHandle, ResourceQueue<Buffer<[u32]>>>,
@@ -575,7 +576,10 @@ impl SceneState {
                 buffer.destroy(&allocator);
             }
         }
-        self.object_instance_buffer.destroy(&allocator);
+        self.scene_object_instance_buffer.destroy(&allocator);
+        for buffer in self.object_instance_buffer {
+            buffer.destroy(&allocator);
+        }
         for buffer in self.indirect_cmd_buffers {
             buffer.destroy(&allocator);
         }
@@ -1037,7 +1041,8 @@ impl Renderer {
             scene_index_buffer,
             visibility_buffers,
             scene_index_offsets,
-            object_instance_buffer,
+            scene_object_instance_buffer,
+            object_instance_buffer: object_instance_buffers,
             frustum_passing_meshlet_buffers,
             world_keys,
             ..
@@ -1061,6 +1066,7 @@ impl Renderer {
         let hzb_image = &hzb_images[frame_index];
         let hzb_set = hzb_sets[frame_index];
         let hzb_build_src_views = &hzb_build_src_views[frame_index];
+        let object_instance_buffer = &object_instance_buffers[frame_index];
         let indirect_cmd_buffer = &indirect_cmd_buffers[frame_index];
         let frustum_passing_meshlet_buffer = &frustum_passing_meshlet_buffers[frame_index];
         let visibility_wait_strategy = WaitStrategy {
@@ -1238,7 +1244,24 @@ impl Renderer {
                     // Upload scene data.
                     let staging = &mut self.staging_buffers[frame_index];
                     staging.reset();
-                    staging.stage(&self.core.device, cmd, &object_instance_buffer, Whole(object_data));
+                    staging.stage(&self.core.device, cmd, &scene_object_instance_buffer, Whole(object_data));
+                    self.core.device.cmd_pipeline_barrier2(
+                        cmd,
+                        &vk::DependencyInfo::default().buffer_memory_barriers(&[vk::BufferMemoryBarrier2::default()
+                            .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+                            .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
+                            .dst_stage_mask(vk::PipelineStageFlags2::TRANSFER)
+                            .dst_access_mask(vk::AccessFlags2::TRANSFER_READ)
+                            .buffer(scene_object_instance_buffer.vk_handle())
+                            .offset(0)
+                            .size(vk::WHOLE_SIZE)]),
+                    );
+                    self.core.device.cmd_copy_buffer(
+                        cmd,
+                        scene_object_instance_buffer.vk_handle(),
+                        object_instance_buffer.vk_handle(),
+                        &[vk::BufferCopy::default().size(scene_object_instance_buffer.size() as u64)],
+                    );
 
                     staging.stage(
                         &self.core.device,
@@ -2247,9 +2270,20 @@ impl Renderer {
             new_world_keys.objects.len() as u32,
             vk::BufferUsageFlags::STORAGE_BUFFER
                 | vk::BufferUsageFlags::TRANSFER_DST
+                | vk::BufferUsageFlags::TRANSFER_SRC
                 | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
             vk_mem::MemoryUsage::AutoPreferDevice,
         );
+        let object_instance_buffers = std::array::from_fn(|_| {
+            Buffer::<[GpuObjectInstance]>::new(
+                &self.core.allocator,
+                new_world_keys.objects.len() as u32,
+                vk::BufferUsageFlags::STORAGE_BUFFER
+                    | vk::BufferUsageFlags::TRANSFER_DST
+                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                vk_mem::MemoryUsage::AutoPreferDevice,
+            )
+        });
 
         let indirect_cmd_buffers = std::array::from_fn(|_| {
             Buffer::<GpuDrawCommandBuffer>::new_trailing(
@@ -2283,7 +2317,8 @@ impl Renderer {
         let total_triangle_count = total_index_count / 3;
         let scene_index_copy_bytes = total_index_count * std::mem::size_of::<GpuIndex>();
         let visibility_buffer_count = new_visibility_buffers.values().map(|queue| queue.len()).sum::<usize>();
-        let object_instance_bytes = object_instance_buffer.size();
+        let object_instance_bytes =
+            object_instance_buffer.size() + object_instance_buffers.iter().map(|buffer| buffer.size()).sum::<usize>();
         let indirect_cmd_capacity = indirect_cmd_buffers[0].len() as usize;
         let indirect_cmd_bytes = indirect_cmd_buffers.iter().map(|buffer| buffer.size()).sum::<usize>();
         let frustum_passing_capacity = frustum_passing_meshlet_buffers[0].len() as usize;
@@ -2374,7 +2409,8 @@ impl Renderer {
                 cmd,
                 staging,
                 scene_states: SceneState {
-                    object_instance_buffer,
+                    scene_object_instance_buffer: object_instance_buffer,
+                    object_instance_buffer: object_instance_buffers,
                     indirect_cmd_buffers,
                     scene_index_buffer,
                     frustum_passing_meshlet_buffers,
