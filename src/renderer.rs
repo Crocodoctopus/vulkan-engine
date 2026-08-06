@@ -632,6 +632,10 @@ pub struct Renderer {
     // Used for sequencing stages, and other cross-frame syncing.
     pipeline_semaphores: [vk::Semaphore; MAX_FRAMES_IN_FLIGHT],
 
+    // Serializes data upload across all FIF slots.
+    upload_sync_timeline: vk::Semaphore,
+    upload_sync_counter: u64,
+
     // Scene generation currently associated with each FIF slot.
     fif_scene_generations: [u64; MAX_FRAMES_IN_FLIGHT],
 
@@ -786,6 +790,16 @@ impl Renderer {
                     )
                     .unwrap()
             });
+            let upload_sync_timeline = device
+                .create_semaphore(
+                    &vk::SemaphoreCreateInfo::default().push_next(
+                        &mut vk::SemaphoreTypeCreateInfo::default()
+                            .semaphore_type(vk::SemaphoreType::TIMELINE)
+                            .initial_value(0),
+                    ),
+                    None,
+                )
+                .unwrap();
 
             // Descriptor sets.
             let global_set = device
@@ -897,6 +911,8 @@ impl Renderer {
                 frame_global_buffers,
 
                 pipeline_semaphores,
+                upload_sync_timeline,
+                upload_sync_counter: 0,
                 fif_scene_generations: [0; MAX_FRAMES_IN_FLIGHT],
                 fif_timeline_waits: [0; MAX_FRAMES_IN_FLIGHT],
                 swapchain_states_dirty: false,
@@ -1817,20 +1833,35 @@ impl Renderer {
             );
 
             // TODO: Submit all queues.
+            let upload_sync_wait_value = self.upload_sync_counter;
+            self.upload_sync_counter += 1;
+            let upload_sync_signal_value = self.upload_sync_counter;
             self.core
                 .device
                 .queue_submit2(
                     self.core.graphics_queue,
                     &[vk::SubmitInfo2::default()
                         .command_buffer_infos(&[vk::CommandBufferSubmitInfo::default().command_buffer(data_upload)])
-                        .wait_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
-                            .semaphore(pipeline_semaphore)
-                            .value(PipelineStage::DataUpload.wait_value(frame_timeline_base))
-                            .stage_mask(vk::PipelineStageFlags2::TRANSFER)])
-                        .signal_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
-                            .semaphore(pipeline_semaphore)
-                            .value(PipelineStage::DataUpload.signal_value(frame_timeline_base))
-                            .stage_mask(vk::PipelineStageFlags2::TRANSFER)])],
+                        .wait_semaphore_infos(&[
+                            vk::SemaphoreSubmitInfo::default()
+                                .semaphore(pipeline_semaphore)
+                                .value(PipelineStage::DataUpload.wait_value(frame_timeline_base))
+                                .stage_mask(vk::PipelineStageFlags2::TRANSFER),
+                            vk::SemaphoreSubmitInfo::default()
+                                .semaphore(self.upload_sync_timeline)
+                                .value(upload_sync_wait_value)
+                                .stage_mask(vk::PipelineStageFlags2::TRANSFER),
+                        ])
+                        .signal_semaphore_infos(&[
+                            vk::SemaphoreSubmitInfo::default()
+                                .semaphore(pipeline_semaphore)
+                                .value(PipelineStage::DataUpload.signal_value(frame_timeline_base))
+                                .stage_mask(vk::PipelineStageFlags2::TRANSFER),
+                            vk::SemaphoreSubmitInfo::default()
+                                .semaphore(self.upload_sync_timeline)
+                                .value(upload_sync_signal_value)
+                                .stage_mask(vk::PipelineStageFlags2::TRANSFER),
+                        ])],
                     vk::Fence::null(),
                 )
                 .unwrap();
