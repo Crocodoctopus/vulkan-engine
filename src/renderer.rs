@@ -10,9 +10,10 @@ use crate::staging::{StagingBlock, StagingBuffer, Whole};
 use crate::swapchain::Swapchain;
 use crate::util::{format_bytes, format_usize_commas, wait_semaphores_any_fallback};
 use crate::vk_helpers::*;
+use crate::world::{Object, World, WorldDiff};
 use ash::vk;
 use glam::*;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::mem::offset_of;
 use std::ops::Range;
 use std::path::Path;
@@ -33,22 +34,8 @@ impl Iterator for HandleCounter {
     }
 }
 
-type MeshHandle = Handle;
-type ObjectHandle = Handle;
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct Object {
-    pub mesh: MeshHandle,
-    pub position: Vec3,
-    pub scale: f32,
-    pub orientation: Quat,
-}
-
-#[derive(Debug, Clone, Default)]
-struct WorldKeys {
-    objects: BTreeSet<ObjectHandle>,
-    meshes: BTreeSet<MeshHandle>,
-}
+pub(crate) type MeshHandle = Handle;
+pub(crate) type ObjectHandle = Handle;
 
 #[allow(unused)]
 const B: u64 = 1;
@@ -561,7 +548,7 @@ struct SceneState {
     visibility_buffers: HashMap<ObjectHandle, ResourceQueue<Buffer<[u32]>>>,
 
     // Bookkeeping
-    world_keys: WorldKeys,
+    world: World,
     scene_index_offsets: HashMap<MeshHandle, u32>,
 }
 
@@ -1044,7 +1031,7 @@ impl Renderer {
             scene_object_instance_buffer,
             object_instance_buffer: object_instance_buffers,
             frustum_passing_meshlet_buffers,
-            world_keys,
+            world,
             ..
         } = self.scene_states.get_mut(&scene_generation).unwrap();
         let SwapchainState {
@@ -1144,7 +1131,7 @@ impl Renderer {
             );
 
             // TODO: Make command buffers better.
-            let mut object_dispatch = Vec::with_capacity(world_keys.objects.len());
+            let mut object_dispatch = Vec::with_capacity(world.objects.len());
             let visibility_resource_waits = record_cmd_buffer(
                 &self.core.device,
                 &self.profiler,
@@ -1158,8 +1145,8 @@ impl Renderer {
                         self.cam_rot[1].sin(),
                         -self.cam_rot[0].cos() * self.cam_rot[1].cos(),
                     );
-                    let mut object_data = Vec::with_capacity(world_keys.objects.len());
-                    for handle in world_keys.objects.iter() {
+                    let mut object_data = Vec::with_capacity(world.objects.len());
+                    for handle in world.objects.keys() {
                         let obj = self.objects.get(handle).unwrap();
 
                         let mesh = self.meshes.get(&obj.mesh).unwrap();
@@ -2044,16 +2031,18 @@ impl Renderer {
         self.core.device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).unwrap();
         self.core.device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
 
-        // Clone world keys.
-        let new_world_keys = WorldKeys {
-            objects: self.objects.keys().cloned().collect(),
-            meshes: self.meshes.keys().cloned().collect(),
+        let new_world = World {
+            objects: self.objects.clone(),
+            meshes: self.meshes.keys().copied().collect(),
         };
 
         let previous_scene = self.scene_states.iter_mut().next_back();
-        let old_world_keys = previous_scene.as_ref().map(|(_, scene)| scene.world_keys.clone()).unwrap_or_default();
-        let added_meshes: Vec<_> = new_world_keys.meshes.difference(&old_world_keys.meshes).copied().collect();
-        let removed_meshes: Vec<_> = old_world_keys.meshes.difference(&new_world_keys.meshes).copied().collect();
+        let previous_world = previous_scene.as_ref().map(|(_, scene)| &scene.world);
+        let world_diff = WorldDiff::between(previous_world.unwrap_or(&World::default()), &new_world);
+        // TODO: Use world_diff to choose between in-place master-buffer uploads and a new scene generation.
+        // For now build_scene remains the full-generation path.
+        let added_meshes: Vec<_> = world_diff.added_meshes.iter().copied().collect();
+        let removed_meshes: Vec<_> = world_diff.removed_meshes.iter().copied().collect();
         let mut previous_scene_visibility_buffers = previous_scene.map(|(_, scene)| &mut scene.visibility_buffers);
 
         // Upload meshes that are new to this scene generation.
@@ -2137,9 +2126,9 @@ impl Renderer {
             );
         }
 
-        let mut scene_index_offsets = HashMap::with_capacity(new_world_keys.meshes.len());
+        let mut scene_index_offsets = HashMap::with_capacity(new_world.meshes.len());
         let mut scene_index_count = 0u32;
-        for mesh_id in &new_world_keys.meshes {
+        for mesh_id in &new_world.meshes {
             let index_buffer = self.index_buffers.get(mesh_id).unwrap();
             scene_index_offsets.insert(*mesh_id, scene_index_count);
             scene_index_count += index_buffer.len();
@@ -2152,7 +2141,7 @@ impl Renderer {
             vk_mem::MemoryUsage::AutoPreferDevice,
         );
 
-        let scene_index_buffer_barriers: Vec<_> = new_world_keys
+        let scene_index_buffer_barriers: Vec<_> = new_world
             .meshes
             .iter()
             .map(|mesh_id| {
@@ -2173,7 +2162,7 @@ impl Renderer {
             &vk::DependencyInfo::default().buffer_memory_barriers(&scene_index_buffer_barriers),
         );
 
-        for mesh_id in &new_world_keys.meshes {
+        for mesh_id in &new_world.meshes {
             let index_buffer = self.index_buffers.get(mesh_id).unwrap();
             let dst_offset = scene_index_offsets[mesh_id] as u64 * std::mem::size_of::<GpuIndex>() as u64;
             self.core.device.cmd_copy_buffer(
@@ -2184,19 +2173,18 @@ impl Renderer {
             );
         }
 
-        let maximum_scene_meshlets = new_world_keys
+        let maximum_scene_meshlets = new_world
             .objects
-            .iter()
-            .map(|object_id| {
-                let object = self.objects.get(object_id).unwrap();
+            .values()
+            .map(|object| {
                 let mesh = self.meshes.get(&object.mesh).unwrap();
                 mesh.lods.iter().map(|lod| lod.len() as u32).max().unwrap_or(0)
             })
             .sum::<u32>();
 
-        let mut new_visibility_buffers = HashMap::with_capacity(new_world_keys.objects.len());
+        let mut new_visibility_buffers = HashMap::with_capacity(new_world.objects.len());
         let mut visibility_buffer_bytes = 0usize;
-        for object_id in &new_world_keys.objects {
+        for object_id in new_world.objects.keys() {
             let object = self.objects.get(object_id).unwrap();
             let mesh = self.meshes.get(&object.mesh).unwrap();
             let maximum_mesh_meshlets = mesh.lods.iter().map(|lod| lod.len()).max().unwrap_or(0);
@@ -2267,7 +2255,7 @@ impl Renderer {
 
         let object_instance_buffer = Buffer::<[GpuObjectInstance]>::new(
             &self.core.allocator,
-            new_world_keys.objects.len() as u32,
+            new_world.objects.len() as u32,
             vk::BufferUsageFlags::STORAGE_BUFFER
                 | vk::BufferUsageFlags::TRANSFER_DST
                 | vk::BufferUsageFlags::TRANSFER_SRC
@@ -2277,7 +2265,7 @@ impl Renderer {
         let object_instance_buffers = std::array::from_fn(|_| {
             Buffer::<[GpuObjectInstance]>::new(
                 &self.core.allocator,
-                new_world_keys.objects.len() as u32,
+                new_world.objects.len() as u32,
                 vk::BufferUsageFlags::STORAGE_BUFFER
                     | vk::BufferUsageFlags::TRANSFER_DST
                     | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
@@ -2308,7 +2296,7 @@ impl Renderer {
             )
         });
 
-        let total_meshlet_buffer_count = new_world_keys
+        let total_meshlet_buffer_count = new_world
             .meshes
             .iter()
             .map(|mesh_id| self.meshlet_buffers.get(mesh_id).unwrap().0.len() as usize)
@@ -2336,8 +2324,8 @@ impl Renderer {
             "Scene {} created ({} staged):\n  objects = {}\n  meshes = {} (+{}, -{}, {} new mesh payload)",
             generation,
             format_bytes(staging_bytes_used),
-            format_usize_commas(new_world_keys.objects.len()),
-            format_usize_commas(new_world_keys.meshes.len()),
+            format_usize_commas(new_world.objects.len()),
+            format_usize_commas(new_world.meshes.len()),
             format_usize_commas(added_meshes.len()),
             format_usize_commas(removed_meshes.len()),
             format_bytes(added_mesh_upload_bytes),
@@ -2374,7 +2362,7 @@ impl Renderer {
             format_usize_commas(total_index_count),
             format_usize_commas(total_triangle_count),
             format_bytes(scene_index_copy_bytes),
-            format_usize_commas(new_world_keys.objects.len()),
+            format_usize_commas(new_world.objects.len()),
             format_bytes(object_instance_bytes),
             format_usize_commas(indirect_cmd_capacity),
             format_bytes(indirect_cmd_bytes),
@@ -2416,7 +2404,7 @@ impl Renderer {
                     frustum_passing_meshlet_buffers,
                     visibility_buffers: new_visibility_buffers,
                     scene_index_offsets,
-                    world_keys: new_world_keys,
+                    world: new_world,
                 },
             },
         );

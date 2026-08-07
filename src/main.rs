@@ -23,6 +23,7 @@ mod staging;
 mod swapchain;
 mod util;
 mod vk_helpers;
+mod world;
 
 use crate::renderer::*;
 use glam::*;
