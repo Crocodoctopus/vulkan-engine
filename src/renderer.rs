@@ -2,7 +2,7 @@ use crate::buffer::Buffer;
 use crate::core::VulkanCore;
 use crate::glsl_types::*;
 use crate::image::{Image, ImageView};
-use crate::mesh::{Mesh, load_mesh};
+use crate::mesh::{GpuMesh, Mesh, PendingGpuMesh, load_mesh};
 use crate::pipelines::Pipelines;
 use crate::profiling::PipelineProfiler;
 use crate::rw_queue::{ResourceQueue, WaitStrategy};
@@ -15,7 +15,6 @@ use ash::vk;
 use glam::*;
 use std::collections::{BTreeMap, HashMap};
 use std::mem::offset_of;
-use std::ops::Range;
 use std::path::Path;
 use std::path::PathBuf;
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
@@ -594,9 +593,7 @@ pub struct Renderer {
     meshes: BTreeMap<MeshHandle, Mesh>,
 
     // Some cpu -> gpu resources.
-    vertex_buffers: HashMap<MeshHandle, Buffer<[GpuVertex]>>,
-    index_buffers: HashMap<MeshHandle, Buffer<[GpuIndex]>>,
-    meshlet_buffers: HashMap<MeshHandle, (Buffer<[GpuMeshlet]>, HashMap<u8, Range<u16>>)>,
+    gpu_meshes: HashMap<MeshHandle, GpuMesh>,
 
     /* Staging: */
     staging: StagingBlock,
@@ -883,9 +880,7 @@ impl Renderer {
                 objects: BTreeMap::new(),
                 meshes: BTreeMap::new(),
 
-                vertex_buffers: HashMap::new(),
-                index_buffers: HashMap::new(),
-                meshlet_buffers: HashMap::new(),
+                gpu_meshes: HashMap::new(),
 
                 staging,
 
@@ -1150,8 +1145,7 @@ impl Renderer {
                         let obj = self.objects.get(handle).unwrap();
 
                         let mesh = self.meshes.get(&obj.mesh).unwrap();
-                        let vertex_buffer = self.vertex_buffers.get(&obj.mesh).unwrap();
-                        let (meshlet_buffer, lod_map) = self.meshlet_buffers.get(&obj.mesh).unwrap();
+                        let gpu_mesh = self.gpu_meshes.get(&obj.mesh).unwrap();
                         let scene_index_offset = *scene_index_offsets.get(&obj.mesh).unwrap();
 
                         let distance = (self.cam_pos - obj.position).length();
@@ -1161,7 +1155,7 @@ impl Renderer {
                             * LOD_DISTANCE_BIAS;
                         let lod_id =
                             lod_ratio.log2().floor().clamp(0.0, (mesh.lod_count.saturating_sub(1)) as f32) as u8;
-                        let meshlet_subrange = lod_map[&lod_id.min(mesh.lod_count)].clone();
+                        let meshlet_subrange = gpu_mesh.meshlet_lod_to_offset[&lod_id.min(mesh.lod_count)].clone();
 
                         // Push dispatch.
                         object_dispatch.push((object_data.len() as u16, meshlet_subrange.end - meshlet_subrange.start));
@@ -1182,11 +1176,11 @@ impl Renderer {
                             scale: obj.scale * mesh.scale,
                             orientation: obj.orientation,
                             vertex_buffer: self.core.device.get_buffer_device_address(
-                                &vk::BufferDeviceAddressInfo::default().buffer(vertex_buffer.vk_handle()),
+                                &vk::BufferDeviceAddressInfo::default().buffer(gpu_mesh.vertex_buffer.vk_handle()),
                             ),
                             // This BDA is corrected for LOD subrange.
                             meshlet_buffer: self.core.device.get_buffer_device_address(
-                                &vk::BufferDeviceAddressInfo::default().buffer(meshlet_buffer.vk_handle()),
+                                &vk::BufferDeviceAddressInfo::default().buffer(gpu_mesh.meshlet_buffer.vk_handle()),
                             ) + meshlet_subrange.start as u64
                                 * std::mem::size_of::<GpuMeshlet>() as u64,
                             visibility_buffer: self.core.device.get_buffer_device_address(
@@ -2036,100 +2030,36 @@ impl Renderer {
             meshes: self.meshes.keys().copied().collect(),
         };
 
-        let previous_scene = self.scene_states.iter_mut().next_back();
+        let previous_scene = self.scene_states.iter().next_back();
         let previous_world = previous_scene.as_ref().map(|(_, scene)| &scene.world);
         let world_diff = WorldDiff::between(previous_world.unwrap_or(&World::default()), &new_world);
         // TODO: Use world_diff to choose between in-place master-buffer uploads and a new scene generation.
         // For now build_scene remains the full-generation path.
         let added_meshes: Vec<_> = world_diff.added_meshes.iter().copied().collect();
         let removed_meshes: Vec<_> = world_diff.removed_meshes.iter().copied().collect();
-        let mut previous_scene_visibility_buffers = previous_scene.map(|(_, scene)| &mut scene.visibility_buffers);
 
-        // Upload meshes that are new to this scene generation.
-        for mesh_id in &added_meshes {
-            let mesh = self.meshes.get(mesh_id).unwrap();
-
-            let mut vertices = vec![];
-            let mut indices = vec![];
-            let mut meshlets = vec![];
-            let mut meshlet_lod_to_offset = HashMap::new();
-            for lod in 0..mesh.lod_count {
-                let meshlet_offset = meshlets.len() as u16;
-
-                for meshlet in &mesh.lods[lod as usize] {
-                    meshlets.push(GpuMeshlet {
-                        center: Vec3::from(meshlet.center),
-                        radius: meshlet.radius,
-                        aabb_min: Vec3::from(meshlet.aabb_min),
-                        cone_cutoff: meshlet.cone_cutoff,
-                        aabb_max: Vec3::from(meshlet.aabb_max),
-                        index_count: meshlet.indices.len() as u32,
-                        cone_apex: Vec3::from(meshlet.cone_apex),
-                        first_index: indices.len() as u32,
-                        cone_axis: Vec3::from(meshlet.cone_axis),
-                    });
-
-                    indices.extend(meshlet.indices.iter().map(|i| *i as u32 + vertices.len() as u32));
-
-                    vertices.extend((0..meshlet.positions.len()).map(|i| GpuVertex {
-                        position: meshlet.positions[i],
-                        normal: meshlet.normals[i],
-                        uv: [0, 0],
-                    }));
-                }
-
-                meshlet_lod_to_offset.insert(lod, meshlet_offset..meshlets.len() as u16);
+        for mesh_id in &new_world.meshes {
+            if self.gpu_meshes.contains_key(mesh_id) {
+                continue;
             }
-
-            let meshlet_buffer = Buffer::<[GpuMeshlet]>::new(
-                &self.core.allocator,
-                meshlets.len() as u32,
-                vk::BufferUsageFlags::VERTEX_BUFFER
-                    | vk::BufferUsageFlags::TRANSFER_DST
-                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-                vk_mem::MemoryUsage::AutoPreferDevice,
-            );
-            let index_buffer = Buffer::<[GpuIndex]>::new(
-                &self.core.allocator,
-                indices.len() as u32,
-                vk::BufferUsageFlags::INDEX_BUFFER
-                    | vk::BufferUsageFlags::TRANSFER_DST
-                    | vk::BufferUsageFlags::TRANSFER_SRC
-                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-                vk_mem::MemoryUsage::AutoPreferDevice,
-            );
-            let vertex_buffer = Buffer::<[GpuVertex]>::new(
-                &self.core.allocator,
-                vertices.len() as u32,
-                vk::BufferUsageFlags::VERTEX_BUFFER
-                    | vk::BufferUsageFlags::TRANSFER_DST
-                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
-                vk_mem::MemoryUsage::AutoPreferDevice,
-            );
-
-            self.vertex_buffers.insert(*mesh_id, vertex_buffer);
-            self.index_buffers.insert(*mesh_id, index_buffer);
-            self.meshlet_buffers.insert(*mesh_id, (meshlet_buffer, meshlet_lod_to_offset));
-
-            staging.stage(
+            let pending_gpu_mesh = PendingGpuMesh::submit(
                 &self.core.device,
-                cmd,
-                &self.meshlet_buffers.get(mesh_id).unwrap().0,
-                Whole(meshlets.as_slice()),
+                &self.core.allocator,
+                &mut self.staging,
+                self.cmd_pool,
+                self.core.graphics_queue,
+                self.meshes.get(mesh_id).unwrap(),
             );
-            staging.stage(&self.core.device, cmd, self.index_buffers.get(mesh_id).unwrap(), Whole(indices.as_slice()));
-            staging.stage(
-                &self.core.device,
-                cmd,
-                self.vertex_buffers.get(mesh_id).unwrap(),
-                Whole(vertices.as_slice()),
-            );
+            let gpu_mesh = pending_gpu_mesh.wait_and_unwrap(&self.core.device, self.cmd_pool, &mut self.staging);
+            self.gpu_meshes.insert(*mesh_id, gpu_mesh);
         }
+        let previous_scene = self.scene_states.iter_mut().next_back();
+        let mut previous_scene_visibility_buffers = previous_scene.map(|(_, scene)| &mut scene.visibility_buffers);
 
         let mut scene_index_offsets = HashMap::with_capacity(new_world.meshes.len());
         let mut scene_index_count = 0u32;
         for mesh_id in &new_world.meshes {
-            let index_buffer = self.index_buffers.get(mesh_id).unwrap();
+            let index_buffer = &self.gpu_meshes.get(mesh_id).unwrap().index_buffer;
             scene_index_offsets.insert(*mesh_id, scene_index_count);
             scene_index_count += index_buffer.len();
         }
@@ -2145,7 +2075,7 @@ impl Renderer {
             .meshes
             .iter()
             .map(|mesh_id| {
-                let index_buffer = self.index_buffers.get(mesh_id).unwrap();
+                let index_buffer = &self.gpu_meshes.get(mesh_id).unwrap().index_buffer;
                 vk::BufferMemoryBarrier2::default()
                     .src_stage_mask(vk::PipelineStageFlags2::TRANSFER)
                     .src_access_mask(vk::AccessFlags2::TRANSFER_WRITE)
@@ -2163,7 +2093,7 @@ impl Renderer {
         );
 
         for mesh_id in &new_world.meshes {
-            let index_buffer = self.index_buffers.get(mesh_id).unwrap();
+            let index_buffer = &self.gpu_meshes.get(mesh_id).unwrap().index_buffer;
             let dst_offset = scene_index_offsets[mesh_id] as u64 * std::mem::size_of::<GpuIndex>() as u64;
             self.core.device.cmd_copy_buffer(
                 cmd,
@@ -2299,7 +2229,7 @@ impl Renderer {
         let total_meshlet_buffer_count = new_world
             .meshes
             .iter()
-            .map(|mesh_id| self.meshlet_buffers.get(mesh_id).unwrap().0.len() as usize)
+            .map(|mesh_id| self.gpu_meshes.get(mesh_id).unwrap().meshlet_buffer.len() as usize)
             .sum::<usize>();
         let total_index_count = scene_index_count as usize;
         let total_triangle_count = total_index_count / 3;
@@ -2314,9 +2244,8 @@ impl Renderer {
         let staging_bytes_used = staging.size() as usize;
 
         let mesh_upload_bytes = |mesh_id: &MeshHandle| -> usize {
-            self.meshlet_buffers.get(mesh_id).unwrap().0.size()
-                + self.index_buffers.get(mesh_id).unwrap().size()
-                + self.vertex_buffers.get(mesh_id).unwrap().size()
+            let gpu_mesh = self.gpu_meshes.get(mesh_id).unwrap();
+            gpu_mesh.meshlet_buffer.size() + gpu_mesh.index_buffer.size() + gpu_mesh.vertex_buffer.size()
         };
         let added_mesh_upload_bytes = added_meshes.iter().map(mesh_upload_bytes).sum::<usize>();
 
@@ -2335,20 +2264,18 @@ impl Renderer {
             let mesh = self.meshes.get(mesh_id).unwrap();
             let meshlet_count = mesh.lods.iter().map(|lod| lod.len()).sum::<usize>();
             let max_lod_meshlets = mesh.lods.iter().map(|lod| lod.len()).max().unwrap_or(0);
-            let meshlet_buffer = &self.meshlet_buffers.get(mesh_id).unwrap().0;
-            let index_buffer = self.index_buffers.get(mesh_id).unwrap();
-            let vertex_buffer = self.vertex_buffers.get(mesh_id).unwrap();
+            let gpu_mesh = self.gpu_meshes.get(mesh_id).unwrap();
             println!(
                 "    + {:?}: lods = {}, meshlets = {} ({}) max_lod_meshlets = {}, indices = {} ({}), vertices = {} ({}), upload = {}",
                 mesh_id,
                 mesh.lod_count,
                 format_usize_commas(meshlet_count),
-                format_bytes(meshlet_buffer.size()),
+                format_bytes(gpu_mesh.meshlet_buffer.size()),
                 format_usize_commas(max_lod_meshlets),
-                format_usize_commas(index_buffer.len() as usize),
-                format_bytes(index_buffer.size()),
-                format_usize_commas(vertex_buffer.len() as usize),
-                format_bytes(vertex_buffer.size()),
+                format_usize_commas(gpu_mesh.index_buffer.len() as usize),
+                format_bytes(gpu_mesh.index_buffer.size()),
+                format_usize_commas(gpu_mesh.vertex_buffer.len() as usize),
+                format_bytes(gpu_mesh.vertex_buffer.size()),
                 format_bytes(mesh_upload_bytes(mesh_id)),
             );
         }

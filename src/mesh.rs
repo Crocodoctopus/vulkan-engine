@@ -1,6 +1,11 @@
+use crate::buffer::Buffer;
+use crate::glsl_types::{GpuIndex, GpuMeshlet, GpuVertex};
+use crate::staging::{StagingBlock, StagingBuffer, Whole};
+use ash::vk;
 use glam::*;
 use itertools::Itertools;
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::Path;
 
 pub(crate) const MAX_LODS: usize = 8;
@@ -26,6 +31,186 @@ pub(crate) struct Mesh {
     pub radius: f32,
     pub lod_count: u8,
     pub lods: [Box<[Meshlet]>; MAX_LODS],
+}
+
+pub(crate) struct GpuMesh {
+    pub vertex_buffer: Buffer<[GpuVertex]>,
+    pub index_buffer: Buffer<[GpuIndex]>,
+    pub meshlet_buffer: Buffer<[GpuMeshlet]>,
+    pub meshlet_lod_to_offset: HashMap<u8, Range<u16>>,
+}
+
+impl GpuMesh {
+    #[allow(dead_code)]
+    pub(crate) unsafe fn destroy(self, allocator: &vk_mem::Allocator) {
+        self.vertex_buffer.destroy(allocator);
+        self.index_buffer.destroy(allocator);
+        self.meshlet_buffer.destroy(allocator);
+    }
+}
+
+pub(crate) struct PendingGpuMesh {
+    gpu_mesh: GpuMesh,
+    cmd: vk::CommandBuffer,
+    staging: StagingBuffer,
+    semaphore: vk::Semaphore,
+}
+
+impl PendingGpuMesh {
+    pub(crate) unsafe fn submit(
+        device: &ash::Device,
+        allocator: &vk_mem::Allocator,
+        staging_block: &mut StagingBlock,
+        cmd_pool: vk::CommandPool,
+        queue: vk::Queue,
+        mesh: &Mesh,
+    ) -> Self {
+        let mut vertices = vec![];
+        let mut indices = vec![];
+        let mut meshlets = vec![];
+        let mut meshlet_lod_to_offset = HashMap::new();
+        for lod in 0..mesh.lod_count {
+            let meshlet_offset = meshlets.len() as u16;
+
+            for meshlet in &mesh.lods[lod as usize] {
+                meshlets.push(GpuMeshlet {
+                    center: Vec3::from(meshlet.center),
+                    radius: meshlet.radius,
+                    aabb_min: Vec3::from(meshlet.aabb_min),
+                    cone_cutoff: meshlet.cone_cutoff,
+                    aabb_max: Vec3::from(meshlet.aabb_max),
+                    index_count: meshlet.indices.len() as u32,
+                    cone_apex: Vec3::from(meshlet.cone_apex),
+                    first_index: indices.len() as u32,
+                    cone_axis: Vec3::from(meshlet.cone_axis),
+                });
+
+                indices.extend(meshlet.indices.iter().map(|i| *i as u32 + vertices.len() as u32));
+
+                vertices.extend((0..meshlet.positions.len()).map(|i| GpuVertex {
+                    position: meshlet.positions[i],
+                    normal: meshlet.normals[i],
+                    uv: [0, 0],
+                }));
+            }
+
+            meshlet_lod_to_offset.insert(lod, meshlet_offset..meshlets.len() as u16);
+        }
+
+        let staging_len = {
+            let align4 = |value: usize| value.div_ceil(4) * 4;
+            let mut len = 0usize;
+            for bytes in [
+                meshlets.len() * std::mem::size_of::<GpuMeshlet>(),
+                indices.len() * std::mem::size_of::<GpuIndex>(),
+                vertices.len() * std::mem::size_of::<GpuVertex>(),
+            ] {
+                len = align4(len) + bytes;
+            }
+            len as u64
+        };
+
+        let mut staging =
+            StagingBuffer::try_new(staging_block, staging_len).expect("failed to allocate mesh upload staging buffer");
+        let cmd = device
+            .allocate_command_buffers(
+                &vk::CommandBufferAllocateInfo::default()
+                    .command_pool(cmd_pool)
+                    .level(vk::CommandBufferLevel::PRIMARY)
+                    .command_buffer_count(1),
+            )
+            .unwrap()[0];
+        let semaphore = device
+            .create_semaphore(
+                &vk::SemaphoreCreateInfo::default().push_next(
+                    &mut vk::SemaphoreTypeCreateInfo::default()
+                        .semaphore_type(vk::SemaphoreType::TIMELINE)
+                        .initial_value(0),
+                ),
+                None,
+            )
+            .unwrap();
+
+        staging.reset();
+        device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).unwrap();
+        device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
+
+        let gpu_mesh = GpuMesh {
+            meshlet_buffer: Buffer::<[GpuMeshlet]>::new(
+                allocator,
+                meshlets.len() as u32,
+                vk::BufferUsageFlags::VERTEX_BUFFER
+                    | vk::BufferUsageFlags::TRANSFER_DST
+                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                vk_mem::MemoryUsage::AutoPreferDevice,
+            ),
+            index_buffer: Buffer::<[GpuIndex]>::new(
+                allocator,
+                indices.len() as u32,
+                vk::BufferUsageFlags::INDEX_BUFFER
+                    | vk::BufferUsageFlags::TRANSFER_DST
+                    | vk::BufferUsageFlags::TRANSFER_SRC
+                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                vk_mem::MemoryUsage::AutoPreferDevice,
+            ),
+            vertex_buffer: Buffer::<[GpuVertex]>::new(
+                allocator,
+                vertices.len() as u32,
+                vk::BufferUsageFlags::VERTEX_BUFFER
+                    | vk::BufferUsageFlags::TRANSFER_DST
+                    | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS,
+                vk_mem::MemoryUsage::AutoPreferDevice,
+            ),
+            meshlet_lod_to_offset,
+        };
+
+        staging.stage(device, cmd, &gpu_mesh.meshlet_buffer, Whole(meshlets.as_slice()));
+        staging.stage(device, cmd, &gpu_mesh.index_buffer, Whole(indices.as_slice()));
+        staging.stage(device, cmd, &gpu_mesh.vertex_buffer, Whole(vertices.as_slice()));
+
+        device.end_command_buffer(cmd).unwrap();
+        device
+            .queue_submit2(
+                queue,
+                &[vk::SubmitInfo2::default()
+                    .command_buffer_infos(&[vk::CommandBufferSubmitInfo::default().command_buffer(cmd)])
+                    .signal_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
+                        .semaphore(semaphore)
+                        .value(1)
+                        .stage_mask(vk::PipelineStageFlags2::TRANSFER)])],
+                vk::Fence::null(),
+            )
+            .unwrap();
+
+        Self { gpu_mesh, cmd, staging, semaphore }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn wait_info(&self) -> vk::SemaphoreSubmitInfo<'static> {
+        vk::SemaphoreSubmitInfo::default()
+            .semaphore(self.semaphore)
+            .value(1)
+            .stage_mask(vk::PipelineStageFlags2::TRANSFER)
+    }
+
+    pub(crate) unsafe fn wait(&self, device: &ash::Device) {
+        device
+            .wait_semaphores(&vk::SemaphoreWaitInfo::default().semaphores(&[self.semaphore]).values(&[1]), u64::MAX)
+            .unwrap();
+    }
+
+    pub(crate) unsafe fn wait_and_unwrap(
+        self,
+        device: &ash::Device,
+        cmd_pool: vk::CommandPool,
+        staging_block: &mut StagingBlock,
+    ) -> GpuMesh {
+        self.wait(device);
+        device.free_command_buffers(cmd_pool, &[self.cmd]);
+        device.destroy_semaphore(self.semaphore, None);
+        self.staging.free(staging_block);
+        self.gpu_mesh
+    }
 }
 
 pub(crate) fn load_mesh(filename: impl AsRef<Path>) -> Option<Mesh> {

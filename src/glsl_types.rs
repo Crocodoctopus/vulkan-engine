@@ -80,7 +80,7 @@ pub(crate) type GpuIndex = u32;
 
 #[derive(Clone, Copy, Debug, Default)]
 #[repr(C)]
-pub(super) struct GpuVertex {
+pub(crate) struct GpuVertex {
     pub position: [i16; 3],
     pub uv: [i16; 2],
     pub normal: [i8; 3],
