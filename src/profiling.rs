@@ -1,3 +1,4 @@
+use crate::core::VulkanCore;
 use crate::renderer::{MAX_FRAMES_IN_FLIGHT, PipelineStage};
 use ash::vk;
 
@@ -11,7 +12,8 @@ pub(crate) struct PipelineProfiler {
 impl PipelineProfiler {
     const QUERIES_PER_FRAME: usize = 2 + PipelineStage::FrameEnd as usize * 2;
 
-    pub(crate) unsafe fn new(device: &ash::Device, queue_family_index: u32, queue: vk::Queue) -> Self {
+    pub(crate) unsafe fn new(core: &VulkanCore) -> Self {
+        let device = &core.device;
         let query_pool = device
             .create_query_pool(
                 &vk::QueryPoolCreateInfo::default()
@@ -24,7 +26,7 @@ impl PipelineProfiler {
         let cmd_pool = device
             .create_command_pool(
                 &vk::CommandPoolCreateInfo::default()
-                    .queue_family_index(queue_family_index)
+                    .queue_family_index(core.queue_family_index)
                     .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
                 None,
             )
@@ -51,8 +53,10 @@ impl PipelineProfiler {
             }
         }
         device.end_command_buffer(cmd).unwrap();
-        device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], vk::Fence::null()).unwrap();
-        device.queue_wait_idle(queue).unwrap();
+        device
+            .queue_submit(core.graphics_queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], vk::Fence::null())
+            .unwrap();
+        device.queue_wait_idle(core.graphics_queue).unwrap();
         device.destroy_command_pool(cmd_pool, None);
 
         Self {

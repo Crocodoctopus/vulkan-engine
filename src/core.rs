@@ -12,6 +12,7 @@ pub(crate) struct VulkanCore {
     pub device: ash::Device,
     pub graphics_queue: vk::Queue,
     pub present_queue: vk::Queue,
+    pub cmd_pool: vk::CommandPool,
     pub allocator: vk_mem::Allocator,
 
     pub _surface_instance: khr::surface::Instance,
@@ -171,6 +172,14 @@ impl VulkanCore {
 
         let graphics_queue = device.get_device_queue(queue_family_index, 0);
         let present_queue = device.get_device_queue(queue_family_index, 0);
+        let cmd_pool = device
+            .create_command_pool(
+                &vk::CommandPoolCreateInfo::default()
+                    .queue_family_index(queue_family_index)
+                    .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
+                None,
+            )
+            .unwrap();
 
         let mut allocator_cinfo = vk_mem::AllocatorCreateInfo::new(&instance, &device, physical_device);
         allocator_cinfo.flags |= vk_mem::AllocatorCreateFlags::BUFFER_DEVICE_ADDRESS;
@@ -185,6 +194,7 @@ impl VulkanCore {
             device,
             graphics_queue,
             present_queue,
+            cmd_pool,
             allocator,
 
             _surface_instance: surface_instance,

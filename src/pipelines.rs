@@ -1,3 +1,4 @@
+use crate::core::VulkanCore;
 use crate::renderer::{HZB_SAMPLED_IMAGE_CAPACITY, HZB_STORAGE_IMAGE_CAPACITY};
 use ash::vk;
 
@@ -23,7 +24,9 @@ pub(crate) struct Pipelines {
 }
 
 impl Pipelines {
-    pub(crate) unsafe fn new(device: &ash::Device, surface_format: vk::SurfaceFormatKHR) -> Self {
+    pub(crate) unsafe fn new(core: &VulkanCore) -> Self {
+        let device = &core.device;
+        let surface_format = core.surface_format;
         let global_set_layout = device
             .create_descriptor_set_layout(
                 &vk::DescriptorSetLayoutCreateInfo::default()

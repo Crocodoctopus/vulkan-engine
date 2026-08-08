@@ -112,7 +112,6 @@ struct SwapchainState {
 impl SwapchainState {
     unsafe fn new(
         core: &VulkanCore,
-        cmd_pool: vk::CommandPool,
         swapchain: &Swapchain,
         pipelines: &Pipelines,
         overdraw_sets: &[vk::DescriptorSet; MAX_FRAMES_IN_FLIGHT],
@@ -138,7 +137,7 @@ impl SwapchainState {
         let staging_cmd_buffer = device
             .allocate_command_buffers(
                 &vk::CommandBufferAllocateInfo::default()
-                    .command_pool(cmd_pool)
+                    .command_pool(core.cmd_pool)
                     .level(vk::CommandBufferLevel::PRIMARY)
                     .command_buffer_count(1),
             )
@@ -453,7 +452,7 @@ impl SwapchainState {
             )
             .unwrap();
         device.queue_wait_idle(core.graphics_queue).unwrap();
-        device.free_command_buffers(cmd_pool, &[staging_cmd_buffer]);
+        device.free_command_buffers(core.cmd_pool, &[staging_cmd_buffer]);
 
         Self {
             hzb_descriptor_pool,
@@ -471,7 +470,9 @@ impl SwapchainState {
         }
     }
 
-    unsafe fn free(self, device: &ash::Device, allocator: &vk_mem::Allocator) {
+    unsafe fn free(self, core: &VulkanCore) {
+        let device = &core.device;
+        let allocator = &core.allocator;
         let Self {
             hzb_descriptor_pool,
             hzb_images,
@@ -552,7 +553,9 @@ struct SceneState {
 }
 
 impl SceneState {
-    unsafe fn free(self, device: &ash::Device, allocator: &vk_mem::Allocator) {
+    unsafe fn free(self, core: &VulkanCore) {
+        let device = &core.device;
+        let allocator = &core.allocator;
         for buffer in self.frustum_passing_meshlet_buffers {
             buffer.destroy(&allocator);
         }
@@ -579,9 +582,8 @@ pub struct Renderer {
     /* Swapchain data: */
     swapchain: Swapchain,
 
-    /* Command pool: */
+    /* Profiling: */
     profiler: PipelineProfiler,
-    cmd_pool: vk::CommandPool,
 
     /* Pipelines: */
     pipelines: Pipelines,
@@ -669,38 +671,21 @@ impl Renderer {
     ) -> Self {
         unsafe {
             let core = VulkanCore::new(display);
-            let VulkanCore {
-                ref device,
-                ref allocator,
-                graphics_queue,
-                queue_family_index,
-                surface_format,
-                ..
-            } = core;
+            let VulkanCore { ref device, ref allocator, .. } = core;
 
             // Build swapchain from core.
             let swapchain = Swapchain::new(&core, vk::Extent2D { width: viewport_w, height: viewport_h });
 
-            let profiler = PipelineProfiler::new(device, queue_family_index, graphics_queue);
+            let profiler = PipelineProfiler::new(&core);
 
-            let pipelines = Pipelines::new(device, surface_format);
-
-            // Generic command pool.
-            let cmd_pool = device
-                .create_command_pool(
-                    &vk::CommandPoolCreateInfo::default()
-                        .queue_family_index(queue_family_index)
-                        .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
-                    None,
-                )
-                .unwrap();
+            let pipelines = Pipelines::new(&core);
 
             // Per-frame recorded render buffers.
             let cmd_buffers = std::array::from_fn(|_| {
                 device
                     .allocate_command_buffers(
                         &vk::CommandBufferAllocateInfo::default()
-                            .command_pool(cmd_pool)
+                            .command_pool(core.cmd_pool)
                             .level(vk::CommandBufferLevel::PRIMARY)
                             .command_buffer_count(PipelineStage::COUNT as _),
                     )
@@ -862,7 +847,7 @@ impl Renderer {
                 );
             }
 
-            let swapchain_states = SwapchainState::new(&core, cmd_pool, &swapchain, &pipelines, &overdraw_sets);
+            let swapchain_states = SwapchainState::new(&core, &swapchain, &pipelines, &overdraw_sets);
 
             //
             Self {
@@ -871,7 +856,6 @@ impl Renderer {
                 swapchain,
 
                 profiler,
-                cmd_pool,
 
                 pipelines,
 
@@ -937,9 +921,9 @@ impl Renderer {
 
                 let mut swapchain = Swapchain::new(&self.core, self.swapchain.extent);
                 let mut swapchain_states =
-                    SwapchainState::new(&self.core, self.cmd_pool, &swapchain, &self.pipelines, &self.overdraw_sets);
+                    SwapchainState::new(&self.core, &swapchain, &self.pipelines, &self.overdraw_sets);
                 std::mem::swap(&mut self.swapchain_states, &mut swapchain_states);
-                swapchain_states.free(&self.core.device, &self.core.allocator);
+                swapchain_states.free(&self.core);
                 std::mem::swap(&mut self.swapchain, &mut swapchain);
                 swapchain.free(&self.core.device);
             }
@@ -961,7 +945,7 @@ impl Renderer {
             .collect();
         for (generation, PendingSceneState { cmd, staging, scene_states }) in ready_scene_states {
             unsafe {
-                self.core.device.free_command_buffers(self.cmd_pool, &[cmd]);
+                self.core.device.free_command_buffers(self.core.cmd_pool, &[cmd]);
                 staging.free(&mut self.staging);
                 self.scene_states.insert(generation, scene_states);
             }
@@ -1009,10 +993,7 @@ impl Renderer {
                 .filter(|generation| !active_scene_generations.contains(generation))
                 .collect();
             for generation in retired_scene_generations {
-                self.scene_states
-                    .remove(&generation)
-                    .expect("Scene generation should exist!")
-                    .free(&self.core.device, &self.core.allocator);
+                self.scene_states.remove(&generation).expect("Scene generation should exist!").free(&self.core);
             }
         }
 
@@ -2010,7 +1991,7 @@ impl Renderer {
             .device
             .allocate_command_buffers(
                 &vk::CommandBufferAllocateInfo::default()
-                    .command_pool(self.cmd_pool)
+                    .command_pool(self.core.cmd_pool)
                     .level(vk::CommandBufferLevel::PRIMARY)
                     .command_buffer_count(1),
             )
@@ -2042,15 +2023,9 @@ impl Renderer {
             if self.gpu_meshes.contains_key(mesh_id) {
                 continue;
             }
-            let pending_gpu_mesh = PendingGpuMesh::submit(
-                &self.core.device,
-                &self.core.allocator,
-                &mut self.staging,
-                self.cmd_pool,
-                self.core.graphics_queue,
-                self.meshes.get(mesh_id).unwrap(),
-            );
-            let gpu_mesh = pending_gpu_mesh.wait_and_unwrap(&self.core.device, self.cmd_pool, &mut self.staging);
+            let pending_gpu_mesh =
+                PendingGpuMesh::submit(&self.core, &mut self.staging, self.meshes.get(mesh_id).unwrap());
+            let gpu_mesh = pending_gpu_mesh.wait_and_unwrap(&self.core, &mut self.staging);
             self.gpu_meshes.insert(*mesh_id, gpu_mesh);
         }
         let previous_scene = self.scene_states.iter_mut().next_back();

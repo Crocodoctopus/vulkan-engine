@@ -1,4 +1,5 @@
 use crate::buffer::Buffer;
+use crate::core::VulkanCore;
 use crate::glsl_types::{GpuIndex, GpuMeshlet, GpuVertex};
 use crate::staging::{StagingBlock, StagingBuffer, Whole};
 use ash::vk;
@@ -57,14 +58,8 @@ pub(crate) struct PendingGpuMesh {
 }
 
 impl PendingGpuMesh {
-    pub(crate) unsafe fn submit(
-        device: &ash::Device,
-        allocator: &vk_mem::Allocator,
-        staging_block: &mut StagingBlock,
-        cmd_pool: vk::CommandPool,
-        queue: vk::Queue,
-        mesh: &Mesh,
-    ) -> Self {
+    pub(crate) unsafe fn submit(core: &VulkanCore, staging_block: &mut StagingBlock, mesh: &Mesh) -> Self {
+        let device = &core.device;
         let mut vertices = vec![];
         let mut indices = vec![];
         let mut meshlets = vec![];
@@ -115,7 +110,7 @@ impl PendingGpuMesh {
         let cmd = device
             .allocate_command_buffers(
                 &vk::CommandBufferAllocateInfo::default()
-                    .command_pool(cmd_pool)
+                    .command_pool(core.cmd_pool)
                     .level(vk::CommandBufferLevel::PRIMARY)
                     .command_buffer_count(1),
             )
@@ -137,7 +132,7 @@ impl PendingGpuMesh {
 
         let gpu_mesh = GpuMesh {
             meshlet_buffer: Buffer::<[GpuMeshlet]>::new(
-                allocator,
+                &core.allocator,
                 meshlets.len() as u32,
                 vk::BufferUsageFlags::VERTEX_BUFFER
                     | vk::BufferUsageFlags::TRANSFER_DST
@@ -145,7 +140,7 @@ impl PendingGpuMesh {
                 vk_mem::MemoryUsage::AutoPreferDevice,
             ),
             index_buffer: Buffer::<[GpuIndex]>::new(
-                allocator,
+                &core.allocator,
                 indices.len() as u32,
                 vk::BufferUsageFlags::INDEX_BUFFER
                     | vk::BufferUsageFlags::TRANSFER_DST
@@ -154,7 +149,7 @@ impl PendingGpuMesh {
                 vk_mem::MemoryUsage::AutoPreferDevice,
             ),
             vertex_buffer: Buffer::<[GpuVertex]>::new(
-                allocator,
+                &core.allocator,
                 vertices.len() as u32,
                 vk::BufferUsageFlags::VERTEX_BUFFER
                     | vk::BufferUsageFlags::TRANSFER_DST
@@ -171,7 +166,7 @@ impl PendingGpuMesh {
         device.end_command_buffer(cmd).unwrap();
         device
             .queue_submit2(
-                queue,
+                core.graphics_queue,
                 &[vk::SubmitInfo2::default()
                     .command_buffer_infos(&[vk::CommandBufferSubmitInfo::default().command_buffer(cmd)])
                     .signal_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
@@ -193,21 +188,16 @@ impl PendingGpuMesh {
             .stage_mask(vk::PipelineStageFlags2::TRANSFER)
     }
 
-    pub(crate) unsafe fn wait(&self, device: &ash::Device) {
-        device
+    pub(crate) unsafe fn wait(&self, core: &VulkanCore) {
+        core.device
             .wait_semaphores(&vk::SemaphoreWaitInfo::default().semaphores(&[self.semaphore]).values(&[1]), u64::MAX)
             .unwrap();
     }
 
-    pub(crate) unsafe fn wait_and_unwrap(
-        self,
-        device: &ash::Device,
-        cmd_pool: vk::CommandPool,
-        staging_block: &mut StagingBlock,
-    ) -> GpuMesh {
-        self.wait(device);
-        device.free_command_buffers(cmd_pool, &[self.cmd]);
-        device.destroy_semaphore(self.semaphore, None);
+    pub(crate) unsafe fn wait_and_unwrap(self, core: &VulkanCore, staging_block: &mut StagingBlock) -> GpuMesh {
+        self.wait(core);
+        core.device.free_command_buffers(core.cmd_pool, &[self.cmd]);
+        core.device.destroy_semaphore(self.semaphore, None);
         self.staging.free(staging_block);
         self.gpu_mesh
     }
