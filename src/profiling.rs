@@ -1,205 +1,190 @@
 use crate::core::VulkanCore;
-use crate::renderer::{MAX_FRAMES_IN_FLIGHT, PipelineStage};
 use ash::vk;
+use std::borrow::Cow;
+use std::cell::RefCell;
+use std::collections::HashMap;
+
+///////////////////////////////////////////////////////////////////////////////
+// This file was generated with substantial AI assistance and has not been
+// carefully reviewed yet. Expect some odd formatting, verbose structure, or
+// unclear organization until it gets a manual pass.
+///////////////////////////////////////////////////////////////////////////////
+
+pub(crate) struct ProfileLabel(Cow<'static, str>);
+
+impl ProfileLabel {
+    fn as_str(&self) -> &str {
+        self.0.as_ref()
+    }
+
+    fn into_owned(self) -> String {
+        self.0.into_owned()
+    }
+}
+
+impl From<&'static str> for ProfileLabel {
+    fn from(label: &'static str) -> Self {
+        Self(Cow::Borrowed(label))
+    }
+}
+
+impl From<String> for ProfileLabel {
+    fn from(label: String) -> Self {
+        Self(Cow::Owned(label))
+    }
+}
 
 pub(crate) struct PipelineProfiler {
     query_pool: vk::QueryPool,
-    stage_accum_ms: [f32; PipelineStage::FrameEnd as usize],
-    total_accum_ms: f32,
+    state: RefCell<PipelineProfilerState>,
+}
+
+struct PipelineProfilerState {
+    queries: Vec<ProfileQuery>,
+    query_by_label: HashMap<String, usize>,
+}
+
+struct ProfileQuery {
+    label: String,
+    query: u32,
+    pending: bool,
+    accum_ms: f32,
     samples: u32,
 }
 
 impl PipelineProfiler {
-    const QUERIES_PER_FRAME: usize = 2 + PipelineStage::FrameEnd as usize * 2;
+    pub(crate) const REPORT_SAMPLES: u32 = 300;
+    const MAX_PROFILE_LABELS: usize = 64;
 
     pub(crate) unsafe fn new(core: &VulkanCore) -> Self {
-        let device = &core.device;
-        let query_pool = device
+        let query_pool = core
+            .device
             .create_query_pool(
                 &vk::QueryPoolCreateInfo::default()
                     .query_type(vk::QueryType::TIMESTAMP)
-                    .query_count((MAX_FRAMES_IN_FLIGHT * Self::QUERIES_PER_FRAME) as u32),
+                    .query_count((Self::MAX_PROFILE_LABELS * 2) as u32),
                 None,
             )
             .unwrap();
-
-        let cmd_pool = device
-            .create_command_pool(
-                &vk::CommandPoolCreateInfo::default()
-                    .queue_family_index(core.queue_family_index)
-                    .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER),
-                None,
-            )
-            .unwrap();
-
-        let cmd = device
-            .allocate_command_buffers(
-                &vk::CommandBufferAllocateInfo::default()
-                    .command_pool(cmd_pool)
-                    .level(vk::CommandBufferLevel::PRIMARY)
-                    .command_buffer_count(1),
-            )
-            .unwrap()[0];
-
-        device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
-        device.cmd_reset_query_pool(cmd, query_pool, 0, (MAX_FRAMES_IN_FLIGHT * Self::QUERIES_PER_FRAME) as u32);
-        for fif in 0..MAX_FRAMES_IN_FLIGHT {
-            Self::write_total_start_to(device, query_pool, cmd, fif);
-            Self::write_total_end_to(device, query_pool, cmd, fif);
-            for stage in 0..PipelineStage::FrameEnd as usize {
-                let query = Self::query_base(fif) + 2 + stage as u32 * 2;
-                device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, query_pool, query);
-                device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, query_pool, query + 1);
-            }
-        }
-        device.end_command_buffer(cmd).unwrap();
-        device
-            .queue_submit(core.graphics_queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], vk::Fence::null())
-            .unwrap();
-        device.queue_wait_idle(core.graphics_queue).unwrap();
-        device.destroy_command_pool(cmd_pool, None);
 
         Self {
             query_pool,
-            stage_accum_ms: [0.0; PipelineStage::FrameEnd as usize],
-            total_accum_ms: 0.0,
-            samples: 0,
+            state: RefCell::new(PipelineProfilerState { queries: Vec::new(), query_by_label: HashMap::new() }),
         }
     }
 
-    const fn query_base(frame_index: usize) -> u32 {
-        (frame_index * Self::QUERIES_PER_FRAME) as u32
-    }
-
-    const fn stage_query(frame_index: usize, stage: PipelineStage, end: bool) -> u32 {
-        Self::query_base(frame_index) + 2 + stage as u32 * 2 + end as u32
-    }
-
-    pub(crate) unsafe fn reset_frame(&self, device: &ash::Device, cmd: vk::CommandBuffer, frame_index: usize) {
-        device.cmd_reset_query_pool(
-            cmd,
-            self.query_pool,
-            Self::query_base(frame_index),
-            Self::QUERIES_PER_FRAME as u32,
-        );
-    }
-
-    pub(crate) unsafe fn write_total_start(&self, device: &ash::Device, cmd: vk::CommandBuffer, frame_index: usize) {
-        device.cmd_write_timestamp(
-            cmd,
-            vk::PipelineStageFlags::TOP_OF_PIPE,
-            self.query_pool,
-            Self::query_base(frame_index),
-        );
-    }
-
-    pub(crate) unsafe fn write_total_end(&self, device: &ash::Device, cmd: vk::CommandBuffer, frame_index: usize) {
-        device.cmd_write_timestamp(
-            cmd,
-            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-            self.query_pool,
-            Self::query_base(frame_index) + 1,
-        );
-    }
-
-    pub(crate) unsafe fn write_stage_start(
+    pub(crate) unsafe fn begin<T>(
         &self,
         device: &ash::Device,
         cmd: vk::CommandBuffer,
-        frame_index: usize,
-        stage: PipelineStage,
-    ) {
-        device.cmd_write_timestamp(
-            cmd,
-            vk::PipelineStageFlags::TOP_OF_PIPE,
-            self.query_pool,
-            Self::stage_query(frame_index, stage, false),
-        );
+        label: impl Into<ProfileLabel>,
+        f: impl FnOnce() -> T,
+    ) -> T {
+        let query = {
+            let label = label.into();
+            let mut state = self.state.borrow_mut();
+            if let Some(&query_index) = state.query_by_label.get(label.as_str()) {
+                let query = &mut state.queries[query_index];
+                query.pending = true;
+                query.query
+            } else {
+                let query_index = state.queries.len();
+                assert!(
+                    query_index < Self::MAX_PROFILE_LABELS,
+                    "profile query capacity exceeded; increase MAX_PROFILE_LABELS"
+                );
+
+                let label = label.into_owned();
+                let query = (query_index * 2) as u32;
+                state.query_by_label.insert(label.clone(), query_index);
+                state.queries.push(ProfileQuery { label, query, pending: true, accum_ms: 0.0, samples: 0 });
+                query
+            }
+        };
+
+        device.cmd_reset_query_pool(cmd, self.query_pool, query, 2);
+        device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, self.query_pool, query);
+
+        let result = f();
+
+        device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, self.query_pool, query + 1);
+        result
     }
 
-    pub(crate) unsafe fn write_stage_end(
-        &self,
-        device: &ash::Device,
-        cmd: vk::CommandBuffer,
-        frame_index: usize,
-        stage: PipelineStage,
-    ) {
-        device.cmd_write_timestamp(
-            cmd,
-            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-            self.query_pool,
-            Self::stage_query(frame_index, stage, true),
-        );
-    }
+    pub(crate) unsafe fn read_and_accumulate(&self, device: &ash::Device, timestamp_period: f32) -> bool {
+        let pending_queries: Vec<_> = {
+            let state = self.state.borrow();
+            state
+                .queries
+                .iter()
+                .enumerate()
+                .filter(|(_, query)| query.pending)
+                .map(|(index, query)| (index, query.query))
+                .collect()
+        };
 
-    unsafe fn write_total_start_to(
-        device: &ash::Device,
-        query_pool: vk::QueryPool,
-        cmd: vk::CommandBuffer,
-        frame_index: usize,
-    ) {
-        device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, query_pool, Self::query_base(frame_index));
-    }
-
-    unsafe fn write_total_end_to(
-        device: &ash::Device,
-        query_pool: vk::QueryPool,
-        cmd: vk::CommandBuffer,
-        frame_index: usize,
-    ) {
-        device.cmd_write_timestamp(
-            cmd,
-            vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-            query_pool,
-            Self::query_base(frame_index) + 1,
-        );
-    }
-
-    pub(crate) unsafe fn read_and_accumulate(
-        &mut self,
-        device: &ash::Device,
-        frame_index: usize,
-        timestamp_period: f32,
-    ) {
-        let mut data = [0u64; Self::QUERIES_PER_FRAME];
-        device
-            .get_query_pool_results(
-                self.query_pool,
-                Self::query_base(frame_index),
-                &mut data,
-                vk::QueryResultFlags::TYPE_64,
-            )
-            .unwrap();
+        if pending_queries.is_empty() {
+            return false;
+        }
 
         let to_ms = timestamp_period / 1_000_000.0;
-        let elapsed_ms = |start: usize, end: usize| to_ms * (data[end] - data[start]) as f32;
+        let mut state = self.state.borrow_mut();
+        for (index, query) in pending_queries {
+            let mut data = [0u64; 2];
+            device.get_query_pool_results(self.query_pool, query, &mut data, vk::QueryResultFlags::TYPE_64).unwrap();
 
-        self.total_accum_ms += elapsed_ms(0, 1);
-        for stage in 0..PipelineStage::FrameEnd as usize {
-            let query = 2 + stage * 2;
-            self.stage_accum_ms[stage] += elapsed_ms(query, query + 1);
+            let query = &mut state.queries[index];
+            query.accum_ms += to_ms * (data[1] - data[0]) as f32;
+            query.samples += 1;
+            query.pending = false;
         }
 
-        self.samples += 1;
-        if self.samples == 300 {
-            let scale = 1.0 / self.samples as f32;
-            let data_upload_ms = self.stage_accum_ms[PipelineStage::DataUpload as usize] * scale;
-            let frustum_cull_ms = self.stage_accum_ms[PipelineStage::FrustumCull as usize] * scale;
-            let early_draw_ms = self.stage_accum_ms[PipelineStage::EarlyDraw as usize] * scale;
-            let build_hzb_ms = self.stage_accum_ms[PipelineStage::BuildHzb as usize] * scale;
-            let occlusion_cull_ms = self.stage_accum_ms[PipelineStage::OcclusionCull as usize] * scale;
-            let late_draw_ms = self.stage_accum_ms[PipelineStage::LateDraw as usize] * scale;
-            let sum_ms =
-                data_upload_ms + frustum_cull_ms + early_draw_ms + build_hzb_ms + occlusion_cull_ms + late_draw_ms;
-            let total_ms = self.total_accum_ms * scale;
-
-            println!(
-                "timestamp: real = {total_ms:.4}ms (sum = {sum_ms:.4}ms)\n  upload = {data_upload_ms:.4}ms\n  frustum = {frustum_cull_ms:.4}ms\n  early_draw = {early_draw_ms:.4}ms\n  build_hzb = {build_hzb_ms:.4}ms\n  occlusion = {occlusion_cull_ms:.4}ms\n  late_draw = {late_draw_ms:.4}ms"
-            );
-
-            self.stage_accum_ms = [0.0; PipelineStage::FrameEnd as usize];
-            self.total_accum_ms = 0.0;
-            self.samples = 0;
-        }
+        true
     }
+
+    pub(crate) fn print_report(profilers: &[Self]) {
+        let mut entries: Vec<ProfileReportEntry> = Vec::new();
+        for profiler in profilers {
+            let mut state = profiler.state.borrow_mut();
+            for query in &mut state.queries {
+                if query.samples == 0 {
+                    continue;
+                }
+
+                if let Some(entry) = entries.iter_mut().find(|entry| entry.label == query.label) {
+                    entry.accum_ms += query.accum_ms;
+                    entry.samples += query.samples;
+                } else {
+                    entries.push(ProfileReportEntry {
+                        label: query.label.clone(),
+                        accum_ms: query.accum_ms,
+                        samples: query.samples,
+                    });
+                }
+
+                query.accum_ms = 0.0;
+                query.samples = 0;
+            }
+        }
+
+        if entries.is_empty() {
+            return;
+        }
+
+        let mut sum_ms = 0.0;
+        let mut lines = Vec::new();
+        for entry in entries {
+            let average_ms = entry.accum_ms / entry.samples as f32;
+            sum_ms += average_ms;
+            lines.push(format!("  {} = {average_ms:.4}ms", entry.label));
+        }
+
+        println!("timestamp: sum = {sum_ms:.4}ms\n{}", lines.join("\n"));
+    }
+}
+
+struct ProfileReportEntry {
+    label: String,
+    accum_ms: f32,
+    samples: u32,
 }

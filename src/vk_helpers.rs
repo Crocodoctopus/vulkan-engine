@@ -1,7 +1,5 @@
 use ash::vk;
 
-use crate::profiling::PipelineProfiler;
-
 pub(crate) fn extent3d_from_extent2d(extent: vk::Extent2D) -> vk::Extent3D {
     vk::Extent3D { width: extent.width, height: extent.height, depth: 1 }
 }
@@ -50,31 +48,13 @@ pub(crate) const DEPTH_2D_SUBRESOURCE_RANGE: vk::ImageSubresourceRange = vk::Ima
 
 pub(crate) unsafe fn record_cmd_buffer<T>(
     device: &ash::Device,
-    profiler: &PipelineProfiler,
-    frame_index: usize,
-    stage: crate::renderer::PipelineStage,
     cmd: vk::CommandBuffer,
     f: impl FnOnce(vk::CommandBuffer) -> T,
 ) -> T {
     device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).unwrap();
     device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
 
-    if stage as usize == 0 {
-        profiler.reset_frame(device, cmd, frame_index);
-        profiler.write_total_start(device, cmd, frame_index);
-    }
-    if stage != crate::renderer::PipelineStage::FrameEnd {
-        profiler.write_stage_start(device, cmd, frame_index, stage);
-    }
-
     let result = f(cmd);
-
-    if stage != crate::renderer::PipelineStage::FrameEnd {
-        profiler.write_stage_end(device, cmd, frame_index, stage);
-    }
-    if stage as usize == crate::renderer::PipelineStage::FrameEnd as usize - 1 {
-        profiler.write_total_end(device, cmd, frame_index);
-    }
 
     device.end_command_buffer(cmd).unwrap();
     result
