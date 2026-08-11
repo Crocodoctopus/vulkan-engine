@@ -35,7 +35,7 @@ use winit::window::{CursorGrabMode, Window};
 
 fn main() {
     // Create window.
-    let (viewport_w, viewport_h) = (1080_u32, 720_u32);
+    let (viewport_w, viewport_h) = (1024_u32, 1024_u32);
     let mut event_loop = EventLoop::new().expect("Could not create window event loop.");
     event_loop.listen_device_events(DeviceEvents::Always);
     #[allow(deprecated)]

@@ -15,23 +15,13 @@ void main() {
         return;
     }
 
-    // Each destination texel reduces a 2x2 footprint from the source.
-    ivec2 src_base = dst_xy * 2;
     ivec2 src_size = textureSize(src_views[view], 0);
+    vec2 src_uv = (vec2(dst_xy) * 2.0 + vec2(1.0)) / vec2(src_size);
 
-    // Clamp for odd extents so the last texel still reduces conservatively.
-    ivec2 p00 = min(src_base + ivec2(0, 0), src_size - 1);
-    ivec2 p10 = min(src_base + ivec2(1, 0), src_size - 1);
-    ivec2 p01 = min(src_base + ivec2(0, 1), src_size - 1);
-    ivec2 p11 = min(src_base + ivec2(1, 1), src_size - 1);
-
-    float z00 = texelFetch(src_views[view], p00, 0).r;
-    float z10 = texelFetch(src_views[view], p10, 0).r;
-    float z01 = texelFetch(src_views[view], p01, 0).r;
-    float z11 = texelFetch(src_views[view], p11, 0).r;
-
-    // Reverse-Z: smaller depth is farther away. Store the farthest visible
-    // depth in each footprint so occlusion tests can prove full coverage.
-    float reduced = min(min(z00, z10), min(z01, z11));
+    // The HZB sampler uses linear filtering with MIN reduction. Sampling the
+    // center of the source footprint reduces the same 2x2 texels that the old
+    // explicit texelFetch path reduced. Reverse-Z stores the minimum depth,
+    // which is the farthest visible depth in the footprint.
+    float reduced = textureLod(src_views[view], src_uv, 0.0).r;
     imageStore(dst_views[view], dst_xy, vec4(reduced, 0.0, 0.0, 0.0));
 }

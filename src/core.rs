@@ -148,6 +148,7 @@ impl VulkanCore {
                 .descriptor_indexing(true)
                 .shader_sampled_image_array_non_uniform_indexing(true)
                 .runtime_descriptor_array(true)
+                .sampler_filter_minmax(true)
                 .timeline_semaphore(true);
 
             let mut vk13features =

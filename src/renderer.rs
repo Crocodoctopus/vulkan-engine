@@ -133,11 +133,14 @@ impl SwapchainState {
     ) -> Self {
         let device = &core.device;
         let allocator = &core.allocator;
+        let mut hzb_sampler_reduction =
+            vk::SamplerReductionModeCreateInfo::default().reduction_mode(vk::SamplerReductionMode::MIN);
         let hzb_sampler = device
             .create_sampler(
                 &vk::SamplerCreateInfo::default()
-                    .mag_filter(vk::Filter::NEAREST)
-                    .min_filter(vk::Filter::NEAREST)
+                    .push_next(&mut hzb_sampler_reduction)
+                    .mag_filter(vk::Filter::LINEAR)
+                    .min_filter(vk::Filter::LINEAR)
                     .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
                     .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
                     .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
