@@ -6,7 +6,7 @@ use crate::mesh::{GpuMesh, Mesh, PendingGpuMesh, load_mesh};
 use crate::pipelines::Pipelines;
 use crate::profiling::{PipelineProfiler, ProfileLabel};
 use crate::rw_queue::{ResourceQueue, WaitStrategy};
-use crate::staging::{StagingBlock, StagingBuffer, Whole};
+use crate::staging::{StagingPool, StagingSpan, Whole};
 use crate::swapchain::Swapchain;
 use crate::util::{format_bytes, format_usize_commas, wait_semaphores_any_fallback};
 use crate::vk_helpers::*;
@@ -549,7 +549,7 @@ impl SwapchainState {
 struct PendingSceneState {
     // Keep the upload cmd buffer and staging allocation alive until promotion.
     cmd: vk::CommandBuffer,
-    staging: StagingBuffer,
+    staging: StagingSpan,
     scene_states: SceneState,
 }
 
@@ -617,7 +617,7 @@ pub struct Renderer {
     gpu_meshes: HashMap<MeshHandle, GpuMesh>,
 
     /* Staging: */
-    staging: StagingBlock,
+    staging: StagingPool,
 
     /* Scene: */
     _descriptor_pools: [vk::DescriptorPool; MAX_FRAMES_IN_FLIGHT],
@@ -627,7 +627,7 @@ pub struct Renderer {
     cmd_buffers: [[vk::CommandBuffer; PipelineStage::COUNT]; MAX_FRAMES_IN_FLIGHT],
 
     // Reusable FIF staging buffers.
-    staging_buffers: [StagingBuffer; MAX_FRAMES_IN_FLIGHT],
+    staging_buffers: [StagingSpan; MAX_FRAMES_IN_FLIGHT],
 
     // Global & per FIF desciptor sets.
     global_set: vk::DescriptorSet,
@@ -714,8 +714,8 @@ impl Renderer {
             });
 
             // Staging data.
-            let mut staging = StagingBlock::new(allocator, STAGING_ARENA_SIZE);
-            let staging_buffers = std::array::from_fn(|_| StagingBuffer::new(&mut staging, STAGING_FIF_BLOCK_SIZE));
+            let staging = StagingPool::new(allocator, STAGING_ARENA_SIZE);
+            let staging_buffers = std::array::from_fn(|_| staging.alloc(STAGING_FIF_BLOCK_SIZE));
 
             //
             let global_descriptor_pool = device
@@ -973,7 +973,7 @@ impl Renderer {
                 self.core.device.free_command_buffers(self.core.cmd_pool, &[cmd]);
             }
             unsafe {
-                staging.free(&mut self.staging);
+                self.staging.free_span(staging);
             }
             self.scene_states.insert(generation, scene_states);
         }
@@ -1171,7 +1171,7 @@ impl Renderer {
                 // Upload scene data.
                 let staging = &mut self.staging_buffers[frame_index];
                 staging.reset();
-                staging.stage(&self.core.device, cmd, &scene_object_instance_buffer, Whole(object_data));
+                self.staging.stage(staging, &self.core.device, cmd, &scene_object_instance_buffer, Whole(object_data));
                 self.core.device.cmd_pipeline_barrier2(
                     cmd,
                     &vk::DependencyInfo::default().buffer_memory_barriers(&[vk::BufferMemoryBarrier2::default()
@@ -1190,7 +1190,7 @@ impl Renderer {
                     &[vk::BufferCopy::default().size(scene_object_instance_buffer.size() as u64)],
                 );
 
-                staging.stage(&self.core.device, cmd, frame_global_buffer, Whole(frame_global));
+                self.staging.stage(staging, &self.core.device, cmd, frame_global_buffer, Whole(frame_global));
 
                 // Set indirect & frustum_passing lens to 0.
                 self.core.device.cmd_fill_buffer(
@@ -2127,8 +2127,7 @@ impl Renderer {
     }
 
     unsafe fn build_scene(&mut self) {
-        let mut staging = StagingBuffer::try_new(&mut self.staging, 64 * MiB)
-            .expect("failed to allocate scene upload staging buffer");
+        let mut staging = self.staging.alloc(64 * MiB);
         let cmd = self
             .core
             .device
@@ -2166,9 +2165,8 @@ impl Renderer {
             if self.gpu_meshes.contains_key(mesh_id) {
                 continue;
             }
-            let pending_gpu_mesh =
-                PendingGpuMesh::submit(&self.core, &mut self.staging, self.meshes.get(mesh_id).unwrap());
-            let gpu_mesh = pending_gpu_mesh.wait_and_unwrap(&self.core, &mut self.staging);
+            let pending_gpu_mesh = PendingGpuMesh::submit(&self.core, &self.staging, self.meshes.get(mesh_id).unwrap());
+            let gpu_mesh = pending_gpu_mesh.wait_and_unwrap(&self.core, &self.staging);
             self.gpu_meshes.insert(*mesh_id, gpu_mesh);
         }
         let previous_scene = self.scene_states.iter_mut().next_back();

@@ -1,7 +1,7 @@
 use crate::buffer::Buffer;
 use crate::core::VulkanCore;
 use crate::glsl_types::{GpuIndex, GpuMeshlet, GpuVertex};
-use crate::staging::{StagingBlock, StagingBuffer, Whole};
+use crate::staging::{StagingPool, StagingSpan, Whole};
 use ash::vk;
 use glam::*;
 use itertools::Itertools;
@@ -53,12 +53,12 @@ impl GpuMesh {
 pub(crate) struct PendingGpuMesh {
     gpu_mesh: GpuMesh,
     cmd: vk::CommandBuffer,
-    staging: StagingBuffer,
+    staging: StagingSpan,
     semaphore: vk::Semaphore,
 }
 
 impl PendingGpuMesh {
-    pub(crate) unsafe fn submit(core: &VulkanCore, staging_block: &mut StagingBlock, mesh: &Mesh) -> Self {
+    pub(crate) unsafe fn submit(core: &VulkanCore, staging_pool: &StagingPool, mesh: &Mesh) -> Self {
         let device = &core.device;
         let mut vertices = vec![];
         let mut indices = vec![];
@@ -92,21 +92,15 @@ impl PendingGpuMesh {
             meshlet_lod_to_offset.insert(lod, meshlet_offset..meshlets.len() as u16);
         }
 
-        let staging_len = {
-            let align4 = |value: usize| value.div_ceil(4) * 4;
-            let mut len = 0usize;
-            for bytes in [
-                meshlets.len() * std::mem::size_of::<GpuMeshlet>(),
-                indices.len() * std::mem::size_of::<GpuIndex>(),
-                vertices.len() * std::mem::size_of::<GpuVertex>(),
-            ] {
-                len = align4(len) + bytes;
-            }
-            len as u64
-        };
+        let staging_len = [
+            meshlets.len() * std::mem::size_of::<GpuMeshlet>(),
+            indices.len() * std::mem::size_of::<GpuIndex>(),
+            vertices.len() * std::mem::size_of::<GpuVertex>(),
+        ]
+        .into_iter()
+        .sum::<usize>() as u64;
 
-        let mut staging =
-            StagingBuffer::try_new(staging_block, staging_len).expect("failed to allocate mesh upload staging buffer");
+        let mut staging = staging_pool.alloc(staging_len);
         let cmd = device
             .allocate_command_buffers(
                 &vk::CommandBufferAllocateInfo::default()
@@ -159,9 +153,9 @@ impl PendingGpuMesh {
             meshlet_lod_to_offset,
         };
 
-        staging.stage(device, cmd, &gpu_mesh.meshlet_buffer, Whole(meshlets.as_slice()));
-        staging.stage(device, cmd, &gpu_mesh.index_buffer, Whole(indices.as_slice()));
-        staging.stage(device, cmd, &gpu_mesh.vertex_buffer, Whole(vertices.as_slice()));
+        staging_pool.stage(&mut staging, device, cmd, &gpu_mesh.meshlet_buffer, Whole(meshlets.as_slice()));
+        staging_pool.stage(&mut staging, device, cmd, &gpu_mesh.index_buffer, Whole(indices.as_slice()));
+        staging_pool.stage(&mut staging, device, cmd, &gpu_mesh.vertex_buffer, Whole(vertices.as_slice()));
 
         device.end_command_buffer(cmd).unwrap();
         device
@@ -194,11 +188,11 @@ impl PendingGpuMesh {
             .unwrap();
     }
 
-    pub(crate) unsafe fn wait_and_unwrap(self, core: &VulkanCore, staging_block: &mut StagingBlock) -> GpuMesh {
+    pub(crate) unsafe fn wait_and_unwrap(self, core: &VulkanCore, staging_pool: &StagingPool) -> GpuMesh {
         self.wait(core);
         core.device.free_command_buffers(core.cmd_pool, &[self.cmd]);
         core.device.destroy_semaphore(self.semaphore, None);
-        self.staging.free(staging_block);
+        staging_pool.free_span(self.staging);
         self.gpu_mesh
     }
 }

@@ -4,21 +4,21 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
 use crate::renderer::MAX_FRAMES_IN_FLIGHT;
-use crate::staging::{StagingBlock, StagingBuffer};
+use crate::staging::{StagingPool, StagingSpan};
 
 pub(crate) type Generation = u64;
 
 pub(crate) struct Pending {
     pub cmd: vk::CommandBuffer,
-    pub staging: StagingBuffer,
+    pub staging: StagingSpan,
     pub timeline: vk::Semaphore,
     pub signal_value: Generation,
 }
 
 impl Pending {
-    unsafe fn free(self, device: &ash::Device, staging: &mut StagingBlock, cmd_pool: vk::CommandPool) {
+    unsafe fn free(self, device: &ash::Device, staging: &StagingPool, cmd_pool: vk::CommandPool) {
         device.free_command_buffers(cmd_pool, &[self.cmd]);
-        self.staging.free(staging);
+        staging.free_span(self.staging);
     }
 }
 
@@ -73,7 +73,7 @@ impl GenerationQueue {
     pub(crate) unsafe fn register(
         &mut self,
         device: &ash::Device,
-        staging: &mut StagingBlock,
+        staging: &StagingPool,
         staging_len: u64,
     ) -> (Generation, &mut Pending) {
         // Retry until we can get a command buffer.
@@ -98,7 +98,7 @@ impl GenerationQueue {
 
         // Retry staging allocation until the virtual block has room.
         let staging = loop {
-            let staging_buffer = StagingBuffer::try_new(staging, staging_len);
+            let staging_buffer = staging.try_alloc(staging_len);
 
             match staging_buffer {
                 Ok(staging_buffer) => break staging_buffer,
@@ -125,7 +125,7 @@ impl GenerationQueue {
         (generation, pending)
     }
 
-    unsafe fn update(&mut self, device: &ash::Device, staging: &mut StagingBlock) {
+    unsafe fn update(&mut self, device: &ash::Device, staging: &StagingPool) {
         while let Some((&generation, pending)) = self.pending_generations.first_key_value() {
             if device.get_semaphore_counter_value(pending.timeline).unwrap() < pending.signal_value {
                 break;
@@ -138,7 +138,7 @@ impl GenerationQueue {
         }
     }
 
-    pub(crate) unsafe fn next(&mut self, device: &ash::Device, staging: &mut StagingBlock, frame: usize) -> Generation {
+    pub(crate) unsafe fn next(&mut self, device: &ash::Device, staging: &StagingPool, frame: usize) -> Generation {
         // First frame bootstrap.
         if self.current_generation == Generation::MAX {
             if let Some(generation) = self.wait_for_first_pending(device) {
@@ -154,7 +154,7 @@ impl GenerationQueue {
     pub(crate) unsafe fn retired_scenes(
         &mut self,
         _device: &ash::Device,
-        _staging: &mut StagingBlock,
+        _staging: &StagingPool,
     ) -> impl Iterator<Item = Generation> {
         // Drain retired generations once no FIF slot still references them.
         let fif_generations = self.fif_generations;
@@ -164,7 +164,7 @@ impl GenerationQueue {
     pub(crate) unsafe fn free(
         self,
         device: &ash::Device,
-        staging: &mut StagingBlock,
+        staging: &StagingPool,
     ) -> impl Iterator<Item = Generation> {
         let Self {
             current_generation,
