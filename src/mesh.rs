@@ -8,6 +8,7 @@ use itertools::Itertools;
 use std::collections::HashMap;
 use std::ops::Range;
 use std::path::Path;
+use std::sync::Arc;
 
 pub(crate) const MAX_LODS: usize = 8;
 
@@ -54,7 +55,7 @@ pub(crate) struct PendingGpuMesh {
     gpu_mesh: GpuMesh,
     cmd: vk::CommandBuffer,
     staging: StagingSpan,
-    semaphore: vk::Semaphore,
+    semaphore: Arc<vk::Semaphore>,
 }
 
 impl PendingGpuMesh {
@@ -109,16 +110,18 @@ impl PendingGpuMesh {
                     .command_buffer_count(1),
             )
             .unwrap()[0];
-        let semaphore = device
-            .create_semaphore(
-                &vk::SemaphoreCreateInfo::default().push_next(
-                    &mut vk::SemaphoreTypeCreateInfo::default()
-                        .semaphore_type(vk::SemaphoreType::TIMELINE)
-                        .initial_value(0),
-                ),
-                None,
-            )
-            .unwrap();
+        let semaphore = Arc::new(
+            device
+                .create_semaphore(
+                    &vk::SemaphoreCreateInfo::default().push_next(
+                        &mut vk::SemaphoreTypeCreateInfo::default()
+                            .semaphore_type(vk::SemaphoreType::TIMELINE)
+                            .initial_value(0),
+                    ),
+                    None,
+                )
+                .unwrap(),
+        );
 
         staging.reset();
         device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).unwrap();
@@ -160,11 +163,11 @@ impl PendingGpuMesh {
         device.end_command_buffer(cmd).unwrap();
         device
             .queue_submit2(
-                core.graphics_queue,
+                *core.graphics_queue.lock().unwrap(),
                 &[vk::SubmitInfo2::default()
                     .command_buffer_infos(&[vk::CommandBufferSubmitInfo::default().command_buffer(cmd)])
                     .signal_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
-                        .semaphore(semaphore)
+                        .semaphore(*semaphore)
                         .value(1)
                         .stage_mask(vk::PipelineStageFlags2::TRANSFER)])],
                 vk::Fence::null(),
@@ -177,21 +180,22 @@ impl PendingGpuMesh {
     #[allow(dead_code)]
     pub(crate) fn wait_info(&self) -> vk::SemaphoreSubmitInfo<'static> {
         vk::SemaphoreSubmitInfo::default()
-            .semaphore(self.semaphore)
+            .semaphore(*self.semaphore)
             .value(1)
             .stage_mask(vk::PipelineStageFlags2::TRANSFER)
     }
 
     pub(crate) unsafe fn wait(&self, core: &VulkanCore) {
         core.device
-            .wait_semaphores(&vk::SemaphoreWaitInfo::default().semaphores(&[self.semaphore]).values(&[1]), u64::MAX)
+            .wait_semaphores(&vk::SemaphoreWaitInfo::default().semaphores(&[*self.semaphore]).values(&[1]), u64::MAX)
             .unwrap();
     }
 
     pub(crate) unsafe fn wait_and_unwrap(self, core: &VulkanCore, staging_pool: &StagingPool) -> GpuMesh {
         self.wait(core);
         core.device.free_command_buffers(core.cmd_pool, &[self.cmd]);
-        core.device.destroy_semaphore(self.semaphore, None);
+        let semaphore = Arc::try_unwrap(self.semaphore).expect("completed mesh upload still has semaphore users");
+        core.device.destroy_semaphore(semaphore, None);
         staging_pool.free_span(self.staging);
         self.gpu_mesh
     }

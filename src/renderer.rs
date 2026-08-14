@@ -462,14 +462,14 @@ impl SwapchainState {
         device.end_command_buffer(staging_cmd_buffer).unwrap();
         device
             .queue_submit2(
-                core.graphics_queue,
+                *core.graphics_queue.lock().unwrap(),
                 &[vk::SubmitInfo2::default().command_buffer_infos(&[
                     vk::CommandBufferSubmitInfo::default().command_buffer(staging_cmd_buffer)
                 ])],
                 vk::Fence::null(),
             )
             .unwrap();
-        device.queue_wait_idle(core.graphics_queue).unwrap();
+        device.queue_wait_idle(*core.graphics_queue.lock().unwrap()).unwrap();
         device.free_command_buffers(core.cmd_pool, &[staging_cmd_buffer]);
 
         Self {
@@ -1213,7 +1213,7 @@ impl Renderer {
         self.core
             .device
             .queue_submit2(
-                self.core.graphics_queue,
+                *self.core.graphics_queue.lock().unwrap(),
                 &[vk::SubmitInfo2::default()
                     .command_buffer_infos(&[vk::CommandBufferSubmitInfo::default().command_buffer(data_upload)])
                     .wait_semaphore_infos(&[
@@ -1304,7 +1304,10 @@ impl Renderer {
             .command_buffer_infos(&frustum_cmd_infos)
             .wait_semaphore_infos(&frustum_waits)
             .signal_semaphore_infos(&frustum_signal_infos)];
-        self.core.device.queue_submit2(self.core.graphics_queue, &frustum_submit_infos, vk::Fence::null()).unwrap();
+        self.core
+            .device
+            .queue_submit2(*self.core.graphics_queue.lock().unwrap(), &frustum_submit_infos, vk::Fence::null())
+            .unwrap();
     }
 
     unsafe fn record_and_submit_early_draw_stage(
@@ -1501,7 +1504,7 @@ impl Renderer {
         self.core
             .device
             .queue_submit2(
-                self.core.graphics_queue,
+                *self.core.graphics_queue.lock().unwrap(),
                 &[vk::SubmitInfo2::default()
                     .command_buffer_infos(&[vk::CommandBufferSubmitInfo::default().command_buffer(early_draw)])
                     .wait_semaphore_infos(&[
@@ -1672,7 +1675,7 @@ impl Renderer {
         self.core
             .device
             .queue_submit2(
-                self.core.graphics_queue,
+                *self.core.graphics_queue.lock().unwrap(),
                 &[vk::SubmitInfo2::default()
                     .command_buffer_infos(&[vk::CommandBufferSubmitInfo::default().command_buffer(build_hzb)])
                     .wait_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
@@ -1740,7 +1743,7 @@ impl Renderer {
         self.core
             .device
             .queue_submit2(
-                self.core.graphics_queue,
+                *self.core.graphics_queue.lock().unwrap(),
                 &[vk::SubmitInfo2::default()
                     .command_buffer_infos(&[vk::CommandBufferSubmitInfo::default().command_buffer(occlusion_cull)])
                     .wait_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
@@ -1942,7 +1945,7 @@ impl Renderer {
         self.core
             .device
             .queue_submit2(
-                self.core.graphics_queue,
+                *self.core.graphics_queue.lock().unwrap(),
                 &[vk::SubmitInfo2::default()
                     .command_buffer_infos(&[vk::CommandBufferSubmitInfo::default().command_buffer(late_draw)])
                     .wait_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
@@ -1975,7 +1978,7 @@ impl Renderer {
         self.core
             .device
             .queue_submit2(
-                self.core.graphics_queue,
+                *self.core.graphics_queue.lock().unwrap(),
                 &[vk::SubmitInfo2::default()
                     .command_buffer_infos(&[vk::CommandBufferSubmitInfo::default().command_buffer(frame_end)])
                     .wait_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
@@ -2116,7 +2119,7 @@ impl Renderer {
             self.swapchain
                 .swapchain_device
                 .queue_present(
-                    self.core.present_queue,
+                    *self.core.present_queue.lock().unwrap(),
                     &vk::PresentInfoKHR::default()
                         .wait_semaphores(&[render_finished])
                         .swapchains(&[self.swapchain.swapchain])
@@ -2419,7 +2422,7 @@ impl Renderer {
         self.core
             .device
             .queue_submit2(
-                self.core.graphics_queue,
+                *self.core.graphics_queue.lock().unwrap(),
                 &[vk::SubmitInfo2::default()
                     .command_buffer_infos(&[vk::CommandBufferSubmitInfo::default().command_buffer(cmd)])
                     .wait_semaphore_infos(&[vk::SemaphoreSubmitInfo::default()
