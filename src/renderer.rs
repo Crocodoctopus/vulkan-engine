@@ -12,11 +12,14 @@ use crate::util::{format_bytes, format_usize_commas, wait_semaphores_any_fallbac
 use crate::vk_helpers::*;
 use crate::world::{Object, World, WorldDiff};
 use ash::vk;
+use crossbeam::queue::SegQueue;
 use glam::*;
 use std::collections::{BTreeMap, HashMap};
 use std::mem::offset_of;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
+use threadpool::ThreadPool;
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 #[derive(Debug)]
@@ -595,7 +598,7 @@ impl SceneState {
 
 pub struct Renderer {
     //
-    core: VulkanCore,
+    core: Arc<VulkanCore>,
 
     /* Swapchain data: */
     swapchain: Swapchain,
@@ -611,13 +614,18 @@ pub struct Renderer {
     cwd: PathBuf,
     resource_counter: HandleCounter,
     objects: BTreeMap<ObjectHandle, Object>,
-    meshes: BTreeMap<MeshHandle, Mesh>,
+    meshes: BTreeMap<MeshHandle, Arc<Mesh>>,
 
     // Some cpu -> gpu resources.
     gpu_meshes: HashMap<MeshHandle, GpuMesh>,
+    pending_gpu_meshes: HashMap<MeshHandle, PendingGpuMesh>,
+
+    // 
+    thread_pool: ThreadPool,
+    graphics_cmd_pools: Arc<SegQueue<vk::CommandPool>>,
 
     /* Staging: */
-    staging: StagingPool,
+    staging: Arc<StagingPool>,
 
     /* Scene: */
     _descriptor_pools: [vk::DescriptorPool; MAX_FRAMES_IN_FLIGHT],
@@ -689,8 +697,9 @@ impl Renderer {
         display: impl HasDisplayHandle + HasWindowHandle,
     ) -> Self {
         unsafe {
-            let core = VulkanCore::new(display);
-            let VulkanCore { ref device, ref allocator, .. } = core;
+            let core = Arc::new(VulkanCore::new(display));
+            let device = &core.device;
+            let allocator = &core.allocator;
 
             // Build swapchain from core.
             let swapchain = Swapchain::new(&core, vk::Extent2D { width: viewport_w, height: viewport_h });
@@ -714,8 +723,11 @@ impl Renderer {
             });
 
             // Staging data.
-            let staging = StagingPool::new(allocator, STAGING_ARENA_SIZE);
+            let staging = Arc::new(StagingPool::new(allocator, STAGING_ARENA_SIZE));
             let staging_buffers = std::array::from_fn(|_| staging.alloc(STAGING_FIF_BLOCK_SIZE));
+            let thread_pool =
+                ThreadPool::new(std::thread::available_parallelism().map_or(1, |parallelism| parallelism.get()));
+            let graphics_cmd_pools = Arc::new(SegQueue::new());
 
             //
             let global_descriptor_pool = device
@@ -885,6 +897,9 @@ impl Renderer {
                 meshes: BTreeMap::new(),
 
                 gpu_meshes: HashMap::new(),
+                pending_gpu_meshes: HashMap::new(),
+                thread_pool,
+                graphics_cmd_pools,
 
                 staging,
 
@@ -952,12 +967,45 @@ impl Renderer {
         }
     }
 
-    fn rebuild_scene_if_dirty(&mut self) {
-        if self.scene_states_dirty {
-            self.scene_states_dirty = false;
-            unsafe {
-                self.build_scene();
+    fn promote_completed_gpu_meshes(&mut self) {
+        for (mesh_id, pending) in std::mem::take(&mut self.pending_gpu_meshes) {
+            match unsafe { pending.try_unwrap(&self.core) } {
+                Ok(gpu_mesh) => {
+                    self.gpu_meshes.insert(mesh_id, gpu_mesh);
+                    self.scene_states_dirty = true;
+                }
+                Err(pending) => {
+                    self.pending_gpu_meshes.insert(mesh_id, pending);
+                }
             }
+        }
+    }
+
+    fn rebuild_scene_if_dirty(&mut self) {
+        if !self.scene_states_dirty {
+            return;
+        }
+
+        let missing_meshes: Vec<_> =
+            self.meshes.keys().filter(|mesh_id| !self.gpu_meshes.contains_key(mesh_id)).copied().collect();
+        for mesh_id in missing_meshes {
+            if self.pending_gpu_meshes.contains_key(&mesh_id) {
+                continue;
+            }
+            let mesh = Arc::clone(self.meshes.get(&mesh_id).unwrap());
+            let pending = unsafe {
+                PendingGpuMesh::submit(&self.thread_pool, &self.graphics_cmd_pools, &self.core, &self.staging, mesh)
+            };
+            self.pending_gpu_meshes.insert(mesh_id, pending);
+        }
+
+        if self.meshes.keys().any(|mesh_id| !self.gpu_meshes.contains_key(mesh_id)) {
+            return;
+        }
+
+        self.scene_states_dirty = false;
+        unsafe {
+            self.build_scene();
         }
     }
 
@@ -2091,12 +2139,15 @@ impl Renderer {
     pub fn render(&mut self, _timestamp: f32) {
         self.frame += 1;
 
+        // Promote completed asynchronous work before rebuilding dependent state.
+        self.promote_completed_gpu_meshes();
+        self.promote_completed_scene_states();
+
         // Lazy rebuild global state if neccessary.
         self.rebuild_swapchain_states_if_dirty();
         self.rebuild_scene_if_dirty();
 
         // A scene may not be promoted yet to use, so return early.
-        self.promote_completed_scene_states();
         if self.scene_states.is_empty() {
             return;
         }
@@ -2164,14 +2215,6 @@ impl Renderer {
         let added_meshes: Vec<_> = world_diff.added_meshes.iter().copied().collect();
         let removed_meshes: Vec<_> = world_diff.removed_meshes.iter().copied().collect();
 
-        for mesh_id in &new_world.meshes {
-            if self.gpu_meshes.contains_key(mesh_id) {
-                continue;
-            }
-            let pending_gpu_mesh = PendingGpuMesh::submit(&self.core, &self.staging, self.meshes.get(mesh_id).unwrap());
-            let gpu_mesh = pending_gpu_mesh.wait_and_unwrap(&self.core, &self.staging);
-            self.gpu_meshes.insert(*mesh_id, gpu_mesh);
-        }
         let previous_scene = self.scene_states.iter_mut().next_back();
         let mut previous_scene_visibility_buffers = previous_scene.map(|(_, scene)| &mut scene.visibility_buffers);
 
@@ -2472,7 +2515,7 @@ impl Renderer {
     pub fn load_mesh(&mut self, filename: impl AsRef<Path>) -> Option<MeshHandle> {
         let mesh = load_mesh(self.cwd.join(filename))?;
         let handle = self.resource_counter.next().unwrap();
-        self.meshes.insert(handle, mesh);
+        self.meshes.insert(handle, Arc::new(mesh));
         return Some(handle);
     }
 }

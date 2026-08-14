@@ -13,6 +13,8 @@ tobj = "0.1.7"
 png = "0.17.13"
 itertools = "0.13.0"
 meshopt = "0.4.1"
+crossbeam = "0.8.4"
+threadpool = "1.8.1"
 
 [profile.dev]
 panic = "abort"
